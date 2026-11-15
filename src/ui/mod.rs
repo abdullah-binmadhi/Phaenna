@@ -26,7 +26,7 @@ pub fn render_app(frame: &mut Frame, state: &mut AppState) {
     match state.screen {
         Screen::Home => home::render_home_screen(frame, state, modal_rect),
         Screen::Detail => detail::render_detail_screen(frame, state, modal_rect),
-        Screen::Channel => channel::render_channel_screen(frame, state),
+        Screen::Channel => channel::render_channel_screen(frame, state, modal_rect),
     }
 
     match state.overlay {

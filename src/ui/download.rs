@@ -71,7 +71,7 @@ pub fn render_download_modal(frame: &mut Frame, state: &AppState) {
         frame.render_widget(gauge, rows[1]);
 
         let status = if let Some(ref p) = job.done_path {
-            Span::styled(format!("✓ Saved to {}", p), Style::default().fg(theme.accent))
+            Span::styled(format!("[OK] Saved to {}", p), Style::default().fg(theme.accent))
         } else if let Some(ref e) = job.error {
             Span::styled(format!("✕ Failed: {}", e), Style::default().fg(Color::Rgb(247, 118, 142)))
         } else {

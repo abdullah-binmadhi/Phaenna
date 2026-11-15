@@ -23,3 +23,6 @@ cookies.txt
 Thumbs.db
 *.log
 .env
+
+# Local session scratch plans
+*_PLAN.md

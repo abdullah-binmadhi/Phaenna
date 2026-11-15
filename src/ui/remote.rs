@@ -16,7 +16,7 @@ pub fn render_remote_modal(frame: &mut Frame, state: &AppState) {
 
     let outer = Block::default()
         .title(Span::styled(
-            " 📱 LAN MOBILE REMOTE COMPANION ",
+            " LAN MOBILE REMOTE COMPANION ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.primary)

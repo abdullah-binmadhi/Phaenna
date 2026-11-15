@@ -1,6 +1,6 @@
+pub mod auth;
 pub mod calendar;
 pub mod cast;
-pub mod cookies;
 pub mod downloader;
 pub mod ipc;
 pub mod remote;

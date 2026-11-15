@@ -166,19 +166,25 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &AppState) {
         ]),
         Line::from(vec![
             Span::styled(" GLSL FX  : ", Style::default().fg(theme.text_dim)),
-            Span::styled(state.config.shader_mode.label(), Style::default().fg(theme.primary)),
+            Span::styled(state.config.shader_mode.label(), Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
         ]),
+        Line::from(Span::styled(
+            " Press [s] to cycle Reference 4K shader profile",
+            Style::default().fg(theme.text_dim),
+        )),
     ];
     frame.render_widget(Paragraph::new(sub_lines).block(sub_block), cols[3]);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" [←/→] Switch Column ", Style::default().fg(theme.primary)),
-            Span::styled(" · ", Style::default().fg(theme.divider)),
-            Span::styled("[↑/↓] Cycle Option ", Style::default().fg(theme.secondary)),
-            Span::styled(" · ", Style::default().fg(theme.divider)),
+            Span::styled(" [←/→] Column ", Style::default().fg(theme.primary)),
+            Span::styled("· ", Style::default().fg(theme.divider)),
+            Span::styled("[↑/↓] Option ", Style::default().fg(theme.secondary)),
+            Span::styled("· ", Style::default().fg(theme.divider)),
+            Span::styled("[s] 4K Shader ", Style::default().fg(theme.primary)),
+            Span::styled("· ", Style::default().fg(theme.divider)),
             Span::styled("[Enter] Launch Video ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" · ", Style::default().fg(theme.divider)),
+            Span::styled("· ", Style::default().fg(theme.divider)),
             Span::styled("[Esc] Cancel ", Style::default().fg(theme.text_dim)),
         ]))
         .alignment(Alignment::Center),

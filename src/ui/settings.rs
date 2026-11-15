@@ -17,6 +17,7 @@ pub enum HubActionId {
     PlayerBackend,
     SponsorBlockMode,
     VideoShaders,
+    InstallNeuralShaders,
     SubtitlesEnabled,
     SubtitlePreset,
     SubtitleCollisionGuard,
@@ -24,7 +25,7 @@ pub enum HubActionId {
     ThemePalette,
     RemoteQrModal,
     CastScan,
-    CookieSyncModal,
+    GoogleAccountHub,
     UploadRadar,
     SystemDoctor,
     CheckUpdates,
@@ -69,15 +70,27 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::VideoShaders,
-            category: "✦ VIDEO & SUBTITLE MASTERING",
-            label: "GLSL Video Mastering Shaders",
-            keywords: "shader glsl sharpen cas upscale quality video",
+            category: "VIDEO & SUBTITLE MASTERING",
+            label: "GLSL 4K Mastering & Super-Resolution",
+            keywords: "shader glsl sharpen rcas upscale 4k deblock chroma quality video",
             badge: format!("[ {} ▾ ]", cfg.shader_mode.label()),
-            description: "Apply real-time GPU anti-ringing + FidelityFX CAS sharpening shaders in mpv.",
+            description: "Cycle Reference 4K Studio (bilateral deblock + 4:4:4 chroma + 2x RCAS), Neural Cinema, or Anime4K.",
+        },
+        HubItem {
+            id: HubActionId::InstallNeuralShaders,
+            category: "VIDEO & SUBTITLE MASTERING",
+            label: "Download FSRCNNX 4K Neural CNN Pack",
+            keywords: "fsrcnnx neural cnn download shader 4k upscale install",
+            badge: if crate::services::shaders::neural_shader_installed() {
+                "[ INSTALLED ]".to_string()
+            } else {
+                "[ Download ]".to_string()
+            },
+            description: "Download FSRCNNX_x2_16-0-4-1.glsl to unlock Neural Cinema 4K CNN upscaling.",
         },
         HubItem {
             id: HubActionId::SubtitlesEnabled,
-            category: "✦ VIDEO & SUBTITLE MASTERING",
+            category: "VIDEO & SUBTITLE MASTERING",
             label: "Enable Subtitles / Captions",
             keywords: "subtitles captions cc enable toggle",
             badge: if cfg.subtitles_enabled { "[ ON ]".to_string() } else { "[ OFF ]".to_string() },
@@ -85,7 +98,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::SubtitlePreset,
-            category: "✦ VIDEO & SUBTITLE MASTERING",
+            category: "VIDEO & SUBTITLE MASTERING",
             label: "Subtitle Typography Preset",
             keywords: "subtitle font style preset studio netflix gold oled",
             badge: format!("[ {} ▾ ]", cfg.subtitle_style.preset.label()),
@@ -93,7 +106,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::SubtitleCollisionGuard,
-            category: "✦ VIDEO & SUBTITLE MASTERING",
+            category: "VIDEO & SUBTITLE MASTERING",
             label: "Subtitle Collision Guard",
             keywords: "subtitle collision signage an8 overlap",
             badge: if cfg.subtitle_style.collision_avoidance { "[ ON ]".to_string() } else { "[ OFF ]".to_string() },
@@ -101,7 +114,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::AmbilightBorders,
-            category: "🎨 VISUALS & THEMING",
+            category: "VISUALS & THEMING",
             label: "Dynamic Thumbnail Ambilight",
             keywords: "ambilight glow border color extract theme",
             badge: if cfg.ambilight_enabled { "[ ON ]".to_string() } else { "[ OFF ]".to_string() },
@@ -109,7 +122,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::ThemePalette,
-            category: "🎨 VISUALS & THEMING",
+            category: "VISUALS & THEMING",
             label: "Active Theme Palette",
             keywords: "theme palette tokyo cyberpunk phaenna zen violet dracula nord",
             badge: format!("[ {} ▾ ]", state.base_theme().name),
@@ -117,7 +130,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::RemoteQrModal,
-            category: "📱 COMPANION & CAST",
+            category: "COMPANION & CAST",
             label: "Mobile LAN Remote QR",
             keywords: "remote qr phone websocket companion port",
             badge: state.remote_handle.as_ref().map(|h| format!("[ {} ]", h.url)).unwrap_or_else(|| "[ Open ]".to_string()),
@@ -125,23 +138,27 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::CastScan,
-            category: "📱 COMPANION & CAST",
+            category: "COMPANION & CAST",
             label: "AirPlay / DLNA TV Cast",
             keywords: "cast tv airplay dlna upnp ssdp living room",
             badge: format!("[ {} found ]", state.cast_devices.len()),
             description: "Scan local network for AirPlay 2 & DLNA Smart TVs and hand off streams.",
         },
         HubItem {
-            id: HubActionId::CookieSyncModal,
-            category: "🔐 ACCOUNT & TOOLS",
-            label: "Phaenna Cookie Vault Sync",
-            keywords: "cookies zen firefox login account auth",
-            badge: format!("[ {} cookies ]", state.cookie_count),
-            description: "Extract authenticated YouTube cookies directly from Zen / Firefox SQLite DB.",
+            id: HubActionId::GoogleAccountHub,
+            category: "ACCOUNT & TOOLS",
+            label: "Google Account & Identity Hub",
+            keywords: "google login account oauth qr 2fa auth passkey",
+            badge: if let Some(acct) = state.auth_vault.active_account() {
+                format!("[ OK {} ]", acct.email)
+            } else {
+                "[ Guest ]".to_string()
+            },
+            description: "Sign in inside Phaenna (Email+2FA, Instant QR Device Code, or Kitty Split SSO).",
         },
         HubItem {
             id: HubActionId::UploadRadar,
-            category: "🔐 ACCOUNT & TOOLS",
+            category: "ACCOUNT & TOOLS",
             label: "7-Day Upload Radar Calendar",
             keywords: "calendar uploads schedule radar week",
             badge: "[ Open (c) ]".to_string(),
@@ -149,7 +166,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::SystemDoctor,
-            category: "🔐 ACCOUNT & TOOLS",
+            category: "ACCOUNT & TOOLS",
             label: "System Doctor Diagnostics",
             keywords: "doctor setup check yt-dlp mpv ffmpeg dependencies",
             badge: "[ Inspect (!) ]".to_string(),
@@ -157,7 +174,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
         },
         HubItem {
             id: HubActionId::CheckUpdates,
-            category: "🔐 ACCOUNT & TOOLS",
+            category: "ACCOUNT & TOOLS",
             label: "Check GitHub Releases Update",
             keywords: "update version github release semver",
             badge: format!("[ v{} ]", env!("CARGO_PKG_VERSION")),
@@ -192,7 +209,7 @@ pub fn render_settings_modal(frame: &mut Frame, state: &AppState) {
 
     let outer = Block::default()
         .title(Span::styled(
-            " ⚙ PHAENNA — FUZZY COMMAND HUB & SETTINGS ",
+            " PHAENNA — FUZZY COMMAND HUB & SETTINGS ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.primary)

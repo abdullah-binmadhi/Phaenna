@@ -135,17 +135,24 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     let mut args = vec![
         "--hwdec=auto-safe".to_string(),
         "--vo=gpu-next".to_string(),
+        "--gpu-api=auto".to_string(),
+        "--cache=yes".to_string(),
+        "--demuxer-max-bytes=512MiB".to_string(),
+        "--demuxer-max-back-bytes=128MiB".to_string(),
         "--force-window=immediate".to_string(),
         format!("--force-media-title={}", opts.title),
     ];
 
     if opts.local_file.is_none() {
         args.push(format!("--ytdl-format={}", opts.quality_format));
+        args.push(
+            "--ytdl-raw-options-append=format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr"
+                .to_string(),
+        );
         if let Some(ref cpath) = opts.cookies_path {
             if cpath.exists() {
-                // Escape commas/spaces safely in ytdl-raw-options
                 args.push(format!(
-                    "--ytdl-raw-options=cookies={}",
+                    "--ytdl-raw-options-append=cookies={}",
                     cpath.to_string_lossy()
                 ));
             }
@@ -175,6 +182,74 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     if let Some(shaders) = prepare_video_shaders(opts.shader_mode) {
         args.push(format!("--glsl-shaders={}", shaders));
         args.extend(mpv_mastering_flags(opts.shader_mode, opts.mastering_profile));
+    }
+
+    let target = opts
+        .local_file
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
+    args.push(target);
+    args
+}
+
+/// Build arguments for macOS `iina-cli` translating all Reference 4K shaders,
+/// AV1/VP9 format selection, cookies, and mastering flags via `--mpv-*` parity.
+pub fn build_iina_args(opts: &PlayOptions) -> Vec<String> {
+    let mut args = vec![
+        "--no-stdin".to_string(),
+        "--mpv-hwdec=auto-safe".to_string(),
+        "--mpv-vo=gpu-next".to_string(),
+        "--mpv-gpu-api=auto".to_string(),
+        "--mpv-cache=yes".to_string(),
+        "--mpv-demuxer-max-bytes=512MiB".to_string(),
+        "--mpv-demuxer-max-back-bytes=128MiB".to_string(),
+        format!("--mpv-force-media-title={}", opts.title),
+    ];
+
+    if opts.local_file.is_none() {
+        args.push(format!("--mpv-ytdl-format={}", opts.quality_format));
+        args.push(
+            "--mpv-ytdl-raw-options-append=format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr"
+                .to_string(),
+        );
+        if let Some(ref cpath) = opts.cookies_path {
+            if cpath.exists() {
+                args.push(format!(
+                    "--mpv-ytdl-raw-options-append=cookies={}",
+                    cpath.to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    if let Some(start) = opts.start_pos {
+        if start > 3.0 {
+            args.push(format!("--mpv-start={:.1}", start));
+        }
+    }
+
+    if opts.subtitles_enabled {
+        let lang = opts.sub_lang.as_deref().unwrap_or("en,eng");
+        args.push(format!("--mpv-slang={}", lang));
+        args.push("--mpv-sub-auto=fuzzy".to_string());
+        if let Some(ref sub_url) = opts.sub_url {
+            args.push(format!("--mpv-sub-file={}", sub_url));
+        }
+        for flag in opts.sub_style.to_mpv_flags() {
+            if let Some(trimmed) = flag.strip_prefix("--") {
+                args.push(format!("--mpv-{}", trimmed));
+            }
+        }
+    }
+
+    if let Some(shaders) = prepare_video_shaders(opts.shader_mode) {
+        args.push(format!("--mpv-glsl-shaders={}", shaders));
+        for flag in mpv_mastering_flags(opts.shader_mode, opts.mastering_profile) {
+            if let Some(trimmed) = flag.strip_prefix("--") {
+                args.push(format!("--mpv-{}", trimmed));
+            }
+        }
     }
 
     let target = opts
@@ -216,15 +291,9 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
             #[cfg(target_os = "macos")]
             {
                 if let Some(cli) = find_binary("iina-cli").or_else(|| find_binary("iina")) {
-                    let mut cmd = Command::new(cli);
-                    cmd.arg("--no-stdin");
-                    if let Some(start) = opts.start_pos {
-                        if start > 3.0 {
-                            cmd.arg(format!("--mpv-start={:.1}", start));
-                        }
-                    }
-                    cmd.arg(&target);
-                    let child = cmd
+                    let args = build_iina_args(opts);
+                    let child = Command::new(cli)
+                        .args(&args)
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
@@ -318,6 +387,36 @@ mod tests {
         assert!(args.iter().any(|a| a == "--input-ipc-server=/tmp/yt-test.sock"));
         assert!(args.iter().any(|a| a == "--start=42.5"));
         assert!(args.iter().any(|a| a.starts_with("--glsl-shaders=")));
+        assert!(args.iter().any(|a| a == "--demuxer-max-bytes=512MiB"));
+        assert!(args.iter().any(|a| a.contains("format-sort=res:2160")));
+        assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
+    }
+
+    #[test]
+    fn test_build_iina_args_full_4k_shader_parity() {
+        let opts = PlayOptions {
+            video_id: "dQw4w9WgXcQ".to_string(),
+            title: "Reference 4K Test".to_string(),
+            local_file: None,
+            quality_format: "bestvideo[height<=?4320][vcodec^=av01]+bestaudio/best".to_string(),
+            player: Player::Iina,
+            cookies_path: None,
+            start_pos: Some(18.0),
+            ipc_socket: None,
+            subtitles_enabled: true,
+            sub_lang: Some("en".to_string()),
+            sub_url: None,
+            sub_style: SubtitleStyleConfig::default(),
+            shader_mode: VideoShaderMode::Reference4K,
+            mastering_profile: VideoMasteringProfile::StandardHd,
+        };
+
+        let args = build_iina_args(&opts);
+        assert!(args.iter().any(|a| a == "--no-stdin"));
+        assert!(args.iter().any(|a| a.starts_with("--mpv-glsl-shaders=")));
+        assert!(args.iter().any(|a| a == "--mpv-deband=yes"));
+        assert!(args.iter().any(|a| a == "--mpv-tone-mapping=spline"));
+        assert!(args.iter().any(|a| a == "--mpv-start=18.0"));
         assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
     }
 }

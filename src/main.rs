@@ -10,7 +10,9 @@ mod state;
 mod ui;
 
 use crate::api::dislike::fetch_dislikes;
-use crate::api::innertube::fetch_channel_rss;
+use crate::api::innertube::{
+    browse_id_for_feed_key, fetch_channel_rss, fetch_innertube_shelf, innertube_edit_watch_later,
+};
 use crate::api::player::{
     detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
 };
@@ -22,24 +24,32 @@ use crate::api::ytdlp::{
     search_youtube,
 };
 use crate::config::{Config, Player, Quality};
+use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
     batch_upsert_feed, get_all_cached_videos, get_feed_videos, get_thumb_blob,
     search_cached_videos, store_thumb_blob, upsert_video, VideoItem,
 };
 use crate::db::sync::{is_stale, mark_synced, HISTORY, RECOMMENDED, SUBSCRIPTIONS, WATCH_LATER};
 use crate::db::user::{
-    add_to_watch_later, compute_user_analytics, get_all_progress_map, get_continue_watching,
+    add_to_watch_later, clear_finished_continue_watching, compute_user_analytics,
+    get_all_progress_map, get_continue_watching, get_continue_watching_meta_map,
     get_offline_videos, get_sponsorblock_segments, get_watch_later_sources, get_watched_ids,
-    record_watched, remove_from_watch_later, save_sponsorblock_segments, WatchLaterSource,
+    move_continue_watching_item, pin_to_continue_watching, remove_continue_watching,
+    remove_from_watch_later, save_sponsorblock_segments, touch_watch_history, WatchLaterSource,
 };
 use crate::messages::AppMessage;
+use crate::services::auth::{
+    now_unix_secs, poll_device_code_until_done, refresh_session_token, request_device_code,
+    resolve_oauth_client, run_kitty_split_google_signin, run_loopback_pkce_flow,
+    submit_direct_credentials, submit_two_factor_challenge, ChallengeKind, DirectAuthOutcome,
+    LoginStep, PendingOAuthFlow, GOOGLE_YOUTUBE_SERVICE_LOGIN_URL,
+};
 use crate::services::calendar::{bucket_videos_by_week, compute_week_bounds};
 use crate::services::cast::{discover_devices, resolve_tv_stream_url, start_casting};
-use crate::services::cookies::{get_cookie_count, sync_browser_cookies};
 use crate::services::downloader::{spawn_download_task, DownloadTask};
 use crate::services::ipc::{spawn_mpv_ipc_monitor, IpcMonitorConfig};
 use crate::services::remote::start_remote_server;
-use crate::services::shaders::VideoMasteringProfile;
+use crate::services::shaders::{download_neural_shader_pack, VideoMasteringProfile};
 use crate::services::tailored::{build_questions, score_discovery_pool};
 use crate::services::updater::{check_for_updates, spawn_self_update};
 use crate::state::{
@@ -48,8 +58,8 @@ use crate::state::{
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::home::{
-    footer_action_at, grid_card_index_at, grid_columns, home_layout, top_bar_shelf_at,
-    HomeFooterAction,
+    compute_grid_metrics, continue_watching_row_at, footer_action_at, grid_card_index_at,
+    grid_columns, home_layout, top_bar_shelf_at, HomeFooterAction,
 };
 use crate::ui::settings::{filtered_hub_items, HubActionId};
 use clap::{Parser, Subcommand};
@@ -164,10 +174,10 @@ async fn main() -> anyhow::Result<()> {
         let _ = sqlx::query("UPDATE videos SET thumb_blob = NULL").execute(&pool).await;
     }
 
-    // 2. Setup AppState and hydrate immediately from SQLite
+    // 2. Setup AppState and hydrate immediately from SQLite & isolated auth vault
     let mut state = AppState::new(cfg.clone());
     if let Ok(cpath) = cfg.cookies_path() {
-        state.cookie_count = get_cookie_count(&cpath);
+        let _ = state.auth_vault.sync_isolated_cookie_jar(&cpath);
     }
     hydrate_state_from_db(&mut state, &pool).await;
     state.sync_calendar_tz(&pool).await;
@@ -198,8 +208,26 @@ async fn main() -> anyhow::Result<()> {
         state.remote_handle = start_remote_server(state.config.remote.port).await;
     }
 
-    // 5. SWR Background Refresh: Refresh stale or empty shelves immediately without blocking render
-    trigger_swr_feed_refreshes(&mut state, &pool, &tx, false);
+    // 5. Silent token refresh if active OAuth2 session is expiring, plus SWR feed hydration
+    if let Some(mut acct) = state.auth_vault.active_account().cloned() {
+        if acct.is_token_expiring(now_unix_secs()) && acct.refresh_token.is_some() {
+            let oauth = resolve_oauth_client(&state.config.google_oauth);
+            let c_auth = client.clone();
+            let tx_auth = tx.clone();
+            tokio::spawn(async move {
+                match refresh_session_token(&c_auth, oauth.as_ref(), &mut acct).await {
+                    Ok(true) => {
+                        let _ = tx_auth.send(AppMessage::AuthRefreshed(acct)).await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = tx_auth.send(AppMessage::AuthFailed(e.to_string())).await;
+                    }
+                }
+            });
+        }
+    }
+    trigger_swr_feed_refreshes(&mut state, &pool, &tx, &client, false);
 
     // 6. Optional non-blocking GitHub Releases check
     if state.config.update.check_on_startup {
@@ -232,9 +260,29 @@ async fn main() -> anyhow::Result<()> {
 
         state.clear_expired_toast();
 
+        if state.screen == Screen::Home && state.overlay == ActiveOverlay::None {
+            if let Some(v) = state.current_home_video() {
+                let card_inner_w = crossterm::terminal::size()
+                    .map(|(w, h)| {
+                        let [_, _, grid, _] = home_layout(ratatui::layout::Rect::new(0, 0, w, h));
+                        let m = compute_grid_metrics(grid);
+                        m.base_card_width.saturating_sub(2) as usize
+                    })
+                    .unwrap_or(28);
+                if v.title.chars().count() > card_inner_w.max(12)
+                    && state.ticker_focus_started_at.elapsed() >= Duration::from_millis(640)
+                    && state.ticker_last_step_at.elapsed() >= Duration::from_millis(160)
+                {
+                    state.ticker_step = state.ticker_step.wrapping_add(1);
+                    state.ticker_last_step_at = Instant::now();
+                    needs_redraw = true;
+                }
+            }
+        }
+
         while let Ok(msg) = rx.try_recv() {
             needs_redraw = true;
-            handle_app_message(msg, &mut state, &pool, &tx).await;
+            handle_app_message(msg, &mut state, &pool, &tx, &client).await;
         }
 
         if needs_redraw {
@@ -263,6 +311,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if event::poll(Duration::from_millis(40))? {
+            let prev_focus = (
+                state.screen,
+                state.active_category,
+                state.category_cursors[state.active_category],
+            );
             match event::read()? {
                 Event::Resize(_, _) => needs_redraw = true,
                 Event::Mouse(mouse) => {
@@ -277,11 +330,19 @@ async fn main() -> anyhow::Result<()> {
                     {
                         break;
                     }
-                    if handle_key_event(key.code, &mut state, &pool, &tx, &client).await {
+                    if handle_key_event(key.code, key.modifiers, &mut state, &pool, &tx, &client).await {
                         break;
                     }
                 }
                 _ => {}
+            }
+            let new_focus = (
+                state.screen,
+                state.active_category,
+                state.category_cursors[state.active_category],
+            );
+            if new_focus != prev_focus {
+                state.reset_ticker();
             }
         }
     }
@@ -319,6 +380,9 @@ async fn hydrate_state_from_db(state: &mut AppState, pool: &SqlitePool) {
             entry.1 = cw;
         }
     }
+    if let Ok(cw_meta) = get_continue_watching_meta_map(pool).await {
+        state.continue_watching_meta = cw_meta;
+    }
 
     for (cat, items) in &mut state.categories {
         if *cat == Category::ContinueWatching {
@@ -334,10 +398,12 @@ fn trigger_swr_feed_refreshes(
     state: &mut AppState,
     pool: &SqlitePool,
     tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
     force: bool,
 ) {
     let cookies = state.config.cookies_path().ok();
     let cfg_cache = state.config.cache.clone();
+    let session_opt = state.auth_vault.active_account().cloned();
 
     let jobs = [
         (Category::Recommended, RECOMMENDED, cfg_cache.recommended_ttl),
@@ -359,6 +425,8 @@ fn trigger_swr_feed_refreshes(
         let p_clone = pool.clone();
         let tx_clone = tx.clone();
         let c_clone = cookies.clone();
+        let client_clone = client.clone();
+        let session_clone = session_opt.clone();
         let key_s = key.to_string();
         let url_s = url.to_string();
 
@@ -369,13 +437,53 @@ fn trigger_swr_feed_refreshes(
                     .send(AppMessage::FeedLoaded {
                         feed_key: key_s,
                         items: Vec::new(),
+                        continuation: None,
                         is_from_cache: true,
                     })
                     .await;
                 return;
             }
 
-            let fetched = fetch_feed_range(c_clone.as_deref(), &url_s, 1, 16).await;
+            let mut fetched = Vec::new();
+            let mut next_continuation: Option<String> = None;
+            if let Some(ref session) = session_clone {
+                if let Some(browse_id) = browse_id_for_feed_key(&key_s) {
+                    if let Ok(page) =
+                        fetch_innertube_shelf(&client_clone, session, browse_id, None).await
+                    {
+                        fetched = page.videos;
+                        next_continuation = page.continuation;
+
+                        // Automatically chain a 2nd page if initial shelf returned fewer than 30 items
+                        if fetched.len() < 30 {
+                            if let Some(tok) = next_continuation.take() {
+                                if let Ok(page2) = fetch_innertube_shelf(
+                                    &client_clone,
+                                    session,
+                                    browse_id,
+                                    Some(&tok),
+                                )
+                                .await
+                                {
+                                    let mut seen: HashSet<String> =
+                                        fetched.iter().map(|v| v.id.clone()).collect();
+                                    for v in page2.videos {
+                                        if seen.insert(v.id.clone()) {
+                                            fetched.push(v);
+                                        }
+                                    }
+                                    next_continuation = page2.continuation;
+                                } else {
+                                    next_continuation = Some(tok);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if fetched.is_empty() {
+                fetched = fetch_feed_range(c_clone.as_deref(), &url_s, 1, 28).await;
+            }
             if !fetched.is_empty() {
                 let ts = now_unix();
                 let _ = batch_upsert_feed(&p_clone, &key_s, &fetched, ts).await;
@@ -385,6 +493,7 @@ fn trigger_swr_feed_refreshes(
                 .send(AppMessage::FeedLoaded {
                     feed_key: key_s,
                     items: fetched,
+                    continuation: next_continuation,
                     is_from_cache: false,
                 })
                 .await;
@@ -493,14 +602,24 @@ async fn handle_app_message(
     state: &mut AppState,
     pool: &SqlitePool,
     tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
 ) {
     match msg {
         AppMessage::FeedLoaded {
             feed_key,
             items,
+            continuation,
             is_from_cache,
         } => {
             state.loading_feeds.remove(&feed_key);
+            if !is_from_cache {
+                state.exhausted_feeds.remove(&feed_key);
+                if let Some(tok) = continuation {
+                    state.feed_continuations.insert(feed_key.clone(), tok);
+                } else {
+                    state.feed_continuations.remove(&feed_key);
+                }
+            }
             if !is_from_cache && !items.is_empty() {
                 if let Some((_, list)) = state
                     .categories
@@ -520,9 +639,20 @@ async fn handle_app_message(
                 state.pagination_progress = Some((current, total));
             }
         }
-        AppMessage::MoreFeedLoaded { feed_key, items } => {
+        AppMessage::MoreFeedLoaded {
+            feed_key,
+            items,
+            continuation,
+        } => {
             state.is_fetching_more = false;
             state.pagination_progress = None;
+            if let Some(tok) = continuation {
+                state.feed_continuations.insert(feed_key.clone(), tok);
+                state.exhausted_feeds.remove(&feed_key);
+            } else {
+                state.feed_continuations.remove(&feed_key);
+            }
+
             if let Some((_, list)) = state
                 .categories
                 .iter_mut()
@@ -540,7 +670,9 @@ async fn handle_app_message(
                     let _ = batch_upsert_feed(pool, &feed_key, list, now_unix()).await;
                 }
                 if added > 0 {
-                    state.show_toast(format!("Loaded +{} videos into {}", added, feed_key));
+                    state.show_toast(format!("Loaded +{added} videos"));
+                } else if !state.feed_continuations.contains_key(&feed_key) {
+                    state.exhausted_feeds.insert(feed_key);
                 }
             }
         }
@@ -608,20 +740,67 @@ async fn handle_app_message(
             state.loading_thumbs.remove(&video_id);
             *state.failed_thumbs.entry(video_id).or_insert(0) += 1;
         }
-        AppMessage::SyncFinished(res) => match res {
-            Ok(msg) => {
-                if let Ok(cpath) = state.config.cookies_path() {
-                    state.cookie_count = get_cookie_count(&cpath);
-                }
-                state.login_status = Some(format!("✓ {}", msg));
-                state.show_toast("Cookies synced! Refreshing feeds...");
-                trigger_swr_feed_refreshes(state, pool, tx, true);
-            }
-            Err(e) => {
-                state.login_status = Some(format!("✕ Sync error: {}", e));
-                state.show_toast("Cookie sync failed");
-            }
-        },
+        AppMessage::AuthDeviceCodeReady(dev) => {
+            state.login_ui.busy = false;
+            state.login_ui.error_banner = None;
+            state.login_ui.status_banner = Some(format!(
+                "QR Ready! Scan with phone camera or enter {} at google.com/device",
+                dev.user_code
+            ));
+            state.login_ui.device_session = Some(dev);
+            state.login_ui.step = LoginStep::AwaitingDeviceQr;
+        }
+        AppMessage::AuthKittyUrlReady { url, launcher } => {
+            state.login_ui.kitty_auth_url = Some(url);
+            state.login_ui.status_banner = Some(format!(
+                "Opened Google SSO in {launcher} — complete login to return"
+            ));
+        }
+        AppMessage::AuthChallengeRequired {
+            kind,
+            cookies,
+            challenge_token,
+        } => {
+            state.login_ui.busy = false;
+            state.login_ui.password.clear();
+            state.login_ui.two_factor_code.clear();
+            state.login_ui.pending_flow_cookies = cookies;
+            state.login_ui.pending_challenge_token = challenge_token;
+            state.login_ui.error_banner = None;
+            state.login_ui.status_banner = Some(
+                "2-Step Verification requested — enter your 6-digit code inside Phaenna."
+                    .to_string(),
+            );
+            state.login_ui.step = LoginStep::TwoFactorChallenge(kind);
+        }
+        AppMessage::AuthNeedsModernSso { reason } => {
+            state.login_ui.busy = false;
+            state.login_ui.password.clear();
+            state.login_ui.pending_flow_cookies.clear();
+            state.login_ui.step = LoginStep::Hub;
+            state.login_ui.error_banner = Some(reason);
+        }
+        AppMessage::AuthSignedIn(session) => {
+            let label = format!("Signed in as {} ({})", session.display_name, session.email);
+            state.auth_vault.upsert_session(session);
+            persist_auth_vault_and_cookies(state, pool).await;
+            state.login_ui.reset_transient();
+            state.login_ui.step = LoginStep::Hub;
+            state.login_ui.error_banner = None;
+            state.login_ui.status_banner = Some(label.clone());
+            state.show_toast(format!("{label} · Refreshing YouTube shelves..."));
+            trigger_swr_feed_refreshes(state, pool, tx, client, true);
+        }
+        AppMessage::AuthRefreshed(session) => {
+            state.auth_vault.upsert_session(session);
+            persist_auth_vault_and_cookies(state, pool).await;
+            state.login_ui.status_banner = Some("Google OAuth2 token silently refreshed".into());
+        }
+        AppMessage::AuthFailed(err) => {
+            state.login_ui.busy = false;
+            state.login_ui.error_banner = Some(err.clone());
+            state.show_toast(format!("✕ Auth error: {err}"));
+        }
         AppMessage::PlaybackStarted {
             video_id,
             title,
@@ -648,9 +827,19 @@ async fn handle_app_message(
             pos,
             duration,
         } => {
+            let need_refresh = !state.is_in_continue_watching(&video_id) && pos >= 10.0;
             state.active_playback_pos = pos;
             state.active_playback_dur = duration;
-            state.progress_map.insert(video_id, (pos, duration));
+            state.progress_map.insert(video_id.clone(), (pos, duration));
+            if let Some(meta) = state.continue_watching_meta.get_mut(video_id.trim_start_matches("RD")) {
+                meta.last_pos_secs = pos;
+                if duration > 0.0 {
+                    meta.duration_secs = duration;
+                }
+            }
+            if need_refresh {
+                refresh_continue_watching_state(state, pool).await;
+            }
             if let Some(ref handle) = state.remote_handle {
                 let mut rst = handle.state.write().await;
                 rst.time_pos = pos;
@@ -666,22 +855,15 @@ async fn handle_app_message(
             ..
         } => {
             state.sponsor_skips_session += 1;
-            state.show_toast(format!("🛡 Skipped {} (+{:.0}s)", category, saved_secs));
+            state.show_toast(format!("Skipped {} (+{:.0}s)", category, saved_secs));
         }
         AppMessage::VideoAutoCompleted { video_id } => {
             state.watched_ids.insert(video_id);
-            if let Ok(cw) = get_continue_watching(pool).await {
-                if let Some(entry) = state
-                    .categories
-                    .iter_mut()
-                    .find(|(c, _)| *c == Category::ContinueWatching)
-                {
-                    entry.1 = cw;
-                }
-            }
-            state.show_toast("✓ Marked watched (85%)");
+            refresh_continue_watching_state(state, pool).await;
+            state.show_toast("Marked watched (85%)");
         }
         AppMessage::PlaybackDone(sess) => {
+            refresh_continue_watching_state(state, pool).await;
             if sess == state.active_session_id {
                 state.active_playback_video_id = None;
                 state.active_playback_title = None;
@@ -715,7 +897,7 @@ async fn handle_app_message(
                     job.done_path = Some(file_path);
                 }
             }
-            state.show_toast("✓ Offline download complete!");
+            state.show_toast("Offline download complete!");
         }
         AppMessage::DownloadFailed { video_id, error } => {
             if let Some(ref mut job) = state.active_download {
@@ -736,8 +918,8 @@ async fn handle_app_message(
         }
         AppMessage::UpdateSuccess(ver) => {
             state.update_progress = 100.0;
-            state.update_status = Some(format!("✓ Updated to {} — restart phaenna!", ver));
-            state.show_toast(format!("✓ Updated to {}!", ver));
+            state.update_status = Some(format!("Updated to {} — restart phaenna!", ver));
+            state.show_toast(format!("Updated to {}!", ver));
         }
         AppMessage::UpdateFailed(err) => {
             state.update_progress = 0.0;
@@ -749,10 +931,13 @@ async fn handle_app_message(
             state.cast_cursor = 0;
         }
         AppMessage::CastStarted(name) => {
-            state.show_toast(format!("📺 Casting to {}", name));
+            state.show_toast(format!("Casting to {}", name));
         }
         AppMessage::CastFailed(err) => {
             state.show_toast(format!("✕ Cast error: {}", err));
+        }
+        AppMessage::ShowToast(msg) => {
+            state.show_toast(msg);
         }
         _ => {}
     }
@@ -774,7 +959,9 @@ fn open_detail_for_video(
     state.queue_thumb_if_needed(&vid_id, &video.best_thumbnail_url());
     state.detail_video = Some(video);
     state.detail_view_mode = DetailViewMode::Overview;
+    state.detail_focus_pane = 0;
     state.detail_chapter_cursor = 0;
+    state.detail_related_cursor = 0;
     state.detail_scroll = 0;
     state.detail_subtitles.clear();
     state.detail_sponsor_segments.clear();
@@ -890,10 +1077,10 @@ async fn start_nonblocking_playback(
 
     match spawn_player(&opts) {
         Ok(Some(_child)) => {
-            let _ = record_watched(pool, Some(video), &video.id, now_unix()).await;
+            let _ = touch_watch_history(pool, Some(video), &video.id, now_unix()).await;
             state.watched_ids.insert(video.id.clone());
             state.show_toast(format!(
-                "▶ Playing via {} ({})",
+                "Playing via {} ({})",
                 state.config.player.label(),
                 quality.label()
             ));
@@ -940,17 +1127,199 @@ async fn start_nonblocking_playback(
     }
 }
 
-async fn toggle_watch_later(video: &VideoItem, state: &mut AppState, pool: &SqlitePool) {
+async fn refresh_continue_watching_state(state: &mut AppState, pool: &SqlitePool) {
+    if let Ok(cw) = get_continue_watching(pool).await {
+        if let Some(idx) = state
+            .categories
+            .iter()
+            .position(|(c, _)| *c == Category::ContinueWatching)
+        {
+            let new_len = cw.len();
+            state.categories[idx].1 = cw;
+            if state.category_cursors[idx] >= new_len {
+                state.category_cursors[idx] = new_len.saturating_sub(1);
+            }
+        }
+    }
+    if let Ok(meta) = get_continue_watching_meta_map(pool).await {
+        state.continue_watching_meta = meta;
+    }
+}
+
+async fn pin_video_to_continue_watching(
+    video: &VideoItem,
+    state: &mut AppState,
+    pool: &SqlitePool,
+) {
+    let _ = pin_to_continue_watching(pool, video, now_unix()).await;
+    refresh_continue_watching_state(state, pool).await;
+    let count = state
+        .categories
+        .iter()
+        .find(|(c, _)| *c == Category::ContinueWatching)
+        .map(|(_, v)| v.len())
+        .unwrap_or(0);
+    let short_title: String = video.title.chars().take(36).collect();
+    state.show_toast(format!(
+        "Added \"{short_title}\" to Continue Watching ({count})"
+    ));
+}
+
+async fn remove_video_from_continue_watching(
+    video: &VideoItem,
+    state: &mut AppState,
+    pool: &SqlitePool,
+) {
+    let _ = remove_continue_watching(pool, &video.id).await;
+    refresh_continue_watching_state(state, pool).await;
+    let short_title: String = video.title.chars().take(36).collect();
+    state.show_toast(format!("Removed \"{short_title}\" from Continue Watching"));
+}
+
+fn maybe_trigger_infinite_scroll(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+    force: bool,
+) {
+    let cat = state.categories[state.active_category].0;
+    let Some(url) = cat.url() else {
+        return;
+    };
+    let key = cat.feed_key().to_string();
+    if state.is_fetching_more {
+        return;
+    }
+    if !force {
+        if state.exhausted_feeds.contains(&key) {
+            return;
+        }
+        if let Some(ts) = state.last_pagination_at {
+            if ts.elapsed() < Duration::from_millis(400) {
+                return;
+            }
+        }
+    }
+
+    let current_len = state.categories[state.active_category].1.len();
+    state.is_fetching_more = true;
+    state.last_pagination_at = Some(Instant::now());
+
+    // Fast path: signed-in InnerTube continuation token
+    if let (Some(session), Some(browse_id), Some(token)) = (
+        state.auth_vault.active_account().cloned(),
+        browse_id_for_feed_key(&key),
+        state.feed_continuations.get(&key).cloned(),
+    ) {
+        let client_clone = client.clone();
+        let tx_m = tx.clone();
+        tokio::spawn(async move {
+            match fetch_innertube_shelf(&client_clone, &session, browse_id, Some(&token)).await {
+                Ok(page) => {
+                    let _ = tx_m
+                        .send(AppMessage::MoreFeedLoaded {
+                            feed_key: key,
+                            items: page.videos,
+                            continuation: page.continuation,
+                        })
+                        .await;
+                }
+                Err(_) => {
+                    let _ = tx_m
+                        .send(AppMessage::MoreFeedLoaded {
+                            feed_key: key,
+                            items: Vec::new(),
+                            continuation: None,
+                        })
+                        .await;
+                }
+            }
+        });
+        return;
+    }
+
+    // Fallback path: yt-dlp playlist slice
+    let start = current_len + 1;
+    let end = start + 23;
+    let cookies = state.config.cookies_path().ok();
+    let tx_m = tx.clone();
+    let u = url.to_string();
+    tokio::spawn(async move {
+        fetch_feed_range_stream(cookies.as_deref(), u, key, start, end, tx_m).await;
+    });
+}
+
+fn scroll_down_grid_and_prefetch(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+    cols: usize,
+    rows_step: usize,
+    list_len: usize,
+) {
+    if list_len == 0 {
+        maybe_trigger_infinite_scroll(state, tx, client, false);
+        return;
+    }
+    let cols = cols.max(1);
+    let step = cols * rows_step.max(1);
+    let c = &mut state.category_cursors[state.active_category];
+    if *c + step < list_len {
+        *c += step;
+    } else {
+        // Allow stepping down onto the incomplete final row cleanly instead of switching tabs.
+        let cur_row = *c / cols;
+        let last_row = (list_len - 1) / cols;
+        if cur_row < last_row {
+            *c = list_len - 1;
+        }
+    }
+
+    let cur_row = state.category_cursors[state.active_category] / cols;
+    let total_rows = list_len.div_ceil(cols);
+    if cur_row + 2 >= total_rows {
+        maybe_trigger_infinite_scroll(state, tx, client, false);
+    }
+}
+
+async fn toggle_watch_later(
+    video: &VideoItem,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+) {
+    let active_session = state.auth_vault.active_account().cloned();
     if state.watch_later_sources.contains_key(&video.id) {
         let _ = remove_from_watch_later(pool, &video.id).await;
         state.watch_later_sources.remove(&video.id);
-        state.show_toast("Removed from Watch Later");
+        if let Some(sess) = active_session {
+            let c_clone = client.clone();
+            let vid = video.id.clone();
+            tokio::spawn(async move {
+                let _ = innertube_edit_watch_later(&c_clone, &sess, &vid, false).await;
+            });
+            state.show_toast("Removed from Watch Later (Local + YouTube)");
+        } else {
+            state.show_toast("Removed from Watch Later");
+        }
     } else {
-        let _ = add_to_watch_later(pool, video, WatchLaterSource::Local, now_unix()).await;
-        state
-            .watch_later_sources
-            .insert(video.id.clone(), WatchLaterSource::Local);
-        state.show_toast("★ Added to Watch Later");
+        let src = if active_session.is_some() {
+            WatchLaterSource::Both
+        } else {
+            WatchLaterSource::Local
+        };
+        let _ = add_to_watch_later(pool, video, src, now_unix()).await;
+        state.watch_later_sources.insert(video.id.clone(), src);
+        if let Some(sess) = active_session {
+            let c_clone = client.clone();
+            let vid = video.id.clone();
+            tokio::spawn(async move {
+                let _ = innertube_edit_watch_later(&c_clone, &sess, &vid, true).await;
+            });
+            state.show_toast("Added to Watch Later (Synced to YouTube)");
+        } else {
+            state.show_toast("Added to Watch Later");
+        }
     }
     if let Ok(wl_items) = get_feed_videos(pool, WATCH_LATER).await {
         if let Some((_, list)) = state
@@ -1033,6 +1402,18 @@ async fn execute_hub_action(
             state.config.shader_mode = state.config.shader_mode.next();
             let _ = state.config.save();
         }
+        HubActionId::InstallNeuralShaders => {
+            state.show_toast("Downloading FSRCNNX 4K neural CNN shader pack...");
+            let c_s = client.clone();
+            let tx_s = tx.clone();
+            tokio::spawn(async move {
+                let msg = match download_neural_shader_pack(&c_s).await {
+                    Ok(path) => format!("FSRCNNX Neural Cinema 4K installed ({})", path.display()),
+                    Err(e) => format!("Neural shader download failed: {}", e),
+                };
+                let _ = tx_s.send(AppMessage::ShowToast(msg)).await;
+            });
+        }
         HubActionId::SubtitlesEnabled => {
             state.config.subtitles_enabled = !state.config.subtitles_enabled;
             let _ = state.config.save();
@@ -1067,7 +1448,9 @@ async fn execute_hub_action(
                 let _ = tx_c.send(AppMessage::CastDevicesDiscovered(devs)).await;
             });
         }
-        HubActionId::CookieSyncModal => {
+        HubActionId::GoogleAccountHub => {
+            state.login_ui.step = LoginStep::Hub;
+            state.login_ui.error_banner = None;
             state.overlay = ActiveOverlay::Login;
         }
         HubActionId::UploadRadar => {
@@ -1118,6 +1501,9 @@ async fn handle_mouse_event(
     }
 
     let [top_area, _, grid_area, footer_area] = home_layout(frame_area);
+    let active_cat = state.categories[state.active_category].0;
+    let cw_deck = active_cat == Category::ContinueWatching && !state.continue_watching_grid_mode;
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if mouse.row == top_area.y {
@@ -1129,12 +1515,19 @@ async fn handle_mouse_event(
             if mouse.row >= grid_area.y && mouse.row < grid_area.y + grid_area.height {
                 let total = state.current_filtered_videos().len();
                 let scroll = state.grid_scroll_rows[state.active_category];
-                if let Some(idx) =
+                let hit = if cw_deck {
+                    continue_watching_row_at(grid_area, mouse.column, mouse.row, scroll, total)
+                } else {
                     grid_card_index_at(grid_area, mouse.column, mouse.row, scroll, total)
-                {
+                };
+                if let Some(idx) = hit {
                     if state.category_cursors[state.active_category] == idx {
                         if let Some(v) = state.current_home_video() {
-                            open_detail_for_video(v, state, pool, tx, client);
+                            if cw_deck {
+                                start_nonblocking_playback(&v, None, state, pool, tx, client).await;
+                            } else {
+                                open_detail_for_video(v, state, pool, tx, client);
+                            }
                         }
                     } else {
                         state.category_cursors[state.active_category] = idx;
@@ -1164,17 +1557,27 @@ async fn handle_mouse_event(
         }
         MouseEventKind::ScrollDown => {
             let len = state.current_filtered_videos().len();
-            if len > 0 {
+            if cw_deck {
+                if len > 0 {
+                    let cur = &mut state.category_cursors[state.active_category];
+                    *cur = (*cur + 1).min(len - 1);
+                    return true;
+                }
+            } else {
                 let cols = grid_columns(grid_area.width);
-                let cur = &mut state.category_cursors[state.active_category];
-                *cur = (*cur + cols).min(len - 1);
+                scroll_down_grid_and_prefetch(state, tx, client, cols, 1, len);
                 return true;
             }
         }
         MouseEventKind::ScrollUp => {
-            let cols = grid_columns(grid_area.width);
-            let cur = &mut state.category_cursors[state.active_category];
-            *cur = cur.saturating_sub(cols);
+            if cw_deck {
+                let cur = &mut state.category_cursors[state.active_category];
+                *cur = cur.saturating_sub(1);
+            } else {
+                let cols = grid_columns(grid_area.width);
+                let cur = &mut state.category_cursors[state.active_category];
+                *cur = cur.saturating_sub(cols);
+            }
             return true;
         }
         _ => {}
@@ -1185,6 +1588,7 @@ async fn handle_mouse_event(
 /// Returns true only when application should quit.
 async fn handle_key_event(
     code: KeyCode,
+    modifiers: KeyModifiers,
     state: &mut AppState,
     pool: &SqlitePool,
     tx: &mpsc::Sender<AppMessage>,
@@ -1192,7 +1596,7 @@ async fn handle_key_event(
 ) -> bool {
     // 1. Handle active modal overlay first
     if state.overlay != ActiveOverlay::None {
-        handle_overlay_key(code, state, pool, tx, client).await;
+        handle_overlay_key(code, modifiers, state, pool, tx, client).await;
         return false;
     }
 
@@ -1208,39 +1612,76 @@ async fn handle_key_event(
                     }
                 }
                 KeyCode::Tab => {
-                    state.detail_view_mode = match state.detail_view_mode {
-                        DetailViewMode::Overview => DetailViewMode::Chapters,
-                        DetailViewMode::Chapters => DetailViewMode::Overview,
+                    state.detail_focus_pane = (state.detail_focus_pane + 1) % 3;
+                    state.detail_view_mode = if state.detail_focus_pane == 1 {
+                        DetailViewMode::Chapters
+                    } else {
+                        DetailViewMode::Overview
+                    };
+                }
+                KeyCode::BackTab => {
+                    state.detail_focus_pane = (state.detail_focus_pane + 2) % 3;
+                    state.detail_view_mode = if state.detail_focus_pane == 1 {
+                        DetailViewMode::Chapters
+                    } else {
+                        DetailViewMode::Overview
                     };
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if state.detail_view_mode == DetailViewMode::Chapters {
-                        let n = state
-                            .detail_video
-                            .as_ref()
-                            .and_then(|v| v.chapters.as_ref())
-                            .map(|c| c.len())
-                            .unwrap_or(0);
-                        if n > 0 {
-                            state.detail_chapter_cursor = (state.detail_chapter_cursor + 1).min(n - 1);
+                    match state.detail_focus_pane {
+                        1 => {
+                            let n = state
+                                .detail_video
+                                .as_ref()
+                                .map(|v| v.effective_chapters().len())
+                                .unwrap_or(0);
+                            if n > 0 {
+                                state.detail_chapter_cursor =
+                                    (state.detail_chapter_cursor + 1).min(n - 1);
+                            }
                         }
-                    } else {
-                        state.detail_scroll = state.detail_scroll.saturating_add(2);
+                        2 => {
+                            let n = state.detail_related_entries().len();
+                            if n > 0 {
+                                state.detail_related_cursor =
+                                    (state.detail_related_cursor + 1).min(n - 1);
+                            }
+                        }
+                        _ => {
+                            state.detail_scroll = state.detail_scroll.saturating_add(2);
+                        }
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    if state.detail_view_mode == DetailViewMode::Chapters {
-                        state.detail_chapter_cursor = state.detail_chapter_cursor.saturating_sub(1);
-                    } else {
-                        state.detail_scroll = state.detail_scroll.saturating_sub(2);
+                    match state.detail_focus_pane {
+                        1 => {
+                            state.detail_chapter_cursor =
+                                state.detail_chapter_cursor.saturating_sub(1);
+                        }
+                        2 => {
+                            state.detail_related_cursor =
+                                state.detail_related_cursor.saturating_sub(1);
+                        }
+                        _ => {
+                            state.detail_scroll = state.detail_scroll.saturating_sub(2);
+                        }
                     }
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(v) = state.detail_video.clone() {
-                        let start_ch = if state.detail_view_mode == DetailViewMode::Chapters {
-                            v.chapters
-                                .as_ref()
-                                .and_then(|c| c.get(state.detail_chapter_cursor))
+                    if state.detail_focus_pane == 2 {
+                        let related = state.detail_related_entries();
+                        if let Some((_, rel_vid)) = related.get(state.detail_related_cursor).cloned() {
+                            if code == KeyCode::Char(' ') {
+                                start_nonblocking_playback(&rel_vid, None, state, pool, tx, client)
+                                    .await;
+                            } else {
+                                open_detail_for_video(rel_vid, state, pool, tx, client);
+                            }
+                        }
+                    } else if let Some(v) = state.detail_video.clone() {
+                        let start_ch = if state.detail_focus_pane == 1 {
+                            v.effective_chapters()
+                                .get(state.detail_chapter_cursor)
                                 .map(|c| c.start_time)
                         } else {
                             None
@@ -1282,9 +1723,14 @@ async fn handle_key_event(
                     }
                 }
                 KeyCode::Char('p') => state.overlay = ActiveOverlay::PlayOptions,
+                KeyCode::Char('a') | KeyCode::Char('+') => {
+                    if let Some(v) = state.detail_video.clone() {
+                        pin_video_to_continue_watching(&v, state, pool).await;
+                    }
+                }
                 KeyCode::Char('w') => {
                     if let Some(v) = state.detail_video.clone() {
-                        toggle_watch_later(&v, state, pool).await;
+                        toggle_watch_later(&v, state, pool, client).await;
                     }
                 }
                 KeyCode::Char('D') => {
@@ -1323,6 +1769,11 @@ async fn handle_key_event(
                         start_nonblocking_playback(&v, None, state, pool, tx, client).await;
                     }
                 }
+                KeyCode::Char('a') | KeyCode::Char('+') => {
+                    if let Some(v) = state.channel_videos.get(state.channel_cursor).cloned() {
+                        pin_video_to_continue_watching(&v, state, pool).await;
+                    }
+                }
                 KeyCode::Char('q') => return true,
                 _ => {}
             }
@@ -1331,11 +1782,17 @@ async fn handle_key_event(
         Screen::Home => {}
     }
 
-    // 3. Home Grid Global Keybindings
+    // 3. Home Global Keybindings
     let list_len = state.current_filtered_videos().len();
-    let cols = crossterm::terminal::size()
-        .map(|(w, _)| grid_columns(w))
-        .unwrap_or(3);
+    let (cols, visible_rows) = crossterm::terminal::size()
+        .map(|(w, h)| {
+            let [_, _, grid_area, _] = home_layout(ratatui::layout::Rect::new(0, 0, w, h));
+            let m = compute_grid_metrics(grid_area);
+            (m.cols, m.visible_rows)
+        })
+        .unwrap_or((3, 2));
+    let active_cat = state.categories[state.active_category].0;
+    let cw_deck = active_cat == Category::ContinueWatching && !state.continue_watching_grid_mode;
 
     match code {
         KeyCode::Char('q') => return true,
@@ -1352,14 +1809,23 @@ async fn handle_key_event(
             state.settings_cursor = 0;
             state.overlay = ActiveOverlay::Settings;
         }
-        KeyCode::Char('L') => state.overlay = ActiveOverlay::Login,
+        KeyCode::Char('L') => {
+            state.login_ui.step = LoginStep::Hub;
+            state.login_ui.error_banner = None;
+            state.overlay = ActiveOverlay::Login;
+        }
         KeyCode::Char('!') => {
             state.deps = detect_dependencies();
             state.overlay = ActiveOverlay::Setup;
         }
         KeyCode::Char('f') => state.overlay = ActiveOverlay::Filter,
         KeyCode::Char('p') => state.overlay = ActiveOverlay::PlayOptions,
-        KeyCode::Char('a') => open_analytics(state, pool).await,
+        KeyCode::Char('A') => open_analytics(state, pool).await,
+        KeyCode::Char('a') | KeyCode::Char('+') => {
+            if let Some(v) = state.current_home_video() {
+                pin_video_to_continue_watching(&v, state, pool).await;
+            }
+        }
         KeyCode::Char('t') => {
             recompute_tailored_pool(state);
             state.overlay = ActiveOverlay::TailoredWizard;
@@ -1374,38 +1840,70 @@ async fn handle_key_event(
         KeyCode::Char('T') => {
             state.config.theme_index = (state.config.theme_index + 1) % ui::theme::THEMES.len();
             let _ = state.config.save();
-            state.show_toast(format!("🎨 Theme: {}", state.base_theme().name));
+            state.show_toast(format!("Theme: {}", state.base_theme().name));
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {
-            trigger_swr_feed_refreshes(state, pool, tx, true);
-            state.show_toast("⟳ Refreshing all YouTube shelves...");
+            trigger_swr_feed_refreshes(state, pool, tx, client, true);
+            state.show_toast("Refreshing all YouTube shelves...");
         }
         KeyCode::Char('n') | KeyCode::Char(']') => {
-            let cat = state.categories[state.active_category].0;
-            if let Some(url) = cat.url() {
-                if !state.is_fetching_more {
-                    state.is_fetching_more = true;
-                    let current_len = state.categories[state.active_category].1.len();
-                    let start = current_len + 1;
-                    let end = start + 15;
-                    let cookies = state.config.cookies_path().ok();
-                    let key = cat.feed_key().to_string();
-                    let tx_m = tx.clone();
-                    let u = url.to_string();
-                    tokio::spawn(async move {
-                        fetch_feed_range_stream(cookies.as_deref(), u, key, start, end, tx_m).await;
-                    });
-                }
-            }
+            maybe_trigger_infinite_scroll(state, tx, client, true);
         }
         KeyCode::Char('w') => {
             if let Some(v) = state.current_home_video() {
-                toggle_watch_later(&v, state, pool).await;
+                toggle_watch_later(&v, state, pool, client).await;
             }
         }
         KeyCode::Char('D') => {
             if let Some(v) = state.current_home_video() {
                 spawn_offline_download(&v, state, pool, tx);
+            }
+        }
+        KeyCode::Char('v') if active_cat == Category::ContinueWatching => {
+            state.continue_watching_grid_mode = !state.continue_watching_grid_mode;
+            state.show_toast(if state.continue_watching_grid_mode {
+                "Continue Watching: Grid View"
+            } else {
+                "Continue Watching: Queue Deck View"
+            });
+        }
+        KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete
+            if active_cat == Category::ContinueWatching =>
+        {
+            if let Some(v) = state.current_home_video() {
+                remove_video_from_continue_watching(&v, state, pool).await;
+            }
+        }
+        KeyCode::Backspace if cw_deck => {
+            if let Some(v) = state.current_home_video() {
+                remove_video_from_continue_watching(&v, state, pool).await;
+            }
+        }
+        KeyCode::Char('X') if active_cat == Category::ContinueWatching => {
+            if let Ok(cleared) = clear_finished_continue_watching(pool).await {
+                refresh_continue_watching_state(state, pool).await;
+                state.show_toast(format!("Cleared {cleared} finished videos from Continue Watching"));
+            }
+        }
+        KeyCode::Char('K') if active_cat == Category::ContinueWatching => {
+            if let Some(v) = state.current_home_video() {
+                if move_continue_watching_item(pool, &v.id, -1).await.unwrap_or(false) {
+                    refresh_continue_watching_state(state, pool).await;
+                    let c = &mut state.category_cursors[state.active_category];
+                    *c = c.saturating_sub(1);
+                }
+            }
+        }
+        KeyCode::Char('J') if active_cat == Category::ContinueWatching => {
+            if let Some(v) = state.current_home_video() {
+                if move_continue_watching_item(pool, &v.id, 1).await.unwrap_or(false) {
+                    refresh_continue_watching_state(state, pool).await;
+                    let len = state.current_filtered_videos().len();
+                    if len > 0 {
+                        let c = &mut state.category_cursors[state.active_category];
+                        *c = (*c + 1).min(len - 1);
+                    }
+                }
             }
         }
         KeyCode::Char('i') => {
@@ -1415,7 +1913,11 @@ async fn handle_key_event(
         }
         KeyCode::Enter => {
             if let Some(v) = state.current_home_video() {
-                open_detail_for_video(v, state, pool, tx, client);
+                if active_cat == Category::ContinueWatching {
+                    start_nonblocking_playback(&v, None, state, pool, tx, client).await;
+                } else {
+                    open_detail_for_video(v, state, pool, tx, client);
+                }
             }
         }
         KeyCode::Char(' ') => {
@@ -1431,34 +1933,80 @@ async fn handle_key_event(
         KeyCode::Tab => {
             state.active_category = (state.active_category + 1) % state.categories.len();
         }
+        KeyCode::BackTab => {
+            state.active_category =
+                (state.active_category + state.categories.len() - 1) % state.categories.len();
+        }
         KeyCode::Char('l') | KeyCode::Right => {
-            if list_len > 0 {
+            if list_len > 0 && !cw_deck {
                 let c = &mut state.category_cursors[state.active_category];
                 *c = (*c + 1).min(list_len - 1);
             }
         }
         KeyCode::Char('h') | KeyCode::Left => {
-            let c = &mut state.category_cursors[state.active_category];
-            *c = c.saturating_sub(1);
+            if !cw_deck {
+                let c = &mut state.category_cursors[state.active_category];
+                *c = c.saturating_sub(1);
+            }
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if list_len > 0 {
-                let c = &mut state.category_cursors[state.active_category];
-                if *c + cols < list_len {
-                    *c += cols;
-                } else {
-                    state.active_category = (state.active_category + 1) % state.categories.len();
+            if cw_deck {
+                if list_len > 0 {
+                    let c = &mut state.category_cursors[state.active_category];
+                    *c = (*c + 1).min(list_len - 1);
                 }
             } else {
-                state.active_category = (state.active_category + 1) % state.categories.len();
+                scroll_down_grid_and_prefetch(state, tx, client, cols, 1, list_len);
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
+            if cw_deck {
+                let c = &mut state.category_cursors[state.active_category];
+                *c = c.saturating_sub(1);
+            } else {
+                let c = &mut state.category_cursors[state.active_category];
+                *c = c.saturating_sub(cols);
+            }
+        }
+        KeyCode::PageDown => {
+            if cw_deck {
+                if list_len > 0 {
+                    let c = &mut state.category_cursors[state.active_category];
+                    *c = (*c + 5).min(list_len - 1);
+                }
+            } else {
+                scroll_down_grid_and_prefetch(state, tx, client, cols, visible_rows, list_len);
+            }
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if cw_deck {
+                if list_len > 0 {
+                    let c = &mut state.category_cursors[state.active_category];
+                    *c = (*c + 5).min(list_len - 1);
+                }
+            } else {
+                scroll_down_grid_and_prefetch(state, tx, client, cols, visible_rows, list_len);
+            }
+        }
+        KeyCode::PageUp => {
+            let step = if cw_deck { 5 } else { cols * visible_rows.max(1) };
             let c = &mut state.category_cursors[state.active_category];
-            if *c >= cols {
-                *c -= cols;
-            } else if state.active_category > 0 {
-                state.active_category -= 1;
+            *c = c.saturating_sub(step);
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            let step = if cw_deck { 5 } else { cols * visible_rows.max(1) };
+            let c = &mut state.category_cursors[state.active_category];
+            *c = c.saturating_sub(step);
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.category_cursors[state.active_category] = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            if list_len > 0 {
+                state.category_cursors[state.active_category] = list_len - 1;
+            }
+            if !cw_deck {
+                maybe_trigger_infinite_scroll(state, tx, client, false);
             }
         }
         _ => {}
@@ -1469,6 +2017,7 @@ async fn handle_key_event(
 
 async fn handle_overlay_key(
     code: KeyCode,
+    modifiers: KeyModifiers,
     state: &mut AppState,
     pool: &SqlitePool,
     tx: &mpsc::Sender<AppMessage>,
@@ -1487,49 +2036,18 @@ async fn handle_overlay_key(
             KeyCode::Esc | KeyCode::Char('!') => state.overlay = ActiveOverlay::None,
             KeyCode::Char('r') => {
                 state.deps = detect_dependencies();
-                state.show_toast("🩺 Re-scanned runtime binaries");
+                state.show_toast("Re-scanned runtime binaries");
             }
-            KeyCode::Char('L') => state.overlay = ActiveOverlay::Login,
+            KeyCode::Char('L') => {
+            state.login_ui.step = LoginStep::Hub;
+            state.login_ui.error_banner = None;
+            state.overlay = ActiveOverlay::Login;
+        }
             _ => {}
         },
-        ActiveOverlay::Login => match code {
-            KeyCode::Esc | KeyCode::Char('L') => state.overlay = ActiveOverlay::None,
-            KeyCode::Char('1') => {
-                let cpath = match state.config.cookies_path() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        state.login_status = Some(format!("Path error: {}", e));
-                        return;
-                    }
-                };
-                let src = state.config.cookie_source;
-                let tx_s = tx.clone();
-                state.login_status = Some("⟳ Syncing cookies...".to_string());
-                tokio::spawn(async move {
-                    let res = sync_browser_cookies(src, &cpath)
-                        .await
-                        .map(|(_, msg)| msg)
-                        .map_err(|e| e.to_string());
-                    let _ = tx_s.send(AppMessage::SyncFinished(res)).await;
-                });
-            }
-            KeyCode::Char('2') => {
-                #[cfg(target_os = "macos")]
-                let _ = std::process::Command::new("open")
-                    .arg("https://accounts.google.com")
-                    .spawn();
-                #[cfg(target_os = "linux")]
-                let _ = std::process::Command::new("xdg-open")
-                    .arg("https://accounts.google.com")
-                    .spawn();
-                state.login_status = Some("Opened accounts.google.com in browser.".to_string());
-            }
-            KeyCode::Char('3') => {
-                state.config.cookie_source = state.config.cookie_source.next();
-                let _ = state.config.save();
-            }
-            _ => {}
-        },
+        ActiveOverlay::Login => {
+            handle_login_overlay_key(code, modifiers, state, pool, tx, client).await;
+        }
         ActiveOverlay::Filter => match code {
             KeyCode::Esc | KeyCode::Char('f') | KeyCode::Enter => {
                 state.overlay = ActiveOverlay::None;
@@ -1588,6 +2106,10 @@ async fn handle_overlay_key(
                 }
                 let _ = state.config.save();
             }
+            KeyCode::Char('s') => {
+                state.config.shader_mode = state.config.shader_mode.next();
+                let _ = state.config.save();
+            }
             KeyCode::Enter => {
                 state.overlay = ActiveOverlay::None;
                 if let Some(v) = state.active_selected_video() {
@@ -1618,7 +2140,18 @@ async fn handle_overlay_key(
                     }
                 }
             }
-            KeyCode::Char('p') => {
+            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                    pin_video_to_continue_watching(&v, state, pool).await;
+                }
+            }
+            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                    state.overlay = ActiveOverlay::None;
+                    start_nonblocking_playback(&v, None, state, pool, tx, client).await;
+                }
+            }
+            KeyCode::Char('p') if state.search_query.is_empty() => {
                 if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
                     state.overlay = ActiveOverlay::None;
                     start_nonblocking_playback(&v, None, state, pool, tx, client).await;
@@ -1674,7 +2207,7 @@ async fn handle_overlay_key(
             _ => {}
         },
         ActiveOverlay::Analytics => match code {
-            KeyCode::Esc | KeyCode::Char('a') => state.overlay = ActiveOverlay::None,
+            KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => state.overlay = ActiveOverlay::None,
             KeyCode::Char('r') => open_analytics(state, pool).await,
             _ => {}
         },
@@ -1801,7 +2334,7 @@ async fn handle_overlay_key(
             KeyCode::Down | KeyCode::Char('j') => {
                 state.calendar_item_cursor = state.calendar_item_cursor.saturating_add(1);
             }
-            KeyCode::Char('w') | KeyCode::Enter => {
+            KeyCode::Char('w') | KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('p') | KeyCode::Char('a') | KeyCode::Char('+') => {
                 let pool_v = state.all_known_videos();
                 let wl_ids: HashSet<String> = state.watch_later_sources.keys().cloned().collect();
                 let buckets = bucket_videos_by_week(
@@ -1815,10 +2348,14 @@ async fn handle_overlay_key(
                 if let Some(day_list) = buckets.get(&state.calendar_day_cursor) {
                     if let Some(entry) = day_list.get(state.calendar_item_cursor.min(day_list.len().saturating_sub(1))) {
                         let vid = entry.video.clone();
-                        if code == KeyCode::Char('w') {
-                            toggle_watch_later(&vid, state, pool).await;
-                        } else {
-                            open_detail_for_video(vid, state, pool, tx, client);
+                        match code {
+                            KeyCode::Char('w') => toggle_watch_later(&vid, state, pool, client).await,
+                            KeyCode::Char('a') | KeyCode::Char('+') => pin_video_to_continue_watching(&vid, state, pool).await,
+                            KeyCode::Char(' ') | KeyCode::Char('p') => {
+                                state.overlay = ActiveOverlay::None;
+                                start_nonblocking_playback(&vid, None, state, pool, tx, client).await;
+                            }
+                            _ => open_detail_for_video(vid, state, pool, tx, client),
                         }
                     }
                 }
@@ -1858,7 +2395,7 @@ async fn handle_overlay_key(
                     let tx_cast = tx.clone();
                     let name = dev.name.clone();
                     let start_pos = state.progress_map.get(&vid.id).map(|(p, _)| *p).unwrap_or(0.0);
-                    state.show_toast(format!("📺 Resolving stream for {}...", name));
+                    state.show_toast(format!("Resolving stream for {}...", name));
                     tokio::spawn(async move {
                         match resolve_tv_stream_url(&vid.id).await {
                             Ok(url) => match start_casting(&dev, &url, start_pos).await {
@@ -1894,6 +2431,483 @@ async fn handle_overlay_key(
             KeyCode::Enter => {
                 if let Some(info) = state.available_update.clone() {
                     spawn_self_update(client.clone(), info, tx.clone());
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+async fn persist_auth_vault_and_cookies(state: &AppState, pool: &SqlitePool) {
+    if let Ok(vpath) = Config::auth_vault_path() {
+        let _ = state.auth_vault.save_to_path(&vpath);
+    }
+    if let Ok(cpath) = state.config.cookies_path() {
+        let _ = state.auth_vault.sync_isolated_cookie_jar(&cpath);
+    }
+    if let Some(active) = state.auth_vault.active_account() {
+        let _ = upsert_account(pool, &active.to_account_row(true)).await;
+    }
+}
+
+fn open_client_id_setup(state: &mut AppState, after: Option<PendingOAuthFlow>) {
+    state.login_ui.reset_transient();
+    state.login_ui.error_banner = None;
+    state.login_ui.client_id_input = state
+        .config
+        .google_oauth
+        .client_id
+        .clone()
+        .unwrap_or_default();
+    state.login_ui.client_secret_input = state
+        .config
+        .google_oauth
+        .client_secret
+        .clone()
+        .unwrap_or_default();
+    state.login_ui.setup_field_idx = 0;
+    state.login_ui.setup_after = after;
+    state.login_ui.status_banner = Some(
+        "Enter your Google Cloud OAuth Client ID (TVs / Desktop App) to enable QR & Kitty SSO."
+            .to_string(),
+    );
+    state.login_ui.step = LoginStep::ClientIdSetup;
+}
+
+fn start_device_code_flow(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let Some(oauth) = resolve_oauth_client(&state.config.google_oauth) else {
+        open_client_id_setup(state, Some(PendingOAuthFlow::DeviceCode));
+        return;
+    };
+
+    state.login_ui.reset_transient();
+    state.login_ui.error_banner = None;
+    state.login_ui.busy = true;
+    state.login_ui.step = LoginStep::AwaitingDeviceQr;
+    state.login_ui.status_banner = Some("Requesting Google Device Code & terminal QR...".into());
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    state.login_ui.cancel_tx = Some(cancel_tx);
+
+    let c_clone = client.clone();
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        match request_device_code(&c_clone, &oauth).await {
+            Ok(dev) => {
+                let dev_for_poll = dev.clone();
+                let _ = tx_clone.send(AppMessage::AuthDeviceCodeReady(dev)).await;
+                match poll_device_code_until_done(c_clone, oauth, dev_for_poll, cancel_rx).await {
+                    Ok(session) => {
+                        let _ = tx_clone.send(AppMessage::AuthSignedIn(session)).await;
+                    }
+                    Err(e) if e != "Cancelled by user" => {
+                        let _ = tx_clone.send(AppMessage::AuthFailed(e)).await;
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(e) => {
+                let _ = tx_clone.send(AppMessage::AuthFailed(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn start_kitty_split_signin(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    state.login_ui.reset_transient();
+    state.login_ui.error_banner = None;
+    state.login_ui.busy = true;
+    state.login_ui.step = LoginStep::AwaitingKittySso;
+    state.login_ui.kitty_auth_url = Some(GOOGLE_YOUTUBE_SERVICE_LOGIN_URL.to_string());
+    state.login_ui.status_banner =
+        Some("Launching official Google Sign-In in Kitty right split...".into());
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    state.login_ui.cancel_tx = Some(cancel_tx);
+
+    let c_clone = client.clone();
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        let tx_status = tx_clone.clone();
+        let res = run_kitty_split_google_signin(c_clone, cancel_rx, move |_status| {
+            let _ = tx_status.try_send(AppMessage::AuthKittyUrlReady {
+                url: GOOGLE_YOUTUBE_SERVICE_LOGIN_URL.to_string(),
+                launcher: "Kitty right split (terminal-browser)",
+            });
+        })
+        .await;
+        match res {
+            Ok(session) => {
+                let _ = tx_clone.send(AppMessage::AuthSignedIn(session)).await;
+            }
+            Err(e) if e != "OAuth sign-in cancelled" => {
+                let _ = tx_clone.send(AppMessage::AuthFailed(e)).await;
+            }
+            Err(_) => {}
+        }
+    });
+}
+
+fn start_kitty_pkce_flow(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let Some(oauth) = resolve_oauth_client(&state.config.google_oauth) else {
+        open_client_id_setup(state, Some(PendingOAuthFlow::KittyPkce));
+        return;
+    };
+
+    state.login_ui.reset_transient();
+    state.login_ui.error_banner = None;
+    state.login_ui.busy = true;
+    state.login_ui.step = LoginStep::AwaitingKittySso;
+    state.login_ui.status_banner =
+        Some("Starting loopback callback listener on 127.0.0.1:41933...".into());
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    state.login_ui.cancel_tx = Some(cancel_tx);
+
+    let c_clone = client.clone();
+    let tx_clone = tx.clone();
+    let prefer_kitty = state.config.google_oauth.prefer_kitty_split;
+    tokio::spawn(async move {
+        let tx_url = tx_clone.clone();
+        let res = run_loopback_pkce_flow(
+            c_clone,
+            oauth,
+            prefer_kitty,
+            cancel_rx,
+            move |url, launcher| {
+                let _ = tx_url.try_send(AppMessage::AuthKittyUrlReady { url, launcher });
+            },
+        )
+        .await;
+        match res {
+            Ok(session) => {
+                let _ = tx_clone.send(AppMessage::AuthSignedIn(session)).await;
+            }
+            Err(e) if e != "OAuth sign-in cancelled" => {
+                let _ = tx_clone.send(AppMessage::AuthFailed(e)).await;
+            }
+            Err(_) => {}
+        }
+    });
+}
+
+fn launch_direct_login(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let email = state.login_ui.email.trim().to_string();
+    let pw = state.login_ui.password.clone();
+    state.login_ui.password.clear();
+    state.login_ui.busy = true;
+    state.login_ui.error_banner = None;
+    state.login_ui.status_banner = Some("Authenticating with Google inside Phaenna...".into());
+
+    let c_clone = client.clone();
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        let msg = match submit_direct_credentials(&c_clone, &email, &pw).await {
+            Ok(DirectAuthOutcome::SignedIn(sess)) => AppMessage::AuthSignedIn(*sess),
+            Ok(DirectAuthOutcome::NeedsTwoFactor {
+                kind,
+                cookies,
+                challenge_token,
+            }) => AppMessage::AuthChallengeRequired {
+                kind,
+                cookies,
+                challenge_token,
+            },
+            Ok(DirectAuthOutcome::RequiresModernSso { reason }) => {
+                AppMessage::AuthNeedsModernSso { reason }
+            }
+            Err(e) => AppMessage::AuthFailed(e.to_string()),
+        };
+        let _ = tx_clone.send(msg).await;
+    });
+}
+
+fn launch_two_factor_submit(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let email = state.login_ui.email.trim().to_string();
+    let code = state.login_ui.two_factor_code.clone();
+    let cookies = state.login_ui.pending_flow_cookies.clone();
+    let token = state.login_ui.pending_challenge_token.clone();
+
+    state.login_ui.busy = true;
+    state.login_ui.error_banner = None;
+    state.login_ui.status_banner = Some("Verifying 2-Step Verification code...".into());
+
+    let c_clone = client.clone();
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        let msg = match submit_two_factor_challenge(&c_clone, &email, &code, cookies, token).await {
+            Ok(DirectAuthOutcome::SignedIn(sess)) => AppMessage::AuthSignedIn(*sess),
+            Ok(DirectAuthOutcome::NeedsTwoFactor {
+                kind,
+                cookies,
+                challenge_token,
+            }) => AppMessage::AuthChallengeRequired {
+                kind,
+                cookies,
+                challenge_token,
+            },
+            Ok(DirectAuthOutcome::RequiresModernSso { reason }) => {
+                AppMessage::AuthNeedsModernSso { reason }
+            }
+            Err(e) => AppMessage::AuthFailed(e.to_string()),
+        };
+        let _ = tx_clone.send(msg).await;
+    });
+}
+
+fn is_plain_text_char(modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+async fn handle_login_overlay_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    match state.login_ui.step.clone() {
+        LoginStep::Hub => match code {
+            KeyCode::Esc | KeyCode::Char('L') => {
+                state.login_ui.reset_transient();
+                state.overlay = ActiveOverlay::None;
+            }
+            KeyCode::Char('1') | KeyCode::Char('+') => {
+                start_kitty_split_signin(state, tx, client);
+            }
+            KeyCode::Enter if !state.auth_vault.is_authenticated() => {
+                start_kitty_split_signin(state, tx, client);
+            }
+            KeyCode::Char('2') => {
+                state.login_ui.reset_transient();
+                state.login_ui.error_banner = None;
+                state.login_ui.status_banner =
+                    Some("Step 1/3: Enter your Google or Workspace email address".into());
+                state.login_ui.step = LoginStep::EmailInput;
+            }
+            KeyCode::Char('3') => start_device_code_flow(state, tx, client),
+            KeyCode::Char('o') => open_client_id_setup(state, None),
+            KeyCode::Char('r') if state.auth_vault.is_authenticated() => {
+                trigger_swr_feed_refreshes(state, pool, tx, client, true);
+                state.show_toast("Refreshing personalized YouTube shelves...");
+            }
+            KeyCode::Up | KeyCode::Char('k') if !state.auth_vault.accounts.is_empty() => {
+                state.login_ui.account_cursor = state.login_ui.account_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if !state.auth_vault.accounts.is_empty() => {
+                let max = state.auth_vault.accounts.len().saturating_sub(1);
+                state.login_ui.account_cursor = (state.login_ui.account_cursor + 1).min(max);
+            }
+            KeyCode::Enter if state.auth_vault.is_authenticated() => {
+                let idx = state
+                    .login_ui
+                    .account_cursor
+                    .min(state.auth_vault.accounts.len().saturating_sub(1));
+                if let Some(acct) = state.auth_vault.accounts.get(idx).cloned() {
+                    if state.auth_vault.set_active(&acct.account_id) {
+                        let _ = set_active_account(pool, &acct.account_id).await;
+                        persist_auth_vault_and_cookies(state, pool).await;
+                        state.login_ui.status_banner =
+                            Some(format!("Switched active account to {}", acct.email));
+                        trigger_swr_feed_refreshes(state, pool, tx, client, true);
+                    }
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('d') if state.auth_vault.is_authenticated() => {
+                let idx = state
+                    .login_ui
+                    .account_cursor
+                    .min(state.auth_vault.accounts.len().saturating_sub(1));
+                if let Some(acct) = state.auth_vault.accounts.get(idx).cloned() {
+                    state.auth_vault.remove_account(&acct.account_id);
+                    let _ = delete_account(pool, &acct.account_id).await;
+                    state.login_ui.account_cursor = state
+                        .login_ui
+                        .account_cursor
+                        .min(state.auth_vault.accounts.len().saturating_sub(1));
+                    persist_auth_vault_and_cookies(state, pool).await;
+                    state.login_ui.status_banner =
+                        Some(format!("Signed out and purged credentials for {}", acct.email));
+                    state.show_toast("Signed out & wiped Phaenna vault entry");
+                }
+            }
+            _ => {}
+        },
+        LoginStep::EmailInput => match code {
+            KeyCode::Esc => state.login_ui.back_to_hub(),
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.login_ui.email.clear();
+            }
+            KeyCode::Backspace => {
+                state.login_ui.email.pop();
+            }
+            KeyCode::Enter => {
+                let trimmed = state.login_ui.email.trim();
+                if trimmed.is_empty() || !trimmed.contains('@') {
+                    state.login_ui.error_banner =
+                        Some("Enter a valid Google email address (e.g. name@gmail.com).".into());
+                } else {
+                    state.login_ui.error_banner = None;
+                    state.login_ui.status_banner =
+                        Some("Step 2/3: Password held strictly in Zeroize RAM".into());
+                    state.login_ui.step = LoginStep::PasswordInput;
+                }
+            }
+            KeyCode::Char(c) if is_plain_text_char(modifiers) => {
+                state.login_ui.email.push(c);
+            }
+            _ => {}
+        },
+        LoginStep::PasswordInput => match code {
+            KeyCode::Esc => {
+                state.login_ui.password.clear();
+                state.login_ui.error_banner = None;
+                state.login_ui.step = LoginStep::EmailInput;
+            }
+            KeyCode::Tab => {
+                state.login_ui.show_password = !state.login_ui.show_password;
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.login_ui.password.clear();
+            }
+            KeyCode::Backspace => {
+                state.login_ui.password.pop();
+            }
+            KeyCode::Enter => {
+                if state.login_ui.password.is_empty() {
+                    state.login_ui.error_banner = Some("Password cannot be empty.".into());
+                } else {
+                    launch_direct_login(state, tx, client);
+                }
+            }
+            KeyCode::Char(c) if is_plain_text_char(modifiers) => {
+                state.login_ui.password.push(c);
+            }
+            _ => {}
+        },
+        LoginStep::TwoFactorChallenge(ref kind) => match code {
+            KeyCode::Esc => state.login_ui.back_to_hub(),
+            KeyCode::Char('b') => {
+                state.login_ui.backup_mode = !state.login_ui.backup_mode;
+                state.login_ui.two_factor_code.clear();
+            }
+            KeyCode::Char('3') => start_device_code_flow(state, tx, client),
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.login_ui.two_factor_code.clear();
+            }
+            KeyCode::Backspace => {
+                state.login_ui.two_factor_code.pop();
+            }
+            KeyCode::Enter => launch_two_factor_submit(state, tx, client),
+            KeyCode::Char(c) if is_plain_text_char(modifiers) && c.is_ascii_alphanumeric() => {
+                let target_len = if state.login_ui.backup_mode
+                    || matches!(kind, ChallengeKind::BackupCode)
+                {
+                    8
+                } else {
+                    6
+                };
+                if state.login_ui.two_factor_code.len() < target_len {
+                    state.login_ui.two_factor_code.push(c);
+                    if !state.login_ui.backup_mode
+                        && !matches!(kind, ChallengeKind::BackupCode)
+                        && state.login_ui.two_factor_code.len() == 6
+                    {
+                        launch_two_factor_submit(state, tx, client);
+                    }
+                }
+            }
+            _ => {}
+        },
+        LoginStep::AwaitingDeviceQr => match code {
+            KeyCode::Esc => state.login_ui.back_to_hub(),
+            KeyCode::Char('L') => {
+                state.login_ui.back_to_hub();
+                state.overlay = ActiveOverlay::None;
+            }
+            KeyCode::Char('3') => start_device_code_flow(state, tx, client),
+            _ => {}
+        },
+        LoginStep::AwaitingKittySso => match code {
+            KeyCode::Esc => state.login_ui.back_to_hub(),
+            KeyCode::Char('L') => {
+                state.login_ui.back_to_hub();
+                state.overlay = ActiveOverlay::None;
+            }
+            _ => {}
+        },
+        LoginStep::ClientIdSetup => match code {
+            KeyCode::Esc => state.login_ui.back_to_hub(),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                state.login_ui.setup_field_idx = 1 - state.login_ui.setup_field_idx;
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if state.login_ui.setup_field_idx == 0 {
+                    state.login_ui.client_id_input.clear();
+                } else {
+                    state.login_ui.client_secret_input.clear();
+                }
+            }
+            KeyCode::Backspace => {
+                if state.login_ui.setup_field_idx == 0 {
+                    state.login_ui.client_id_input.pop();
+                } else {
+                    state.login_ui.client_secret_input.pop();
+                }
+            }
+            KeyCode::Enter => {
+                let cid = state.login_ui.client_id_input.trim().to_string();
+                let csec = state.login_ui.client_secret_input.trim().to_string();
+                if cid.is_empty() {
+                    state.login_ui.error_banner =
+                        Some("OAuth Client ID cannot be empty.".into());
+                } else {
+                    state.config.google_oauth.client_id = Some(cid);
+                    state.config.google_oauth.client_secret =
+                        if csec.is_empty() { None } else { Some(csec) };
+                    let _ = state.config.save();
+                    state.login_ui.error_banner = None;
+                    state.login_ui.status_banner =
+                        Some("Saved OAuth Client ID to ~/.config/phaenna/config.toml".into());
+                    match state.login_ui.setup_after.take() {
+                        Some(PendingOAuthFlow::DeviceCode) => {
+                            start_device_code_flow(state, tx, client);
+                        }
+                        Some(PendingOAuthFlow::KittyPkce) => {
+                            start_kitty_pkce_flow(state, tx, client);
+                        }
+                        None => {
+                            state.login_ui.step = LoginStep::Hub;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) if is_plain_text_char(modifiers) => {
+                if state.login_ui.setup_field_idx == 0 {
+                    state.login_ui.client_id_input.push(c);
+                } else {
+                    state.login_ui.client_secret_input.push(c);
                 }
             }
             _ => {}

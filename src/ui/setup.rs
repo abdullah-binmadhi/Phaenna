@@ -18,7 +18,7 @@ pub fn render_setup_modal(frame: &mut Frame, state: &AppState) {
 
     let outer = Block::default()
         .title(Span::styled(
-            " 🩺 PHAENNA — SYSTEM DOCTOR & RUNTIME CHECK ",
+            " PHAENNA — SYSTEM DOCTOR & RUNTIME CHECK ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.secondary)
@@ -39,7 +39,7 @@ pub fn render_setup_modal(frame: &mut Frame, state: &AppState) {
 
     let badge = |ok: bool| -> Span<'static> {
         if ok {
-            Span::styled(" ✓ READY   ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+            Span::styled(" [OK] READY ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
         } else {
             Span::styled(" ✕ MISSING ", Style::default().fg(Color::Rgb(247, 118, 142)).add_modifier(Modifier::BOLD))
         }
@@ -81,13 +81,16 @@ pub fn render_setup_modal(frame: &mut Frame, state: &AppState) {
             Span::styled("Muxing offline vault downloads + VAD subtitle alignment", Style::default().fg(theme.text_dim)),
         ]),
         Line::from(vec![
-            badge(state.cookie_count > 0),
-            Span::styled("Cookies      ", Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+            badge(state.auth_vault.is_authenticated()),
+            Span::styled("Google Auth  ", Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
             Span::styled(
-                if state.cookie_count > 0 {
-                    format!("{} session cookies loaded (Personalized feeds enabled)", state.cookie_count)
+                if let Some(acct) = state.auth_vault.active_account() {
+                    format!(
+                        "Signed in as {} ({}) · Zero browser scraping",
+                        acct.display_name, acct.email
+                    )
                 } else {
-                    "Press [L] to sync Zen/Firefox cookies for Subscriptions & History".to_string()
+                    "Press [L] to sign in directly inside Phaenna (Email/2FA, Device QR, or Kitty SSO)".to_string()
                 },
                 Style::default().fg(theme.text_dim),
             ),
@@ -106,7 +109,7 @@ pub fn render_setup_modal(frame: &mut Frame, state: &AppState) {
         Paragraph::new(Line::from(vec![
             Span::styled(" [r] Re-Scan Binaries ", Style::default().fg(theme.primary)),
             Span::styled(" · ", Style::default().fg(theme.divider)),
-            Span::styled("[L] Cookie Sync ", Style::default().fg(theme.secondary)),
+            Span::styled("[L] Google Account ", Style::default().fg(theme.secondary)),
             Span::styled(" · ", Style::default().fg(theme.divider)),
             Span::styled("[Esc] Close ", Style::default().fg(theme.text_dim)),
         ]))

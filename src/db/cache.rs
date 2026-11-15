@@ -37,6 +37,8 @@ pub struct VideoItem {
     #[serde(default)]
     pub timestamp: Option<i64>,
     #[serde(default)]
+    pub published_text: Option<String>,
+    #[serde(default)]
     pub view_count: Option<u64>,
     #[serde(default)]
     pub like_count: Option<u64>,
@@ -129,6 +131,100 @@ impl VideoItem {
         }
     }
 
+    pub fn compact_views(&self, include_label: bool) -> Option<String> {
+        let v = self.view_count?;
+        let num = if v >= 1_000_000_000 {
+            format_trimmed_unit(v as f64 / 1e9, "B")
+        } else if v >= 1_000_000 {
+            format_trimmed_unit(v as f64 / 1e6, "M")
+        } else if v >= 1_000 {
+            format_trimmed_unit(v as f64 / 1e3, "K")
+        } else {
+            v.to_string()
+        };
+        if include_label {
+            Some(format!("{} views", num))
+        } else {
+            Some(num)
+        }
+    }
+
+    pub fn is_new_release(&self, now_unix: i64) -> bool {
+        if let Some(ts) = self.timestamp {
+            let age = now_unix.saturating_sub(ts);
+            if ts > 0 && (0..=48 * 3600).contains(&age) {
+                return true;
+            }
+        }
+        if let Some(ref txt) = self.published_text {
+            let lower = txt.to_ascii_lowercase();
+            if lower.contains("just now")
+                || lower.contains("second")
+                || lower.contains("minute")
+                || lower.contains("hour")
+                || lower.contains("1 day ago")
+                || lower.contains("2 days ago")
+                || lower.contains("today")
+                || lower == "new"
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn compact_age(&self, now_unix: i64, long_suffix: bool) -> Option<String> {
+        if let Some(ts) = self.timestamp {
+            if ts > 0 && now_unix >= ts {
+                let delta = now_unix.saturating_sub(ts);
+                let s = if delta < 60 {
+                    "Just now".to_string()
+                } else if delta < 3600 {
+                    format!("{}m", delta / 60)
+                } else if delta < 86_400 {
+                    format!("{}h", delta / 3600)
+                } else if delta < 14 * 86_400 {
+                    format!("{}d", delta / 86_400)
+                } else if delta < 60 * 86_400 {
+                    format!("{}w", delta / (7 * 86_400))
+                } else if delta < 365 * 86_400 {
+                    format!("{}mo", (delta / (30 * 86_400)).max(1))
+                } else {
+                    format!("{}y", delta / (365 * 86_400))
+                };
+                if s == "Just now" {
+                    return Some(s);
+                }
+                return Some(if long_suffix { format!("{} ago", s) } else { s });
+            }
+        }
+        if let Some(ref txt) = self.published_text {
+            let cleaned = shorten_published_text(txt, long_suffix);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+        None
+    }
+
+    pub fn effective_chapters(&self) -> Vec<VideoChapter> {
+        if let Some(ref ch) = self.chapters {
+            if !ch.is_empty() {
+                return ch.clone();
+            }
+        }
+        if let Some(ref desc) = self.description {
+            let parsed = crate::api::ytdlp::parse_description_chapters(
+                desc,
+                self.duration.unwrap_or(0) as f64,
+            );
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        Vec::new()
+    }
+
     pub fn like_ratio_pct(&self) -> Option<f64> {
         let likes = self.like_count?;
         let dislikes = self.dislike_count?;
@@ -151,6 +247,49 @@ impl VideoItem {
     pub fn is_shorts(&self) -> bool {
         self.duration.map(|d| d <= 60).unwrap_or(false)
     }
+}
+
+fn format_trimmed_unit(val: f64, unit: &str) -> String {
+    if val >= 100.0 || (val - val.round()).abs() < 0.05 {
+        format!("{:.0}{}", val.round(), unit)
+    } else {
+        format!("{:.1}{}", val, unit)
+    }
+}
+
+fn shorten_published_text(raw: &str, long_suffix: bool) -> String {
+    let mut s = raw
+        .trim()
+        .replace("Streamed ", "")
+        .replace("Premiered ", "")
+        .replace("Scheduled for ", "");
+    let replacements = [
+        (" seconds ago", "s"),
+        (" second ago", "s"),
+        (" minutes ago", "m"),
+        (" minute ago", "m"),
+        (" hours ago", "h"),
+        (" hour ago", "h"),
+        (" days ago", "d"),
+        (" day ago", "d"),
+        (" weeks ago", "w"),
+        (" week ago", "w"),
+        (" months ago", "mo"),
+        (" month ago", "mo"),
+        (" years ago", "y"),
+        (" year ago", "y"),
+    ];
+    for (pat, short) in replacements {
+        if let Some(pos) = s.to_ascii_lowercase().find(pat) {
+            let prefix = s[..pos].trim();
+            if long_suffix {
+                return format!("{prefix}{short} ago");
+            }
+            return format!("{prefix}{short}");
+        }
+    }
+    s = s.trim().to_string();
+    s
 }
 
 pub fn format_duration_secs(secs: u64) -> String {
@@ -183,9 +322,9 @@ where
     sqlx::query(
         "INSERT INTO videos (
             id, channel_id, channel_name, title, description, duration_secs, duration_text,
-            view_count, like_count, dislike_count, published_at, webpage_url,
+            view_count, like_count, dislike_count, published_at, published_text, webpage_url,
             chapters_json, tags_json, thumbnails_json, thumb_url, is_live, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             channel_id      = COALESCE(excluded.channel_id, videos.channel_id),
             channel_name    = CASE WHEN excluded.channel_name != 'Unknown' THEN excluded.channel_name ELSE videos.channel_name END,
@@ -196,7 +335,8 @@ where
             view_count      = COALESCE(excluded.view_count, videos.view_count),
             like_count      = COALESCE(excluded.like_count, videos.like_count),
             dislike_count   = COALESCE(excluded.dislike_count, videos.dislike_count),
-            published_at    = COALESCE(excluded.published_at, videos.published_at),
+            published_at    = CASE WHEN excluded.published_text IS NOT NULL AND excluded.published_at IS NOT NULL THEN excluded.published_at ELSE COALESCE(excluded.published_at, videos.published_at) END,
+            published_text  = COALESCE(excluded.published_text, videos.published_text),
             webpage_url     = COALESCE(excluded.webpage_url, videos.webpage_url),
             chapters_json   = CASE WHEN excluded.chapters_json != '[]' THEN excluded.chapters_json ELSE videos.chapters_json END,
             tags_json       = CASE WHEN excluded.tags_json != '[]' THEN excluded.tags_json ELSE videos.tags_json END,
@@ -216,6 +356,7 @@ where
     .bind(v.like_count.map(|c| c as i64))
     .bind(v.dislike_count.map(|c| c as i64))
     .bind(v.timestamp)
+    .bind(&v.published_text)
     .bind(&v.webpage_url)
     .bind(chapters_json)
     .bind(tags_json)
@@ -274,6 +415,7 @@ fn row_to_video(row: &sqlx::sqlite::SqliteRow) -> VideoItem {
     let like_count: Option<i64> = row.try_get("like_count").unwrap_or(None);
     let dislike_count: Option<i64> = row.try_get("dislike_count").unwrap_or(None);
     let timestamp: Option<i64> = row.try_get("published_at").unwrap_or(None);
+    let published_text: Option<String> = row.try_get("published_text").unwrap_or(None);
     let webpage_url: Option<String> = row.try_get("webpage_url").unwrap_or(None);
     let chapters_raw: String = row.try_get("chapters_json").unwrap_or_else(|_| "[]".into());
     let tags_raw: String = row.try_get("tags_json").unwrap_or_else(|_| "[]".into());
@@ -300,6 +442,7 @@ fn row_to_video(row: &sqlx::sqlite::SqliteRow) -> VideoItem {
         duration: duration.map(|d| d.max(0) as u64),
         duration_string,
         timestamp,
+        published_text,
         view_count: view_count.map(|c| c.max(0) as u64),
         like_count: like_count.map(|c| c.max(0) as u64),
         dislike_count: dislike_count.map(|c| c.max(0) as u64),
@@ -407,8 +550,31 @@ mod tests {
         assert_eq!(v.display_uploader(), "Jon Gjengset");
         assert_eq!(v.display_duration(), "15:20");
         assert_eq!(v.format_views(), "250.0K views");
+        assert_eq!(v.compact_views(true).as_deref(), Some("250K views"));
         assert!((v.like_ratio_pct().unwrap() - 95.0).abs() < 0.01);
         assert!(v.best_thumbnail_url().contains("abc12345678"));
+
+        let now = 1_763_200_000;
+        let fresh = VideoItem {
+            timestamp: Some(now - 3600 * 5),
+            published_text: Some("5 hours ago".to_string()),
+            ..v.clone()
+        };
+        assert!(fresh.is_new_release(now));
+        assert_eq!(fresh.compact_age(now, true).as_deref(), Some("5h ago"));
+        assert_eq!(fresh.compact_age(now, false).as_deref(), Some("5h"));
+
+        let older = VideoItem {
+            timestamp: Some(now - 86_400 * 10),
+            published_text: Some("1 week ago".to_string()),
+            description: Some("0:00 Intro\n1:30 Setup\n5:00 Wrap".to_string()),
+            ..v
+        };
+        assert!(!older.is_new_release(now));
+        assert_eq!(older.compact_age(now, true).as_deref(), Some("10d ago"));
+        let ch = older.effective_chapters();
+        assert_eq!(ch.len(), 3);
+        assert_eq!(ch[1].title, "Setup");
     }
 
     #[tokio::test]

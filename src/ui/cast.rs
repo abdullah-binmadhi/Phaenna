@@ -16,7 +16,7 @@ pub fn render_cast_modal(frame: &mut Frame, state: &AppState) {
 
     let outer = Block::default()
         .title(Span::styled(
-            " 📺 AIRPLAY 2 & DLNA TV CASTING ",
+            " AIRPLAY 2 & DLNA TV CASTING ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.secondary)
@@ -41,7 +41,7 @@ pub fn render_cast_modal(frame: &mut Frame, state: &AppState) {
 
     let selected = state.active_selected_video();
     let header = if state.is_scanning_cast {
-        "⟳ Scanning LAN via SSDP multicast (239.255.255.250:1900)..."
+        "Scanning LAN via SSDP multicast (239.255.255.250:1900)..."
     } else if let Some(ref v) = selected {
         &v.title
     } else {

@@ -67,7 +67,7 @@ pub fn render_tailored_wizard(frame: &mut Frame, state: &AppState) {
         } else {
             state.config.tailored_answers.choices.get(step) == Some(&idx)
         };
-        let mark = if is_chosen { "✓" } else { " " };
+        let mark = if is_chosen { "x" } else { " " };
         let st = if is_cursor {
             Style::default().fg(Color::Black).bg(theme.secondary).add_modifier(Modifier::BOLD)
         } else if is_chosen {
@@ -212,7 +212,7 @@ pub fn render_tailored_results(frame: &mut Frame, state: &AppState) {
 
     let outer = Block::default()
         .title(Span::styled(
-            format!(" ★ TAILORED DISCOVERY SHELF — Vibe Tier: {} ", state.live_tuner.tier_label()),
+            format!(" TAILORED DISCOVERY SHELF — Vibe Tier: {} ", state.live_tuner.tier_label()),
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.accent)

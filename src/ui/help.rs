@@ -16,7 +16,7 @@ pub fn render_help_modal(frame: &mut Frame, state: &AppState) {
 
     let outer = Block::default()
         .title(Span::styled(
-            " ⌨ PHAENNA — KEYBOARD & MOUSE COMMAND MATRIX ",
+            " PHAENNA — KEYBOARD & MOUSE COMMAND MATRIX ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.primary)
@@ -54,44 +54,44 @@ pub fn render_help_modal(frame: &mut Frame, state: &AppState) {
     let cards = [
         (
             top_cols[0],
-            " 󰍉 Navigation & Shelves ",
+            " Navigation & Infinite Scroll ",
             vec![
-                Line::from(vec![Span::styled(" h/l or ←/→   ", key), Span::styled("Move grid cursor", desc)]),
-                Line::from(vec![Span::styled(" j/k or ↑/↓   ", key), Span::styled("Switch row / shelf", desc)]),
-                Line::from(vec![Span::styled(" 1..5         ", key), Span::styled("Jump directly to shelf", desc)]),
-                Line::from(vec![Span::styled(" Click / Wheel", key), Span::styled("Select card / scroll", desc)]),
-                Line::from(vec![Span::styled(" n / ]        ", key), Span::styled("Load next 16 videos", desc)]),
+                Line::from(vec![Span::styled(" h/l, j/k     ", key), Span::styled("Move grid / queue cursor", desc)]),
+                Line::from(vec![Span::styled(" PgDn / ^d    ", key), Span::styled("Scroll down & auto-load more", desc)]),
+                Line::from(vec![Span::styled(" Tab / 1..5   ", key), Span::styled("Switch shelf ([1] Continue Watching)", desc)]),
+                Line::from(vec![Span::styled(" a / +        ", key), Span::styled("Save video to Continue Watching", desc)]),
+                Line::from(vec![Span::styled(" x/d · K/J    ", key), Span::styled("Remove / reorder in Continue Watching", desc)]),
             ],
         ),
         (
             top_cols[1],
-            " 󰐊 Playback, Quality & Detail ",
+            " Playback, Queue & Detail ",
             vec![
-                Line::from(vec![Span::styled(" Enter / Space", key), Span::styled("Play non-blocking mpv", desc)]),
-                Line::from(vec![Span::styled(" i            ", key), Span::styled("Video Detail & Chapters", desc)]),
-                Line::from(vec![Span::styled(" p            ", key), Span::styled("Play Options (8 presets)", desc)]),
-                Line::from(vec![Span::styled(" b            ", key), Span::styled("SponsorBlock + Subtitles", desc)]),
-                Line::from(vec![Span::styled(" D            ", key), Span::styled("Offline Vault Download", desc)]),
+                Line::from(vec![Span::styled(" Enter / Space", key), Span::styled("Watch in Queue / Play or Detail", desc)]),
+                Line::from(vec![Span::styled(" i            ", key), Span::styled("Detail Deck (Tab: Chapters / Up Next)", desc)]),
+                Line::from(vec![Span::styled(" p            ", key), Span::styled("Play Options (Quality/Player/Subs)", desc)]),
+                Line::from(vec![Span::styled(" v / X        ", key), Span::styled("Toggle Queue Grid / Clear finished", desc)]),
+                Line::from(vec![Span::styled(" D / n        ", key), Span::styled("Offline download / Force load more", desc)]),
             ],
         ),
         (
             bot_cols[0],
-            " ✦ Discovery & Intelligence ",
+            " Discovery & Intelligence ",
             vec![
-                Line::from(vec![Span::styled(" /            ", key), Span::styled("Debounced Live Search", desc)]),
+                Line::from(vec![Span::styled(" / (^a Queue) ", key), Span::styled("Debounced Live Search", desc)]),
                 Line::from(vec![Span::styled(" f            ", key), Span::styled("Filter (Shorts/Long) & Sort", desc)]),
-                Line::from(vec![Span::styled(" a            ", key), Span::styled("Phaenna Wrapped Analytics", desc)]),
+                Line::from(vec![Span::styled(" A            ", key), Span::styled("Phaenna Wrapped Analytics", desc)]),
                 Line::from(vec![Span::styled(" t            ", key), Span::styled("Tailored Taste Discovery", desc)]),
                 Line::from(vec![Span::styled(" c            ", key), Span::styled("7-Day Upload Radar", desc)]),
             ],
         ),
         (
             bot_cols[1],
-            " ⚙ System, Companion & Auth ",
+            " System, Companion & Auth ",
             vec![
                 Line::from(vec![Span::styled(" s / ,        ", key), Span::styled("Fuzzy Command Hub", desc)]),
                 Line::from(vec![Span::styled(" m / C        ", key), Span::styled("LAN Remote QR / TV Cast", desc)]),
-                Line::from(vec![Span::styled(" L / T        ", key), Span::styled("Cookie Sync / Cycle Theme", desc)]),
+                Line::from(vec![Span::styled(" L / T        ", key), Span::styled("Google Account / Cycle Theme", desc)]),
                 Line::from(vec![Span::styled(" ! / U        ", key), Span::styled("System Doctor / Updater", desc)]),
                 Line::from(vec![Span::styled(" w / r / q    ", key), Span::styled("WatchLater / Refresh / Quit", desc)]),
             ],

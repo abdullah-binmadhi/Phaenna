@@ -33,9 +33,9 @@ impl WatchLaterSource {
 
     pub fn divider_label(self) -> &'static str {
         match self {
-            Self::YouTube => "✦ YOUTUBE WL",
-            Self::Both => "◈ BOTH",
-            Self::Local => "• LOCAL QUEUE",
+            Self::YouTube => "YOUTUBE WL",
+            Self::Both => "BOTH",
+            Self::Local => "LOCAL QUEUE",
         }
     }
 }
@@ -62,6 +62,18 @@ pub struct RecentWatchItem {
     pub title: String,
     pub channel_name: String,
     pub watched_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct ContinueWatchingMeta {
+    pub video_id: String,
+    pub last_pos_secs: f64,
+    pub duration_secs: f64,
+    pub pinned_manually: bool,
+    pub queue_order: i64,
+    pub last_watched_at: i64,
+    pub added_at: i64,
 }
 
 /// Aggregated personal telemetry powering `[a] YouTube Wrapped & Viewing Analytics`.
@@ -97,7 +109,7 @@ impl Default for UserAnalytics {
             total_hours_watched: 0.0,
             in_progress_videos: 0,
             completion_rate: 0.0,
-            watch_archetype: "✦ Zen Explorer",
+            watch_archetype: "Zen Explorer",
             viewing_cadence: "Afternoon Flow (12:00 - 18:00)",
             active_streak_days: 0,
             longest_streak_days: 0,
@@ -123,6 +135,30 @@ impl Default for UserAnalytics {
     }
 }
 
+pub async fn touch_watch_history(
+    pool: &SqlitePool,
+    video: Option<&VideoItem>,
+    video_id: &str,
+    now: i64,
+) -> Result<()> {
+    let clean = video_id.trim_start_matches("RD");
+    let mut tx = pool.begin().await?;
+    if let Some(v) = video {
+        execute_upsert_video(&mut *tx, v, now).await?;
+    }
+    sqlx::query(
+        "INSERT INTO watch_history (video_id, watched_at) VALUES (?, ?)
+         ON CONFLICT(video_id) DO UPDATE SET watched_at = excluded.watched_at",
+    )
+    .bind(clean)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn record_watched(
     pool: &SqlitePool,
     video: Option<&VideoItem>,
@@ -143,7 +179,7 @@ pub async fn record_watched(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query("DELETE FROM continue_watching WHERE video_id = ?")
+    sqlx::query("DELETE FROM continue_watching WHERE video_id = ? AND pinned_manually = 0")
         .bind(clean)
         .execute(&mut *tx)
         .await?;
@@ -246,11 +282,13 @@ pub async fn get_continue_watching(pool: &SqlitePool) -> Result<Vec<VideoItem>> 
     let rows = sqlx::query(
         "SELECT v.id, v.channel_id, v.channel_name, v.title, v.description,
                 v.duration_secs, v.duration_text, v.view_count, v.like_count,
-                v.dislike_count, v.published_at, v.webpage_url, v.chapters_json,
-                v.tags_json, v.thumbnails_json, v.is_live
+                v.dislike_count, v.published_at, v.published_text, v.webpage_url,
+                v.chapters_json, v.tags_json, v.thumbnails_json, v.is_live
          FROM continue_watching cw
          JOIN videos v ON cw.video_id = v.id
-         ORDER BY cw.last_watched_at DESC",
+         ORDER BY cw.pinned_manually DESC,
+                  CASE WHEN cw.queue_order > 0 THEN cw.queue_order ELSE 999999 END ASC,
+                  cw.last_watched_at DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -281,6 +319,7 @@ pub async fn get_continue_watching(pool: &SqlitePool) -> Result<Vec<VideoItem>> 
                 .unwrap_or(None)
                 .map(|c| c.max(0) as u64),
             timestamp: row.try_get("published_at").unwrap_or(None),
+            published_text: row.try_get("published_text").unwrap_or(None),
             description: row.try_get("description").unwrap_or(None),
             webpage_url: row.try_get("webpage_url").unwrap_or(None),
             thumbnails: serde_json::from_str(
@@ -303,7 +342,116 @@ pub async fn get_continue_watching(pool: &SqlitePool) -> Result<Vec<VideoItem>> 
         .collect())
 }
 
-#[allow(dead_code)]
+pub async fn get_continue_watching_meta_map(
+    pool: &SqlitePool,
+) -> Result<HashMap<String, ContinueWatchingMeta>> {
+    let rows = sqlx::query(
+        "SELECT video_id, last_pos_secs, duration_secs, pinned_manually,
+                queue_order, last_watched_at, added_at
+         FROM continue_watching",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = HashMap::new();
+    for row in rows {
+        let video_id: String = row.try_get("video_id").unwrap_or_default();
+        if video_id.is_empty() {
+            continue;
+        }
+        let meta = ContinueWatchingMeta {
+            video_id: video_id.clone(),
+            last_pos_secs: row.try_get("last_pos_secs").unwrap_or(0.0),
+            duration_secs: row.try_get("duration_secs").unwrap_or(0.0),
+            pinned_manually: row.try_get::<i64, _>("pinned_manually").unwrap_or(0) != 0,
+            queue_order: row.try_get("queue_order").unwrap_or(0),
+            last_watched_at: row.try_get("last_watched_at").unwrap_or(0),
+            added_at: row.try_get("added_at").unwrap_or(0),
+        };
+        out.insert(video_id, meta);
+    }
+    Ok(out)
+}
+
+pub async fn pin_to_continue_watching(
+    pool: &SqlitePool,
+    video: &VideoItem,
+    now: i64,
+) -> Result<()> {
+    let clean = video.clean_id();
+    let mut tx = pool.begin().await?;
+    execute_upsert_video(&mut *tx, video, now).await?;
+    let dur = video.duration.unwrap_or(0) as f64;
+    let next_order: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(queue_order), 0) + 1 FROM continue_watching",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap_or(1);
+
+    sqlx::query(
+        "INSERT INTO continue_watching (
+            video_id, last_pos_secs, duration_secs, last_watched_at,
+            pinned_manually, queue_order, added_at
+         ) VALUES (?, 0.0, ?, ?, 1, ?, ?)
+         ON CONFLICT(video_id) DO UPDATE SET
+            pinned_manually = 1,
+            duration_secs = CASE WHEN continue_watching.duration_secs > 0.0 THEN continue_watching.duration_secs ELSE excluded.duration_secs END,
+            last_watched_at = excluded.last_watched_at,
+            added_at = CASE WHEN continue_watching.added_at > 0 THEN continue_watching.added_at ELSE excluded.added_at END",
+    )
+    .bind(clean)
+    .bind(dur)
+    .bind(now)
+    .bind(next_order)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn move_continue_watching_item(
+    pool: &SqlitePool,
+    video_id: &str,
+    direction: isize,
+) -> Result<bool> {
+    let clean = video_id.trim_start_matches("RD");
+    let current = get_continue_watching(pool).await?;
+    let mut ids: Vec<String> = current.into_iter().map(|v| v.clean_id().to_string()).collect();
+    let Some(pos) = ids.iter().position(|id| id == clean) else {
+        return Ok(false);
+    };
+    let target = (pos as isize + direction).clamp(0, ids.len().saturating_sub(1) as isize) as usize;
+    if target == pos {
+        return Ok(false);
+    }
+    ids.swap(pos, target);
+
+    let mut tx = pool.begin().await?;
+    for (idx, id) in ids.iter().enumerate() {
+        sqlx::query("UPDATE continue_watching SET queue_order = ? WHERE video_id = ?")
+            .bind((idx + 1) as i64)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+pub async fn clear_finished_continue_watching(pool: &SqlitePool) -> Result<usize> {
+    let res = sqlx::query(
+        "DELETE FROM continue_watching
+         WHERE video_id IN (SELECT video_id FROM watch_history)
+            OR (duration_secs > 0.0 AND (last_pos_secs / duration_secs) >= 0.85)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() as usize)
+}
+
 pub async fn remove_continue_watching(pool: &SqlitePool, video_id: &str) -> Result<()> {
     let clean = video_id.trim_start_matches("RD");
     sqlx::query("DELETE FROM continue_watching WHERE video_id = ?")
@@ -703,13 +851,13 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     ];
 
     out.watch_archetype = if dur_counts[2] + dur_counts[3] > dur_counts[0] + dur_counts[1] {
-        "✦ Deep-Dive Scholar"
+        "Deep-Dive Scholar"
     } else if dur_counts[0] > dur_counts[1] {
-        "⚡ RapidPulse Clipper"
+        "RapidPulse Clipper"
     } else if out.total_hours_watched > 25.0 {
-        "◈ Marathon Curator"
+        "Marathon Curator"
     } else {
-        "✦ Zen Explorer"
+        "Zen Explorer"
     };
 
     let mut top_ch: Vec<TopChannelEntry> = channel_stats
@@ -803,5 +951,51 @@ mod tests {
         assert_eq!(analytics.watch_later_count, 1);
         assert!((analytics.sponsorblock_saved_secs - 95.5).abs() < 0.01);
         assert_eq!(analytics.top_channels[0].channel_name, "CompilerLab");
+    }
+
+    #[tokio::test]
+    async fn test_manual_continue_watching_queue_workflow() {
+        let pool = init(":memory:").await.unwrap();
+        let now = 1_700_000_000i64;
+        let v1 = VideoItem {
+            id: "queuevid001".into(),
+            title: "First Queued Talk".into(),
+            uploader: Some("ChanA".into()),
+            duration: Some(900),
+            ..Default::default()
+        };
+        let v2 = VideoItem {
+            id: "queuevid002".into(),
+            title: "Second Queued Talk".into(),
+            uploader: Some("ChanB".into()),
+            duration: Some(1500),
+            ..Default::default()
+        };
+
+        pin_to_continue_watching(&pool, &v1, now).await.unwrap();
+        pin_to_continue_watching(&pool, &v2, now + 10).await.unwrap();
+
+        let cw = get_continue_watching(&pool).await.unwrap();
+        assert_eq!(cw.len(), 2);
+        assert_eq!(cw[0].id, "queuevid001");
+        assert_eq!(cw[1].id, "queuevid002");
+
+        // Pinned items stay in Continue Watching even after record_watched finishes them
+        record_watched(&pool, Some(&v1), &v1.id, now + 20).await.unwrap();
+        let meta = get_continue_watching_meta_map(&pool).await.unwrap();
+        assert!(meta.get("queuevid001").unwrap().pinned_manually);
+        assert_eq!(get_continue_watching(&pool).await.unwrap().len(), 2);
+
+        // Reordering swaps positions persistently
+        assert!(move_continue_watching_item(&pool, "queuevid002", -1).await.unwrap());
+        let reordered = get_continue_watching(&pool).await.unwrap();
+        assert_eq!(reordered[0].id, "queuevid002");
+        assert_eq!(reordered[1].id, "queuevid001");
+
+        // Manual removal deletes cleanly
+        remove_continue_watching(&pool, "queuevid001").await.unwrap();
+        let after_rm = get_continue_watching(&pool).await.unwrap();
+        assert_eq!(after_rm.len(), 1);
+        assert_eq!(after_rm[0].id, "queuevid002");
     }
 }

@@ -1,7 +1,7 @@
 //! Persistent application configuration for Phaenna (`config.toml`).
 
 use crate::error::{AppError, Result};
-use directories::{BaseDirs, ProjectDirs};
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -78,7 +78,7 @@ impl Quality {
 
     pub const fn ytdl_format(self) -> &'static str {
         match self {
-            Quality::Best => "bestvideo+bestaudio/best",
+            Quality::Best => "bestvideo[height<=?4320][vcodec^=av01]+bestaudio/bestvideo[height<=?4320][vcodec^=vp9]+bestaudio/bestvideo[height<=?4320]+bestaudio/bestvideo+bestaudio/best",
             Quality::P2160 => "bestvideo[height<=?2160][fps>=?50]+bestaudio/bestvideo[height<=?2160]+bestaudio/best",
             Quality::P1440 => "bestvideo[height<=?1440][fps>=?50]+bestaudio/bestvideo[height<=?1440]+bestaudio/best",
             Quality::P1080 => "bestvideo[height<=?1080][fps>=?50]+bestaudio/bestvideo[height<=?1080]+bestaudio/best",
@@ -91,7 +91,7 @@ impl Quality {
 
     pub const fn short_badge(self) -> &'static str {
         match self {
-            Quality::Best => "BEST",
+            Quality::Best => "4K-AV1",
             Quality::P2160 => "4K60",
             Quality::P1440 => "2K60",
             Quality::P1080 => "1080p",
@@ -148,14 +148,19 @@ impl Player {
     }
 }
 
-/// Real-time GPU mastering & upscaling GLSL shader profile for `mpv`.
+/// Real-time GPU mastering, compression cleanup & 4K super-resolution GLSL shader profile for `mpv` / `iina`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoShaderMode {
     Off,
-    #[default]
     Balanced,
-    Ultra,
+    #[default]
+    #[serde(alias = "ultra", alias = "reference4k", alias = "reference_4k")]
+    Reference4K,
+    #[serde(alias = "neural", alias = "neural_cinema", alias = "fsrcnnx")]
+    NeuralCinema,
+    #[serde(alias = "anime", alias = "anime_4k")]
+    Anime4K,
 }
 
 #[allow(dead_code)]
@@ -163,8 +168,10 @@ impl VideoShaderMode {
     pub const fn next(self) -> Self {
         match self {
             Self::Off => Self::Balanced,
-            Self::Balanced => Self::Ultra,
-            Self::Ultra => Self::Off,
+            Self::Balanced => Self::Reference4K,
+            Self::Reference4K => Self::NeuralCinema,
+            Self::NeuralCinema => Self::Anime4K,
+            Self::Anime4K => Self::Off,
         }
     }
 
@@ -172,15 +179,19 @@ impl VideoShaderMode {
         match self {
             Self::Off => "off",
             Self::Balanced => "balanced",
-            Self::Ultra => "ultra",
+            Self::Reference4K => "reference4k",
+            Self::NeuralCinema => "neuralcinema",
+            Self::Anime4K => "anime4k",
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Off => "Off (Native)",
-            Self::Balanced => "Balanced (Lanczos + Deband + Crisp)",
-            Self::Ultra => "Ultra (x2 CNN Upscale + Mastering)",
+            Self::Off => "Off (Raw Stream)",
+            Self::Balanced => "Balanced (Deblock + Luma CAS + Deband)",
+            Self::Reference4K => "Reference 4K Studio (AV1/VP9 Deblock + 4:4:4 Chroma + 2x RCAS 4K)",
+            Self::NeuralCinema => "Neural Cinema 4K (FSRCNNX 16-0-4-1 CNN + Deblock + 4:4:4)",
+            Self::Anime4K => "Anime4K Restore (Line Reconstruction + Deband + 2x Upscale)",
         }
     }
 }
@@ -241,33 +252,23 @@ impl SponsorBlockMode {
     }
 }
 
-/// Browser profile source for Netscape cookie extraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CookieSource {
-    #[default]
-    Auto,
-    Zen,
-    Firefox,
-    CustomFile,
+/// Optional Google OAuth2 client settings for in-app Device Code & Kitty Split PKCE flows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoogleOAuthConfig {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default = "default_true")]
+    pub prefer_kitty_split: bool,
 }
 
-impl CookieSource {
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Auto => Self::Zen,
-            Self::Zen => Self::Firefox,
-            Self::Firefox => Self::CustomFile,
-            Self::CustomFile => Self::Auto,
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Auto (Zen -> Firefox -> File)",
-            Self::Zen => "Zen Browser",
-            Self::Firefox => "Mozilla Firefox",
-            Self::CustomFile => "Custom Netscape File",
+impl Default for GoogleOAuthConfig {
+    fn default() -> Self {
+        Self {
+            client_id: None,
+            client_secret: None,
+            prefer_kitty_split: true,
         }
     }
 }
@@ -389,7 +390,7 @@ pub struct Config {
     #[serde(default = "default_theme_index")]
     pub theme_index: usize,
     #[serde(default)]
-    pub cookie_source: CookieSource,
+    pub google_oauth: GoogleOAuthConfig,
     #[serde(default)]
     pub custom_cookies_path: Option<PathBuf>,
     #[serde(default)]
@@ -417,7 +418,7 @@ impl Default for Config {
             shader_mode: VideoShaderMode::default(),
             ambilight_enabled: true,
             theme_index: default_theme_index(),
-            cookie_source: CookieSource::default(),
+            google_oauth: GoogleOAuthConfig::default(),
             custom_cookies_path: None,
             cache: CacheConfig::default(),
             remote: RemoteConfig::default(),
@@ -451,23 +452,21 @@ impl Config {
         Ok(Self::config_dir()?.join("phaenna.db"))
     }
 
-    /// Resolve cookie file path portably:
+    /// Path to Phaenna's isolated OAuth & Google session vault (`<config_dir>/auth.json`).
+    pub fn auth_vault_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("auth.json"))
+    }
+
+    /// Resolve isolated Netscape cookie jar path for optional Flow A sessions or `--cookies` CLI:
     /// 1. Explicit `custom_cookies_path` when configured
-    /// 2. Existing non-empty `~/.config/yt-dlp/cookies.txt` (preserves prior setups)
-    /// 3. `<config_dir>/cookies.txt`
+    /// 2. Phaenna's own `<config_dir>/session_cookies.txt` (zero browser SQLite scraping)
     pub fn cookies_path(&self) -> Result<PathBuf> {
         if let Some(ref custom) = self.custom_cookies_path {
             if !custom.as_os_str().is_empty() {
                 return Ok(custom.clone());
             }
         }
-        if let Some(base) = BaseDirs::new() {
-            let legacy_ytdlp = base.home_dir().join(".config").join("yt-dlp").join("cookies.txt");
-            if is_non_empty_file(&legacy_ytdlp) {
-                return Ok(legacy_ytdlp);
-            }
-        }
-        Ok(Self::config_dir()?.join("cookies.txt"))
+        Ok(Self::config_dir()?.join("session_cookies.txt"))
     }
 
     pub fn load() -> Result<Self> {
@@ -501,10 +500,6 @@ impl Config {
     }
 }
 
-fn is_non_empty_file(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,7 +514,7 @@ mod tests {
             quality: Quality::P1440,
             player: Player::Iina,
             sponsorblock_mode: SponsorBlockMode::SponsorOnly,
-            shader_mode: VideoShaderMode::Ultra,
+            shader_mode: VideoShaderMode::Reference4K,
             theme_index: 4,
             ..Default::default()
         };
@@ -529,13 +524,18 @@ mod tests {
         assert_eq!(loaded.quality, Quality::P1440);
         assert_eq!(loaded.player, Player::Iina);
         assert_eq!(loaded.sponsorblock_mode, SponsorBlockMode::SponsorOnly);
-        assert_eq!(loaded.shader_mode, VideoShaderMode::Ultra);
+        assert_eq!(loaded.shader_mode, VideoShaderMode::Reference4K);
         assert_eq!(loaded.theme_index, 4);
+
+        // Legacy TOML alias compatibility (`"ultra"` -> `Reference4K`)
+        let legacy: Config = toml::from_str("shader_mode = \"ultra\"\n").unwrap();
+        assert_eq!(legacy.shader_mode, VideoShaderMode::Reference4K);
     }
 
     #[test]
     fn test_quality_format_selectors() {
         assert_eq!(Quality::all().len(), 8);
+        assert!(Quality::Best.ytdl_format().contains("av01"));
         assert!(Quality::P1080.ytdl_format().contains("1080"));
         assert_eq!(Quality::AudioOnly.ytdl_format(), "bestaudio/best");
         assert_eq!(Quality::P2160.short_badge(), "4K60");
@@ -545,8 +545,10 @@ mod tests {
     fn test_shader_and_sponsorblock_cycling() {
         let s = VideoShaderMode::Off.next();
         assert_eq!(s, VideoShaderMode::Balanced);
-        assert_eq!(s.next(), VideoShaderMode::Ultra);
-        assert_eq!(s.next().next(), VideoShaderMode::Off);
+        assert_eq!(s.next(), VideoShaderMode::Reference4K);
+        assert_eq!(s.next().next(), VideoShaderMode::NeuralCinema);
+        assert_eq!(s.next().next().next(), VideoShaderMode::Anime4K);
+        assert_eq!(s.next().next().next().next(), VideoShaderMode::Off);
 
         let sb = SponsorBlockMode::AutoSkipAll;
         assert!(sb.auto_skips_category("sponsor"));

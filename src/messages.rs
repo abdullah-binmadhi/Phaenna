@@ -4,8 +4,10 @@ use crate::api::dislike::DislikeInfo;
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::db::cache::VideoItem;
+use crate::services::auth::{ChallengeKind, DeviceCodeSession, GoogleAccountSession};
 use crate::services::cast::CastDevice;
 use crate::services::updater::UpdateInfo;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 #[allow(dead_code, clippy::large_enum_variant)]
@@ -14,11 +16,13 @@ pub enum AppMessage {
     FeedLoaded {
         feed_key: String,
         items: Vec<VideoItem>,
+        continuation: Option<String>,
         is_from_cache: bool,
     },
     MoreFeedLoaded {
         feed_key: String,
         items: Vec<VideoItem>,
+        continuation: Option<String>,
     },
     FetchProgress {
         feed_key: String,
@@ -62,8 +66,23 @@ pub enum AppMessage {
         video_id: String,
     },
 
-    // Cookie Auth Sync
-    SyncFinished(Result<String, String>),
+    // In-App Google Auth & Identity Hub
+    AuthDeviceCodeReady(DeviceCodeSession),
+    AuthKittyUrlReady {
+        url: String,
+        launcher: &'static str,
+    },
+    AuthChallengeRequired {
+        kind: ChallengeKind,
+        cookies: HashMap<String, String>,
+        challenge_token: Option<String>,
+    },
+    AuthNeedsModernSso {
+        reason: String,
+    },
+    AuthSignedIn(GoogleAccountSession),
+    AuthRefreshed(GoogleAccountSession),
+    AuthFailed(String),
 
     // Non-Blocking Playback & IPC Telemetry
     PlaybackStarted {
@@ -102,11 +121,12 @@ pub enum AppMessage {
         error: String,
     },
 
-    // Self-Updater
+    // Self-Updater & UI Notifications
     UpdateAvailable(UpdateInfo),
     UpdateProgress(f32, String),
     UpdateSuccess(String),
     UpdateFailed(String),
+    ShowToast(String),
 
     // LAN Remote & TV Cast
     CastDevicesDiscovered(Vec<CastDevice>),

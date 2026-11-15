@@ -7,7 +7,8 @@ use crate::api::subtitles::SubtitleTrack;
 use crate::config::{Config, Quality};
 use crate::db::cache::VideoItem;
 use crate::db::sync::{HISTORY, RECOMMENDED, SUBSCRIPTIONS, WATCH_LATER};
-use crate::db::user::{UserAnalytics, WatchLaterSource};
+use crate::db::user::{ContinueWatchingMeta, UserAnalytics, WatchLaterSource};
+use crate::services::auth::{AuthVault, LoginUiState};
 use crate::services::calendar::{compute_week_bounds, local_tz_offset_secs, CalendarFilter, WeekBounds};
 use crate::services::cast::CastDevice;
 use crate::services::remote::RemoteServerHandle;
@@ -170,12 +171,16 @@ pub struct AppState {
     pub progress_map: HashMap<String, (f64, f64)>,
     pub watch_later_sources: HashMap<String, WatchLaterSource>,
     pub offline_paths: HashMap<String, String>,
+    pub continue_watching_meta: HashMap<String, ContinueWatchingMeta>,
+    pub continue_watching_grid_mode: bool,
 
     // Detail & Channel drill-down stack
     pub detail_video: Option<VideoItem>,
     pub detail_history: Vec<VideoItem>,
     pub detail_view_mode: DetailViewMode,
+    pub detail_focus_pane: usize, // 0: Synopsis, 1: Chapters, 2: Up Next / Channel More
     pub detail_chapter_cursor: usize,
+    pub detail_related_cursor: usize,
     pub detail_scroll: u16,
     pub detail_subtitles: Vec<SubtitleTrack>,
     pub detail_selected_sub_idx: usize,
@@ -210,14 +215,17 @@ pub struct AppState {
     pub settings_query: String,
     pub settings_cursor: usize,
 
-    // Login / Cookies modal
-    pub cookie_count: usize,
-    pub login_status: Option<String>,
+    // In-app Google Identity Hub & vault
+    pub auth_vault: AuthVault,
+    pub login_ui: LoginUiState,
 
     // Loading & pagination flags
     pub loading_feeds: HashSet<String>,
     pub is_fetching_more: bool,
     pub pagination_progress: Option<(usize, usize)>,
+    pub feed_continuations: HashMap<String, String>,
+    pub exhausted_feeds: HashSet<String>,
+    pub last_pagination_at: Option<Instant>,
 
     // Playback IPC state
     pub active_playback_video_id: Option<String>,
@@ -252,13 +260,15 @@ pub struct AppState {
     pub update_status: Option<String>,
     pub update_progress: f32,
 
-    // Toast
+    // Toast & focused-card stock-ticker marquee
     pub toast: Option<(String, Instant)>,
+    pub ticker_step: usize,
+    pub ticker_focus_started_at: Instant,
+    pub ticker_last_step_at: Instant,
 
-    // Thumbnail & Ambilight Cache
+    // Thumbnail & Ambilight Cache (keyed by (video_id, cell_w, cell_h) for 100% edge-to-edge cover)
     pub picker: Option<Picker>,
-    pub image_cache: HashMap<String, Box<dyn StatefulProtocol>>,
-    pub banner_cache: HashMap<String, Box<dyn StatefulProtocol>>,
+    pub image_cache: HashMap<(String, u16, u16), Box<dyn StatefulProtocol>>,
     pub raw_thumbs: HashMap<String, image::DynamicImage>,
     pub ambilight_cache: HashMap<String, ThemePalette>,
     pub loading_thumbs: HashSet<String>,
@@ -297,11 +307,15 @@ impl AppState {
             progress_map: HashMap::new(),
             watch_later_sources: HashMap::new(),
             offline_paths: HashMap::new(),
+            continue_watching_meta: HashMap::new(),
+            continue_watching_grid_mode: false,
 
             detail_video: None,
             detail_history: Vec::new(),
             detail_view_mode: DetailViewMode::Overview,
+            detail_focus_pane: 0,
             detail_chapter_cursor: 0,
+            detail_related_cursor: 0,
             detail_scroll: 0,
             detail_subtitles: Vec::new(),
             detail_selected_sub_idx: 0,
@@ -332,12 +346,17 @@ impl AppState {
             settings_query: String::new(),
             settings_cursor: 0,
 
-            cookie_count: 0,
-            login_status: None,
+            auth_vault: Config::auth_vault_path()
+                .map(|p| AuthVault::load_or_default(&p))
+                .unwrap_or_default(),
+            login_ui: LoginUiState::default(),
 
             loading_feeds: HashSet::new(),
             is_fetching_more: false,
             pagination_progress: None,
+            feed_continuations: HashMap::new(),
+            exhausted_feeds: HashSet::new(),
+            last_pagination_at: None,
 
             active_playback_video_id: None,
             active_playback_title: None,
@@ -373,10 +392,12 @@ impl AppState {
             update_progress: 0.0,
 
             toast: None,
+            ticker_step: 0,
+            ticker_focus_started_at: Instant::now(),
+            ticker_last_step_at: Instant::now(),
 
             picker: None,
             image_cache: HashMap::new(),
-            banner_cache: HashMap::new(),
             raw_thumbs: HashMap::new(),
             ambilight_cache: HashMap::new(),
             loading_thumbs: HashSet::new(),
@@ -419,11 +440,15 @@ impl AppState {
     }
 
     pub fn current_filtered_videos(&self) -> Vec<VideoItem> {
-        let raw_list = if self.active_category < self.categories.len() {
-            &self.categories[self.active_category].1
+        let (cat, raw_list) = if self.active_category < self.categories.len() {
+            (self.categories[self.active_category].0, &self.categories[self.active_category].1)
         } else {
             return Vec::new();
         };
+
+        if cat == Category::ContinueWatching && self.sort_order == SortOrder::Default {
+            return raw_list.clone();
+        }
 
         let mut filtered: Vec<VideoItem> = raw_list
             .iter()
@@ -449,10 +474,68 @@ impl AppState {
         filtered
     }
 
+    pub fn is_in_continue_watching(&self, video_id: &str) -> bool {
+        let clean = video_id.trim_start_matches("RD");
+        self.continue_watching_meta.contains_key(clean)
+            || self
+                .categories
+                .iter()
+                .find(|(c, _)| *c == Category::ContinueWatching)
+                .map(|(_, list)| list.iter().any(|v| v.clean_id() == clean))
+                .unwrap_or(false)
+    }
+
     pub fn current_home_video(&self) -> Option<VideoItem> {
         let list = self.current_filtered_videos();
         let idx = self.category_cursors[self.active_category].min(list.len().saturating_sub(1));
         list.get(idx).cloned()
+    }
+
+    pub fn reset_ticker(&mut self) {
+        let now = Instant::now();
+        self.ticker_step = 0;
+        self.ticker_focus_started_at = now;
+        self.ticker_last_step_at = now;
+    }
+
+    /// Related items shown in the Detail right-bottom drawer: `[QUEUE]` Up Next + `[CH]` same-channel uploads.
+    pub fn detail_related_entries(&self) -> Vec<(&'static str, VideoItem)> {
+        let Some(ref cur) = self.detail_video else {
+            return Vec::new();
+        };
+        let cur_id = cur.clean_id();
+        let cur_uploader = cur.display_uploader();
+        let mut seen = HashSet::new();
+        seen.insert(cur_id.to_string());
+        let mut out = Vec::new();
+
+        if let Some((_, cw_items)) = self
+            .categories
+            .iter()
+            .find(|(c, _)| *c == Category::ContinueWatching)
+        {
+            for v in cw_items {
+                if seen.insert(v.clean_id().to_string()) {
+                    out.push(("QUEUE", v.clone()));
+                    if out.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        for v in self.all_known_videos() {
+            let same_cid = cur.channel_id.is_some() && v.channel_id == cur.channel_id;
+            let same_up = !cur_uploader.eq_ignore_ascii_case("Unknown")
+                && v.display_uploader().eq_ignore_ascii_case(cur_uploader);
+            if (same_cid || same_up) && seen.insert(v.clean_id().to_string()) {
+                out.push(("CH", v));
+                if out.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     pub fn active_selected_video(&self) -> Option<VideoItem> {
@@ -506,14 +589,8 @@ impl AppState {
 
         let ambi = extract_ambilight_palette(&img, self.base_theme());
         self.ambilight_cache.insert(video_id.clone(), ambi);
-        self.raw_thumbs.insert(video_id.clone(), img.clone());
-
-        if let Some(ref mut picker) = self.picker {
-            let p1 = crate::ui::components::cover::build_stateful_protocol(picker, img.clone());
-            let p2 = crate::ui::components::cover::build_stateful_protocol(picker, img);
-            self.image_cache.insert(video_id.clone(), p1);
-            self.banner_cache.insert(video_id, p2);
-        }
+        self.raw_thumbs.insert(video_id.clone(), img);
+        self.image_cache.retain(|(id, _, _), _| id != &video_id);
     }
 
     pub fn queue_thumb_if_needed(&mut self, id: &str, url: &str) {
@@ -571,7 +648,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
     let (px, py) = match overlay {
         ActiveOverlay::None => return None,
         ActiveOverlay::Search => (76, 78),
-        ActiveOverlay::Login => (68, 60),
+        ActiveOverlay::Login => (84, 78),
         ActiveOverlay::Filter => (60, 56),
         ActiveOverlay::PlayOptions => (86, 62),
         ActiveOverlay::Settings => (82, 74),

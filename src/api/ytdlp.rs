@@ -1,5 +1,6 @@
 //! Cancellation-safe `yt-dlp` JSON runner, feed pagination, detail extractor, and chapter parser.
 
+use crate::api::innertube::parse_iso8601_unix;
 use crate::api::player::find_binary;
 use crate::api::subtitles::{parse_ytdlp_subtitles_json, SubtitleTrack};
 use crate::db::cache::{VideoChapter, VideoItem};
@@ -11,6 +12,33 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::Sender;
+
+fn parse_ytdlp_json_line(line: &str) -> Option<VideoItem> {
+    let val: Value = serde_json::from_str(line).ok()?;
+    let item: VideoItem = serde_json::from_value(val.clone()).ok()?;
+    Some(enrich_ytdlp_dates(&val, item))
+}
+
+fn enrich_ytdlp_dates(val: &Value, mut item: VideoItem) -> VideoItem {
+    if item.timestamp.is_none() {
+        if let Some(ud) = val.get("upload_date").and_then(|v| v.as_str()) {
+            if ud.len() == 8 && ud.chars().all(|c| c.is_ascii_digit()) {
+                let iso = format!("{}-{}-{}T12:00:00Z", &ud[0..4], &ud[4..6], &ud[6..8]);
+                if let Some(ts) = parse_iso8601_unix(&iso) {
+                    item.timestamp = Some(ts as i64);
+                }
+            }
+        }
+    }
+    if item.published_text.is_none() {
+        if let Some(ud) = val.get("upload_date").and_then(|v| v.as_str()) {
+            if ud.len() == 8 && ud.chars().all(|c| c.is_ascii_digit()) {
+                item.published_text = Some(format!("{}-{}-{}", &ud[0..4], &ud[4..6], &ud[6..8]));
+            }
+        }
+    }
+    item
+}
 
 fn ytdlp_bin() -> String {
     find_binary("yt-dlp")
@@ -53,9 +81,7 @@ pub async fn fetch_feed_range(
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<VideoItem>(line).ok())
-        .collect()
+    text.lines().filter_map(parse_ytdlp_json_line).collect()
 }
 
 pub async fn fetch_feed_range_stream(
@@ -89,6 +115,7 @@ pub async fn fetch_feed_range_stream(
             .send(AppMessage::MoreFeedLoaded {
                 feed_key,
                 items: Vec::new(),
+                continuation: None,
             })
             .await;
         return;
@@ -99,7 +126,7 @@ pub async fn fetch_feed_range_stream(
         let mut lines = BufReader::new(stdout).lines();
         let mut count = 0usize;
         while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(item) = serde_json::from_str::<VideoItem>(&line) {
+            if let Some(item) = parse_ytdlp_json_line(&line) {
                 count += 1;
                 items.push(item);
                 let _ = tx
@@ -115,7 +142,11 @@ pub async fn fetch_feed_range_stream(
 
     let _ = child.wait().await;
     let _ = tx
-        .send(AppMessage::MoreFeedLoaded { feed_key, items })
+        .send(AppMessage::MoreFeedLoaded {
+            feed_key,
+            items,
+            continuation: None,
+        })
         .await;
 }
 
@@ -145,9 +176,7 @@ pub async fn search_youtube(
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<VideoItem>(line).ok())
-        .collect()
+    text.lines().filter_map(parse_ytdlp_json_line).collect()
 }
 
 pub async fn fetch_channel_videos(
@@ -188,7 +217,8 @@ pub async fn fetch_video_details(
     }
 
     let val: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let mut item: VideoItem = serde_json::from_value(val.clone()).ok()?;
+    let item: VideoItem = serde_json::from_value(val.clone()).ok()?;
+    let mut item = enrich_ytdlp_dates(&val, item);
 
     // Fallback: extract chapters from description text if YouTube returned empty native chapters
     let has_chapters = item

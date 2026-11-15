@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS videos (
     like_count      INTEGER,
     dislike_count   INTEGER,
     published_at    INTEGER,
+    published_text  TEXT,
     webpage_url     TEXT,
     chapters_json   TEXT NOT NULL DEFAULT '[]',
     tags_json       TEXT NOT NULL DEFAULT '[]',
@@ -49,7 +50,10 @@ CREATE TABLE IF NOT EXISTS continue_watching (
     video_id        TEXT PRIMARY KEY REFERENCES videos(id),
     last_pos_secs   REAL NOT NULL DEFAULT 0.0,
     duration_secs   REAL NOT NULL DEFAULT 0.0,
-    last_watched_at INTEGER NOT NULL
+    last_watched_at INTEGER NOT NULL,
+    pinned_manually INTEGER NOT NULL DEFAULT 0,
+    queue_order     INTEGER NOT NULL DEFAULT 0,
+    added_at        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS watch_later (

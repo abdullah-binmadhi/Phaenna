@@ -32,7 +32,7 @@ pub fn render_analytics_modal(frame: &mut Frame, state: &AppState) {
 
     let outer = Block::default()
         .title(Span::styled(
-            " 📊 PHAENNA WRAPPED — PERSONAL VIEWING INTELLIGENCE ",
+            " PHAENNA WRAPPED — PERSONAL VIEWING INTELLIGENCE ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.primary)
@@ -179,7 +179,7 @@ pub fn render_analytics_modal(frame: &mut Frame, state: &AppState) {
     frame.render_widget(
         Paragraph::new(bucket_lines).block(
             Block::default()
-                .title(Span::styled(" ⏱ Format Runtime Mix ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(" Format Runtime Mix ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.border_idle)),
@@ -240,7 +240,7 @@ pub fn render_analytics_modal(frame: &mut Frame, state: &AppState) {
     frame.render_widget(
         Paragraph::new(ch_lines).block(
             Block::default()
-                .title(Span::styled(" ★ Top Channels ", Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(" Top Channels ", Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.border_idle)),
@@ -269,7 +269,7 @@ pub fn render_analytics_modal(frame: &mut Frame, state: &AppState) {
     frame.render_widget(
         Paragraph::new(recent_lines).block(
             Block::default()
-                .title(Span::styled(" 🕒 Recent Completions ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(" Recent Completions ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.border_idle)),
@@ -281,7 +281,7 @@ pub fn render_analytics_modal(frame: &mut Frame, state: &AppState) {
         Paragraph::new(Line::from(vec![
             Span::styled(" [r] Recompute SQLite Telemetry ", Style::default().fg(theme.primary)),
             Span::styled(" · ", Style::default().fg(theme.divider)),
-            Span::styled("[Esc / a] Close Dashboard ", Style::default().fg(theme.text_dim)),
+            Span::styled("[Esc / A] Close Dashboard ", Style::default().fg(theme.text_dim)),
         ]))
         .alignment(Alignment::Center),
         rows[3],

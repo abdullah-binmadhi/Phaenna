@@ -92,13 +92,13 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
             id: 0,
             title: "Session Pacing & Runtime",
             subtitle: "How long do you want your ideal watch session to last?",
-            symbol: "󱑎",
+            symbol: "[TIME]",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
                     label: "Espresso Shots (5–15 min)",
                     detail: "Tight essays, news breakdowns, devlogs, focused clips.",
-                    symbol: "⚡",
+                    symbol: ">>",
                     keywords_pos: &[("explained", 8.0), ("devlog", 7.0), ("breakdown", 7.0)],
                     keywords_neg: &["podcast", "livestream"],
                     min_duration_secs: Some(120.0),
@@ -143,7 +143,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Systems, Rust & Engineering",
                     detail: "Compilers, Linux, low-level performance, architecture.",
-                    symbol: "🦀",
+                    symbol: "[SYS]",
                     keywords_pos: &[("rust", 14.0), ("linux", 12.0), ("systems", 11.0), ("code", 9.0), ("tui", 12.0)],
                     keywords_neg: &["prank", "drama"],
                     min_duration_secs: None,
@@ -152,7 +152,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Science, Space & History",
                     detail: "Physics, astrophysics, investigative documentaries.",
-                    symbol: "🔭",
+                    symbol: "[SCI]",
                     keywords_pos: &[("physics", 13.0), ("space", 11.0), ("science", 12.0), ("history", 11.0), ("math", 11.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -161,7 +161,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Cinema, Design & Visual Craft",
                     detail: "Color grading, film criticism, 3D motion, sound design.",
-                    symbol: "🎬",
+                    symbol: "[ART]",
                     keywords_pos: &[("film", 12.0), ("design", 11.0), ("cinema", 12.0), ("music", 10.0), ("art", 9.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -170,7 +170,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Gaming & Esports Analysis",
                     detail: "Speedruns, game design essays, tournament strategy.",
-                    symbol: "🎮",
+                    symbol: "[GAM]",
                     keywords_pos: &[("game", 10.0), ("speedrun", 13.0), ("lore", 11.0), ("gameplay", 8.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -188,7 +188,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Late-Night Essay / Lo-Fi Focus",
                     detail: "Calm narration, thoughtful pacing, ambient clarity.",
-                    symbol: "🌙",
+                    symbol: "[LOW]",
                     keywords_pos: &[("essay", 11.0), ("ambient", 11.0), ("jazz", 9.0), ("story", 8.0)],
                     keywords_neg: &["challenge", "24 hours"],
                     min_duration_secs: None,
@@ -197,7 +197,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Razor-Sharp Technical Bench",
                     detail: "No fluff, fast signal density, terminal & live builds.",
-                    symbol: "⚙",
+                    symbol: "[DEV]",
                     keywords_pos: &[("benchmark", 10.0), ("tutorial", 9.0), ("build", 9.0), ("guide", 8.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -206,7 +206,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "High-Production Entertainment",
                     detail: "Big ideas, visual spectacle, storytelling momentum.",
-                    symbol: "★",
+                    symbol: "[PRO]",
                     keywords_pos: &[("documentary", 9.0), ("behind", 8.0), ("Live", 7.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -224,7 +224,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Indie Artisans & Hidden Gems",
                     detail: "Solo researchers, small channels with insane craft.",
-                    symbol: "💎",
+                    symbol: "[IND]",
                     keywords_pos: &[("indie", 10.0), ("devlog", 9.0), ("experiment", 9.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -233,7 +233,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Flagship Educational Studios",
                     detail: "Polished investigative teams and conference talks.",
-                    symbol: "🏛",
+                    symbol: "[EDU]",
                     keywords_pos: &[("talk", 9.0), ("conference", 10.0), ("veritasium", 11.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -245,7 +245,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
             id: 4,
             title: "Sound & Focus Mode",
             subtitle: "Visual cinema or background listening companion?",
-            symbol: "♫",
+            symbol: "[AUD]",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
@@ -260,7 +260,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Audio-First Companion",
                     detail: "Discussions, interviews, ambient soundscapes.",
-                    symbol: "🎧",
+                    symbol: "[AUD]",
                     keywords_pos: &[("podcast", 11.0), ("interview", 10.0), ("ost", 9.0), ("radio", 8.0)],
                     keywords_neg: &[],
                     min_duration_secs: None,
@@ -287,7 +287,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "No Clickbait Drama / Reactions",
                     detail: "Suppress reaction farming and sensational thumbnails.",
-                    symbol: "🚫",
+                    symbol: "[X]",
                     keywords_pos: &[],
                     keywords_neg: &["reacts", "reaction", "drama", "exposed", "gone wrong"],
                     min_duration_secs: None,
@@ -296,7 +296,7 @@ pub fn build_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "No Multi-Hour Livestreams",
                     detail: "Skip unedited 3h+ VOD dumps.",
-                    symbol: "⏱",
+                    symbol: "[<3h]",
                     keywords_pos: &[],
                     keywords_neg: &["vod", "stream archive"],
                     min_duration_secs: None,

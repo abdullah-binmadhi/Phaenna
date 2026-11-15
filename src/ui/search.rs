@@ -1,6 +1,10 @@
 //! Instant Local SQLite + 350ms Debounced YouTube Live Search Modal (`/`).
+//! Split-pane results + Live 16:9 Preview Inspector so every search hit shows
+//! edge-to-edge cover art, views, release age, and synopsis with zero dead space.
 
 use crate::state::{centered_rect, AppState};
+use crate::ui::components::cover::{render_video_preview_inspector, unix_now_secs};
+use crate::ui::home::marquee_window;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -9,14 +13,15 @@ use ratatui::{
     Frame,
 };
 
-pub fn render_search_modal(frame: &mut Frame, state: &AppState) {
+pub fn render_search_modal(frame: &mut Frame, state: &mut AppState) {
     let theme = state.base_theme();
-    let area = centered_rect(76, 78, frame.area());
+    let area = centered_rect(88, 84, frame.area());
     frame.render_widget(Clear, area);
+    let now_unix = unix_now_secs();
 
     let outer = Block::default()
         .title(Span::styled(
-            " 󰍉 PHAENNA — INSTANT LOCAL + LIVE SEARCH ",
+            " PHAENNA — INSTANT LOCAL + LIVE SEARCH ",
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.primary)
@@ -35,7 +40,7 @@ pub fn render_search_modal(frame: &mut Frame, state: &AppState) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(1),
-            Constraint::Min(6),
+            Constraint::Min(10),
             Constraint::Length(1),
         ])
         .split(inner);
@@ -47,15 +52,20 @@ pub fn render_search_modal(frame: &mut Frame, state: &AppState) {
         .border_style(Style::default().fg(theme.border_focus));
 
     let status_suffix = if state.is_searching_remote {
-        "  (⟳ fetching YouTube...)"
+        "  (fetching YouTube...)"
     } else if state.search_pending_remote {
-        "  (⏳ waiting debounce...)"
+        "  (waiting debounce...)"
     } else {
         ""
     };
 
     let input_line = Line::from(vec![
-        Span::styled(&state.search_query, Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            &state.search_query,
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("█", Style::default().fg(theme.primary)),
         Span::styled(status_suffix, Style::default().fg(theme.accent)),
     ]);
@@ -65,7 +75,9 @@ pub fn render_search_modal(frame: &mut Frame, state: &AppState) {
     let meta = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {} results ", combined.len()),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
@@ -93,28 +105,87 @@ pub fn render_search_modal(frame: &mut Frame, state: &AppState) {
             chunks[2],
         );
     } else {
+        // 58% Left Results List / 42% Right Live 16:9 Preview Inspector
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(chunks[2]);
+
+        let list_blk = Block::default()
+            .title(Span::styled(
+                " RESULTS ",
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border_idle));
+        let list_inner = list_blk.inner(panes[0]);
+        frame.render_widget(list_blk, panes[0]);
+
+        let cur = state.search_cursor.min(combined.len().saturating_sub(1));
+        for v in combined.iter().take(12) {
+            state.queue_thumb_if_needed(&v.id, &v.best_thumbnail_url());
+        }
+        if let Some(sel) = combined.get(cur) {
+            state.queue_thumb_if_needed(&sel.id, &sel.best_thumbnail_url());
+        }
+
+        let total_w = list_inner.width as usize;
+        let uploader_w = (total_w / 4).clamp(10, 18);
+        let dur_w = 8usize;
+        let prefix_w = 8usize;
+        let title_w = total_w
+            .saturating_sub(prefix_w + uploader_w + dur_w + 4)
+            .max(12);
+
         let items: Vec<ListItem> = combined
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let is_sel = i == state.search_cursor;
-                let watched_badge = if state.watched_ids.contains(&v.id) { "✓ " } else { "" };
+                let is_sel = i == cur;
+                let watched_badge = if state.watched_ids.contains(&v.id) {
+                    "[OK] "
+                } else if v.is_new_release(now_unix) {
+                    "NEW  "
+                } else {
+                    "  ·  "
+                };
+                let badge_col = if state.watched_ids.contains(&v.id) {
+                    theme.accent
+                } else if v.is_new_release(now_unix) {
+                    Color::Rgb(52, 211, 153)
+                } else {
+                    theme.text_dim
+                };
                 let dur = v.display_duration();
-                let uploader = v.display_uploader();
+                let uploader: String = v.display_uploader().chars().take(uploader_w).collect();
+                let title_text = if is_sel {
+                    marquee_window(&v.title, title_w, state.ticker_step)
+                } else {
+                    v.title.chars().take(title_w).collect::<String>()
+                };
                 let line = Line::from(vec![
                     Span::styled(
                         if is_sel { " ▸ " } else { "   " },
-                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.primary)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(watched_badge, Style::default().fg(theme.accent)),
+                    Span::styled(watched_badge, Style::default().fg(badge_col)),
                     Span::styled(
-                        format!("{:<48}", v.title.chars().take(48).collect::<String>()),
+                        format!("{:<width$}", title_text, width = title_w),
                         Style::default()
                             .fg(if is_sel { theme.primary } else { theme.text })
-                            .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ),
                     Span::styled(
-                        format!("  {} · {}", uploader.chars().take(18).collect::<String>(), dur),
+                        format!("  {:<uw$} · {}", uploader, dur, uw = uploader_w),
                         Style::default().fg(theme.text_dim),
                     ),
                 ]);
@@ -123,20 +194,40 @@ pub fn render_search_modal(frame: &mut Frame, state: &AppState) {
             .collect();
 
         let mut ls = ListState::default();
-        ls.select(Some(state.search_cursor.min(combined.len().saturating_sub(1))));
+        ls.select(Some(cur));
         frame.render_stateful_widget(
             List::new(items).highlight_style(Style::default().bg(Color::Rgb(32, 38, 52))),
-            chunks[2],
+            list_inner,
             &mut ls,
         );
+
+        if let Some(sel) = combined.get(cur) {
+            let mut badges: Vec<(&str, Color)> = Vec::new();
+            if state.watched_ids.contains(&sel.id) {
+                badges.push(("WATCHED", theme.accent));
+            }
+            if state.watch_later_sources.contains_key(&sel.id) {
+                badges.push(("WL", Color::Rgb(251, 191, 36)));
+            }
+            render_video_preview_inspector(
+                frame,
+                panes[1],
+                state,
+                sel,
+                now_unix,
+                &badges,
+                None,
+                "[Enter] Detail · [^p] Play · [^a] +CW · [Esc] Close",
+            );
+        }
     }
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("[↑/↓] Select ", Style::default().fg(theme.primary)),
-            Span::styled("· [Enter] Open Detail ", Style::default().fg(theme.accent)),
-            Span::styled("· [p] Play ", Style::default().fg(theme.secondary)),
-            Span::styled("· [Esc] Close", Style::default().fg(theme.text_dim)),
+            Span::styled("· [Enter] Detail ", Style::default().fg(theme.accent)),
+            Span::styled("· [^a] +Continue Watching ", Style::default().fg(theme.secondary)),
+            Span::styled("· [^p] Play · [Esc] Close", Style::default().fg(theme.text_dim)),
         ]))
         .alignment(Alignment::Center),
         chunks[3],
