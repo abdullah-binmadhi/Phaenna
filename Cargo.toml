@@ -1,0 +1,43 @@
+[package]
+name = "phaenna"
+version = "1.0.0"
+edition = "2021"
+description = "Phaenna — High-definition terminal YouTube theatre, discovery crucible, SponsorBlock companion, and analytics engine"
+authors = ["Abdullah Binmadhi"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/abdullah-binmadhi/Phaenna"
+homepage = "https://github.com/abdullah-binmadhi/Phaenna"
+keywords = ["youtube", "tui", "terminal", "cli", "phaenna"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "phaenna"
+path = "src/main.rs"
+
+[dependencies]
+ratatui           = "0.28"
+crossterm         = "0.28"
+ratatui-image     = { version = "2", features = ["crossterm"] }
+image             = "0.25"
+tokio             = { version = "1", features = ["full"] }
+reqwest           = { version = "0.12", features = ["json"] }
+sqlx              = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+toml              = "0.8"
+anyhow            = "1"
+thiserror         = "1"
+clap              = { version = "4", features = ["derive"] }
+directories       = "5"
+fuzzy-matcher     = "0.3"
+rand              = "0.8"
+base64            = "0.22"
+flate2            = "1.0"
+qrcode            = { version = "0.14.1", default-features = false }
+tokio-tungstenite = "0.30.0"
+futures-util      = "0.3.34"
+tempfile          = "3"
+
+[dev-dependencies]
+tokio-test = "0.4"

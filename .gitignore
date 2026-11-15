@@ -1,0 +1,25 @@
+# Rust / Cargo build artifacts
+/target
+
+# SQLite databases & WAL sidecars
+*.db
+*.db-shm
+*.db-wal
+
+# Runtime sockets, temp files & credentials
+*.sock
+*.update.tmp
+cookies.txt
+
+# Editor & AI agent directories
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS metadata & logs
+.DS_Store
+Thumbs.db
+*.log
+.env
