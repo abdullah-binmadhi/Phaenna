@@ -812,17 +812,20 @@ fn render_chapters_panel(
 fn render_comments_panel(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     pal: &ThemePalette,
 ) {
+    state.detail_comments_panel_rect = area;
+    state.detail_comment_hitboxes.clear();
+
     let focused = state.detail_focus_pane == 2 || state.detail_comment_composing;
     let total = state.detail_comments.len();
     let title = if state.detail_comment_composing {
         format!(" Comments ({total}) [WRITING · Enter Post · Esc Cancel] ")
     } else if focused {
-        format!(" Comments ({total}) [Focused · j/k · Enter/r Replies · m Write] ")
+        format!(" Comments ({total}) [Focused · j/k · Dbl-Click/Enter/r Replies · m Write] ")
     } else {
-        format!(" Comments ({total}) [Tab / m Write] ")
+        format!(" Comments ({total}) [Tab / Dbl-Click / m Write] ")
     };
 
     let blk = Block::default()
@@ -854,6 +857,8 @@ fn render_comments_panel(
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(inner);
+
+    state.detail_comment_composer_rect = chunks[0];
 
     // Top Interactive Comment Composer Box
     let comp_border = if state.detail_comment_composing {
@@ -904,7 +909,7 @@ fn render_comments_panel(
     } else {
         Line::from(Span::styled(
             truncate_word_boundary(
-                "Press [m] to write a comment, or [Tab] then [j/k] to read full threads...",
+                "Click or press [m] to comment · Double-click any comment to reveal replies...",
                 comp_w,
             ),
             Style::default().fg(pal.text_dim),
@@ -944,11 +949,14 @@ fn render_comments_panel(
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     let mut selected_start_line = 0usize;
     let mut selected_end_line = 0usize;
+    let mut per_comment_ranges: Vec<(usize, usize, usize)> =
+        Vec::with_capacity(state.detail_comments.len());
 
     for (idx, c) in state.detail_comments.iter().enumerate() {
+        let c_start_line = all_lines.len();
         let sel = idx == cur;
         if sel {
-            selected_start_line = all_lines.len();
+            selected_start_line = c_start_line;
         }
         let header_bg = if sel {
             Color::Rgb(30, 36, 52)
@@ -1096,8 +1104,11 @@ fn render_comments_panel(
             Style::default().fg(pal.divider),
         )));
 
+        let c_end_line = all_lines.len().saturating_sub(1);
+        per_comment_ranges.push((c_start_line, c_end_line, idx));
+
         if sel {
-            selected_end_line = all_lines.len().saturating_sub(1);
+            selected_end_line = c_end_line;
         }
     }
 
@@ -1109,13 +1120,22 @@ fn render_comments_panel(
         0
     } as u16;
 
+    let sy = scroll_y as usize;
+    for (sl, el, idx) in per_comment_ranges {
+        if el >= sy && sl < sy + vis_h {
+            let y0 = list_area.y + sl.saturating_sub(sy) as u16;
+            let y1 = list_area.y + el.saturating_sub(sy).min(vis_h.saturating_sub(1)) as u16;
+            state.detail_comment_hitboxes.push((y0, y1, idx));
+        }
+    }
+
     frame.render_widget(Paragraph::new(all_lines).scroll((scroll_y, 0)), list_area);
 }
 
 fn render_footer_legend(frame: &mut Frame, area: Rect, state: &AppState, pal: &ThemePalette) {
-    let enter_hint = match state.detail_focus_pane {
+        let enter_hint = match state.detail_focus_pane {
         1 => "[Enter] Play Chapter",
-        2 => "[Enter/r] Replies · [m] Comment",
+        2 => "[Dbl-Click/Enter/r] Replies · [m] Comment",
         _ => "[Enter/Space] Play Video",
     };
     frame.render_widget(
@@ -1208,6 +1228,7 @@ mod tests {
             assert!(text.contains("Comments (1)"), "Expected Comments panel");
             assert!(text.contains("@viewer_one"), "Expected author inside Comments panel");
             assert!(text.contains("@reply_author"), "Expected nested reply author inside expanded thread");
+            assert!(!st.detail_comment_hitboxes.is_empty(), "Expected comment click hitboxes");
             assert!(!text.contains("concatenationissues"), "Words must never concatenate");
             assert!(text.contains("27.5K views"), "Expected view count in detail telemetry");
         }

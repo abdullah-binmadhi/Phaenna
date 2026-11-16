@@ -1862,6 +1862,8 @@ fn open_detail_for_video(
     state.detail_create_comment_params = None;
     state.detail_comment_composing = false;
     state.detail_comment_input.clear();
+    state.detail_comment_hitboxes.clear();
+    state.detail_comment_last_click = None;
     state.overlay = ActiveOverlay::None;
     state.screen = Screen::Detail;
 
@@ -2589,6 +2591,63 @@ async fn handle_mouse_event(
     let frame_area = ratatui::layout::Rect::new(0, 0, w, h);
 
     if state.overlay != ActiveOverlay::None || state.screen != Screen::Home {
+        if state.overlay == ActiveOverlay::None && state.screen == Screen::Detail {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if in_rect(state.detail_comment_composer_rect) {
+                        state.detail_focus_pane = 2;
+                        state.detail_comment_composing = true;
+                        state.detail_comment_last_click = None;
+                        return true;
+                    }
+                    if in_rect(state.detail_comments_panel_rect) {
+                        state.detail_focus_pane = 2;
+                        state.detail_comment_composing = false;
+                        if let Some(&(_, _, idx)) = state
+                            .detail_comment_hitboxes
+                            .iter()
+                            .find(|&&(y0, y1, _)| mouse.row >= y0 && mouse.row <= y1)
+                        {
+                            let is_dbl = matches!(
+                                state.detail_comment_last_click,
+                                Some((prev, ts))
+                                    if prev == idx && ts.elapsed() <= Duration::from_millis(450)
+                            );
+                            state.detail_comment_cursor = idx;
+                            if is_dbl {
+                                state.detail_comment_last_click = None;
+                                toggle_selected_comment_replies(state, tx, client);
+                            } else {
+                                state.detail_comment_last_click = Some((idx, Instant::now()));
+                            }
+                        }
+                        return true;
+                    }
+                }
+                MouseEventKind::ScrollDown if in_rect(state.detail_comments_panel_rect) => {
+                    let n = state.detail_comments.len();
+                    if n > 0 {
+                        state.detail_comment_cursor = (state.detail_comment_cursor + 1).min(n - 1);
+                    }
+                    return true;
+                }
+                MouseEventKind::ScrollUp if in_rect(state.detail_comments_panel_rect) => {
+                    state.detail_comment_cursor = state.detail_comment_cursor.saturating_sub(1);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
             if state.overlay != ActiveOverlay::None {
                 state.overlay = ActiveOverlay::None;

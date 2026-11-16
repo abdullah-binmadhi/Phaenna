@@ -232,6 +232,10 @@ pub struct AppState {
     pub detail_create_comment_params: Option<String>,
     pub detail_comment_composing: bool,
     pub detail_comment_input: String,
+    pub detail_comments_panel_rect: Rect,
+    pub detail_comment_composer_rect: Rect,
+    pub detail_comment_hitboxes: Vec<(u16, u16, usize)>,
+    pub detail_comment_last_click: Option<(usize, Instant)>,
 
     pub channel_title: String,
     pub channel_id: Option<String>,
@@ -380,6 +384,10 @@ impl AppState {
             detail_create_comment_params: None,
             detail_comment_composing: false,
             detail_comment_input: String::new(),
+            detail_comments_panel_rect: Rect::default(),
+            detail_comment_composer_rect: Rect::default(),
+            detail_comment_hitboxes: Vec::new(),
+            detail_comment_last_click: None,
 
             channel_title: String::new(),
             channel_id: None,

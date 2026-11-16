@@ -1185,6 +1185,9 @@ struct CommentParseCtx {
     create_params: Option<String>,
     reply_tokens: std::collections::HashMap<String, String>,
     inline_replies: std::collections::HashMap<String, Vec<VideoComment>>,
+    ordered_ids: Vec<String>,
+    ordered_seen: HashSet<String>,
+    pinned_ids: HashSet<String>,
 }
 
 fn collect_comments_nodes(
@@ -1205,9 +1208,28 @@ fn collect_comments_nodes(
             if let Some(ctr) = map.get("commentThreadRenderer") {
                 let parent_id = ctr
                     .pointer("/comment/commentRenderer/commentId")
+                    .or_else(|| ctr.pointer("/commentViewModel/commentViewModel/commentId"))
                     .or_else(|| ctr.pointer("/comment/commentViewModel/commentId"))
                     .and_then(|x| x.as_str())
+                    .or_else(|| {
+                        ctr.pointer("/replies/commentRepliesRenderer/targetId")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.strip_prefix("comment-replies-item-"))
+                    })
                     .map(str::to_string);
+
+                if let Some(ref pid) = parent_id {
+                    if !pid.is_empty() && ctx.ordered_seen.insert(pid.clone()) {
+                        ctx.ordered_ids.push(pid.clone());
+                    }
+                    if ctr
+                        .pointer("/commentViewModel/commentViewModel/pinnedText")
+                        .or_else(|| ctr.pointer("/comment/commentViewModel/pinnedText"))
+                        .is_some()
+                    {
+                        ctx.pinned_ids.insert(pid.clone());
+                    }
+                }
 
                 if let (Some(pid), Some(replies_node)) = (parent_id.as_ref(), ctr.get("replies")) {
                     if let Some(tok) = extract_reply_continuation_from_replies_node(replies_node) {
@@ -1233,15 +1255,41 @@ fn collect_comments_nodes(
                     }
                 }
 
-                if let Some(comment_node) = ctr.get("comment") {
+                if let Some(comment_node) = ctr
+                    .get("comment")
+                    .or_else(|| ctr.get("commentViewModel"))
+                {
                     collect_comments_nodes(comment_node, ctx, false);
                 }
                 return;
             }
 
+            if let Some(cvm) = map.get("commentViewModel") {
+                if let Some(cid) = cvm
+                    .get("commentId")
+                    .or_else(|| cvm.pointer("/commentViewModel/commentId"))
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    if ctx.ordered_seen.insert(cid.to_string()) {
+                        ctx.ordered_ids.push(cid.to_string());
+                    }
+                    if cvm
+                        .get("pinnedText")
+                        .or_else(|| cvm.pointer("/commentViewModel/pinnedText"))
+                        .is_some()
+                    {
+                        ctx.pinned_ids.insert(cid.to_string());
+                    }
+                }
+            }
+
             if let Some(cr) = map.get("commentRenderer") {
                 if let Some(mut cmt) = parse_comment_renderer_node(cr) {
                     if ctx.seen.insert(cmt.id.clone()) {
+                        if ctx.ordered_seen.insert(cmt.id.clone()) {
+                            ctx.ordered_ids.push(cmt.id.clone());
+                        }
                         cmt.replies_continuation = ctx.reply_tokens.remove(&cmt.id);
                         if let Some(reps) = ctx.inline_replies.remove(&cmt.id) {
                             cmt.replies = reps;
@@ -1297,7 +1345,7 @@ fn collect_comments_nodes(
                             text,
                             like_count_text,
                             reply_count,
-                            is_pinned: false,
+                            is_pinned: ctx.pinned_ids.contains(id),
                             is_self: false,
                             replies_continuation,
                             replies,
@@ -1310,10 +1358,12 @@ fn collect_comments_nodes(
             if !inside_replies_branch && ctx.continuation.is_none() {
                 if let Some(ci) = map.get("continuationItemRenderer") {
                     if let Some(tok) = ci
-                        .get("continuationEndpoint")
-                        .and_then(|e| e.get("continuationCommand"))
-                        .and_then(|c| c.get("token"))
+                        .pointer("/continuationEndpoint/continuationCommand/token")
+                        .or_else(|| {
+                            ci.pointer("/button/buttonRenderer/command/continuationCommand/token")
+                        })
                         .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
                     {
                         ctx.continuation = Some(tok.to_string());
                     }
@@ -1341,6 +1391,26 @@ pub fn parse_innertube_comments_json(root: &serde_json::Value) -> CommentsPage {
         collect_comments_nodes(endpoints, &mut ctx, false);
     }
     collect_comments_nodes(root, &mut ctx, false);
+
+    let order_map: std::collections::HashMap<String, usize> = ctx
+        .ordered_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i))
+        .collect();
+    for c in &mut ctx.out {
+        if let Some(tok) = ctx.reply_tokens.remove(&c.id) {
+            if c.replies_continuation.is_none() {
+                c.replies_continuation = Some(tok);
+            }
+        }
+        if ctx.pinned_ids.contains(&c.id) {
+            c.is_pinned = true;
+        }
+    }
+    ctx.out
+        .sort_by_key(|c| order_map.get(&c.id).copied().unwrap_or(usize::MAX));
+
     CommentsPage {
         comments: ctx.out,
         continuation: ctx.continuation,
@@ -2103,13 +2173,15 @@ mod tests {
                         }
                     }, {
                         "commentThreadRenderer": {
-                            "comment": {
+                            "commentViewModel": {
                                 "commentViewModel": {
-                                    "commentId": "cmt_entity_2"
+                                    "commentId": "cmt_entity_2",
+                                    "pinnedText": "Pinned"
                                 }
                             },
                             "replies": {
                                 "commentRepliesRenderer": {
+                                    "targetId": "comment-replies-item-cmt_entity_2",
                                     "contents": [{
                                         "continuationItemRenderer": {
                                             "continuationEndpoint": {
