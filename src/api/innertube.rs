@@ -12,7 +12,7 @@ const INNERTUBE_CLIENT_VERSION: &str = "2.20251015.01.00";
 /// Map Phaenna internal feed keys onto YouTube InnerTube `browseId` targets.
 pub fn browse_id_for_feed_key(feed_key: &str) -> Option<&'static str> {
     match feed_key {
-        "recommended" => Some("FEwhat_to_watch"),
+        "recommended" | "shorts_suggested" => Some("FEwhat_to_watch"),
         "subscriptions" => Some("FEsubscriptions"),
         "history" => Some("FEhistory"),
         "watch_later" => Some("VLWL"),
@@ -256,6 +256,20 @@ fn collect_innertube_nodes(
                     }
                 }
             }
+            if let Some(sl) = map.get("shortsLockupViewModel") {
+                if let Some(item) = extract_video_from_shorts_lockup(sl) {
+                    if seen.insert(item.id.clone()) {
+                        out.push(item);
+                    }
+                }
+            }
+            if let Some(ri) = map.get("reelItemRenderer") {
+                if let Some(item) = extract_video_from_reel_item(ri) {
+                    if seen.insert(item.id.clone()) {
+                        out.push(item);
+                    }
+                }
+            }
 
             if continuation.is_none() {
                 if let Some(cont_item) = map.get("continuationItemRenderer") {
@@ -311,7 +325,7 @@ fn parse_duration_text(raw: &str) -> Option<u64> {
     }
 }
 
-fn parse_rough_views(raw: &str) -> Option<u64> {
+pub fn parse_rough_views(raw: &str) -> Option<u64> {
     let lower = raw.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return None;
@@ -345,9 +359,44 @@ fn parse_rough_views(raw: &str) -> Option<u64> {
         Some('k') => 1_000.0,
         Some('m') => 1_000_000.0,
         Some('b') => 1_000_000_000.0,
+        _ if lower.contains("billion") => 1_000_000_000.0,
+        _ if lower.contains("million") => 1_000_000.0,
+        _ if lower.contains("thousand") => 1_000.0,
         _ => 1.0,
     };
     Some((val * scale).round() as u64)
+}
+
+/// Parse English YouTube `dateText` like `"Nov 4, 2026"` or `"Streamed live on Nov 4, 2026"` -> Unix seconds.
+pub fn parse_english_short_date_to_unix(raw: &str) -> Option<i64> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("Premiered ")
+        .trim_start_matches("Streamed live on ")
+        .trim_start_matches("Published on ");
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let month: u32 = match parts[0].to_ascii_lowercase().as_str() {
+        "jan" | "january" => 1,
+        "feb" | "february" => 2,
+        "mar" | "march" => 3,
+        "apr" | "april" => 4,
+        "may" => 5,
+        "jun" | "june" => 6,
+        "jul" | "july" => 7,
+        "aug" | "august" => 8,
+        "sep" | "sept" | "september" => 9,
+        "oct" | "october" => 10,
+        "nov" | "november" => 11,
+        "dec" | "december" => 12,
+        _ => return None,
+    };
+    let day: u32 = parts[1].trim_end_matches(',').parse().ok()?;
+    let year: i64 = parts[2].trim_end_matches(',').parse().ok()?;
+    let iso = format!("{year:04}-{month:02}-{day:02}T12:00:00Z");
+    parse_iso8601_unix(&iso).map(|u| u as i64)
 }
 
 pub fn parse_relative_age_to_unix(raw: &str, now_unix: i64) -> Option<i64> {
@@ -485,6 +534,41 @@ fn extract_video_from_renderer(r: &serde_json::Value) -> Option<VideoItem> {
     })
 }
 
+fn classify_metadata_segment(
+    seg: &str,
+    row_idx: usize,
+    uploader: &mut Option<String>,
+    view_count: &mut Option<u64>,
+    published_text: &mut Option<String>,
+) {
+    let t = seg.trim();
+    if t.is_empty() {
+        return;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.contains("view") || lower.contains("watching") {
+        if view_count.is_none() {
+            *view_count = parse_rough_views(t);
+        }
+    } else if lower.contains("ago")
+        || lower.contains("just now")
+        || lower.contains("streamed")
+        || lower.contains("premiered")
+        || lower == "new"
+    {
+        if published_text.is_none() {
+            *published_text = Some(t.to_string());
+        }
+    } else if row_idx == 0
+        && uploader.is_none()
+        && !lower.eq_ignore_ascii_case("cc")
+        && !lower.contains("4k")
+        && !lower.contains("hd")
+    {
+        *uploader = Some(t.to_string());
+    }
+}
+
 fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
     let id = l.get("contentId").and_then(|v| v.as_str())?.trim().to_string();
     if id.is_empty() {
@@ -493,6 +577,10 @@ fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
     let title = l
         .pointer("/metadata/lockupMetadataViewModel/title/content")
         .and_then(|v| v.as_str())
+        .or_else(|| {
+            l.pointer("/metadata/lockupMetadataViewModel/title/simpleText")
+                .and_then(|v| v.as_str())
+        })
         .unwrap_or("Untitled Video")
         .to_string();
 
@@ -500,41 +588,77 @@ fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
         .pointer("/metadata/lockupMetadataViewModel/metadata/contentMetadataViewModel/metadataRows")
         .and_then(|v| v.as_array());
 
-    let mut uploader: Option<String> = None;
+    let mut uploader: Option<String> = l
+        .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/a11yLabel")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.strip_prefix("Go to channel "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let channel_id = l
+        .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let mut view_count: Option<u64> = None;
     let mut published_text: Option<String> = None;
+    let mut has_new_badge = false;
 
     if let Some(rows_arr) = rows {
         for (idx, row) in rows_arr.iter().enumerate() {
+            if let Some(badges) = row.get("badges").and_then(|b| b.as_array()) {
+                for b in badges {
+                    if let Some(bt) = b
+                        .pointer("/badgeViewModel/badgeText")
+                        .or_else(|| b.pointer("/metadataBadgeRenderer/label"))
+                        .and_then(|s| s.as_str())
+                    {
+                        if bt.trim().eq_ignore_ascii_case("new") {
+                            has_new_badge = true;
+                        }
+                    }
+                }
+            }
             let Some(parts) = row.get("metadataParts").and_then(|p| p.as_array()) else {
                 continue;
             };
             for part in parts {
-                let Some(txt) = part.pointer("/text/content").and_then(|s| s.as_str()) else {
+                let raw = part
+                    .pointer("/text/content")
+                    .and_then(|s| s.as_str())
+                    .or_else(|| part.pointer("/text/accessibilityLabel").and_then(|s| s.as_str()));
+                let Some(txt) = raw else {
                     continue;
                 };
-                let t = txt.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                let lower = t.to_ascii_lowercase();
-                if lower.contains("view") || lower.contains("watching") {
-                    if view_count.is_none() {
-                        view_count = parse_rough_views(t);
-                    }
-                } else if lower.contains("ago")
-                    || lower.contains("streamed")
-                    || lower.contains("premiered")
-                    || lower == "new"
-                {
-                    if published_text.is_none() {
-                        published_text = Some(t.to_string());
-                    }
-                } else if idx == 0 && uploader.is_none() {
-                    uploader = Some(t.to_string());
+                for seg in txt.split(['•', '·', '\n']) {
+                    classify_metadata_segment(
+                        seg,
+                        idx,
+                        &mut uploader,
+                        &mut view_count,
+                        &mut published_text,
+                    );
                 }
             }
         }
+    }
+
+    if let Some(a11y) = l
+        .pointer("/rendererContext/accessibilityContext/label")
+        .or_else(|| l.pointer("/metadata/lockupMetadataViewModel/rendererContext/accessibilityContext/label"))
+        .and_then(|v| v.as_str())
+    {
+        for seg in a11y.split(['•', '·', '-']) {
+            classify_metadata_segment(
+                seg,
+                1,
+                &mut uploader,
+                &mut view_count,
+                &mut published_text,
+            );
+        }
+    }
+
+    if published_text.is_none() && has_new_badge {
+        published_text = Some("New".to_string());
     }
 
     let thumbnails = l
@@ -568,6 +692,8 @@ fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
                 if trimmed.eq_ignore_ascii_case("LIVE") {
                     is_live = Some(true);
                     duration_string = Some("LIVE".to_string());
+                } else if trimmed.eq_ignore_ascii_case("SHORTS") {
+                    duration_string = Some("SHORT".to_string());
                 } else if trimmed.contains(':') {
                     duration_string = Some(trimmed.to_string());
                 }
@@ -584,6 +710,7 @@ fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
         title,
         uploader: uploader.clone(),
         channel: uploader,
+        channel_id,
         duration,
         duration_string,
         timestamp,
@@ -592,6 +719,112 @@ fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
         webpage_url: Some(format!("https://www.youtube.com/watch?v={id}")),
         thumbnails,
         is_live,
+        ..Default::default()
+    })
+}
+
+fn extract_video_from_shorts_lockup(sl: &serde_json::Value) -> Option<VideoItem> {
+    let ep = sl.pointer("/onTap/innertubeCommand/reelWatchEndpoint");
+    let id = ep
+        .and_then(|e| e.get("videoId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            sl.get("entityId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.rsplit('-').next())
+                .filter(|s| s.len() == 11)
+        })?
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return None;
+    }
+
+    let title = sl
+        .pointer("/overlayMetadata/primaryText/content")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            sl.get("accessibilityText")
+                .and_then(|v| v.as_str())
+                .map(|s| s.split(',').next().unwrap_or(s).trim())
+        })
+        .unwrap_or("YouTube Short")
+        .to_string();
+
+    let view_count = sl
+        .pointer("/overlayMetadata/secondaryText/content")
+        .and_then(|v| v.as_str())
+        .and_then(parse_rough_views)
+        .or_else(|| {
+            sl.get("accessibilityText")
+                .and_then(|v| v.as_str())
+                .and_then(parse_rough_views)
+        });
+
+    let thumbnails = sl
+        .pointer("/thumbnailViewModel/thumbnailViewModel/image/sources")
+        .or_else(|| ep.and_then(|e| e.pointer("/thumbnail/thumbnails")))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let url = t.get("url")?.as_str()?.to_string();
+                    let width = t.get("width").and_then(|w| w.as_u64()).map(|n| n as u32);
+                    let height = t.get("height").and_then(|h| h.as_u64()).map(|n| n as u32);
+                    Some(Thumbnail { url, width, height })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+
+    Some(VideoItem {
+        id: id.clone(),
+        title,
+        duration: Some(60),
+        duration_string: Some("SHORT".to_string()),
+        view_count,
+        webpage_url: Some(format!("https://www.youtube.com/shorts/{id}")),
+        thumbnails,
+        ..Default::default()
+    })
+}
+
+fn extract_video_from_reel_item(r: &serde_json::Value) -> Option<VideoItem> {
+    let id = r.get("videoId").and_then(|v| v.as_str())?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let title = extract_yt_text(r.get("headline")).unwrap_or_else(|| "YouTube Short".to_string());
+    let view_count = extract_yt_text(r.get("viewCountText")).and_then(|s| parse_rough_views(&s));
+    let published_text = extract_yt_text(r.get("publishedTimeText"));
+    let timestamp = published_text
+        .as_deref()
+        .and_then(|s| parse_relative_age_to_unix(s, now_unix_secs()));
+    let thumbnails = r
+        .pointer("/thumbnail/thumbnails")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let url = t.get("url")?.as_str()?.to_string();
+                    let width = t.get("width").and_then(|w| w.as_u64()).map(|n| n as u32);
+                    let height = t.get("height").and_then(|h| h.as_u64()).map(|n| n as u32);
+                    Some(Thumbnail { url, width, height })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+
+    Some(VideoItem {
+        id: id.clone(),
+        title,
+        duration: Some(60),
+        duration_string: Some("SHORT".to_string()),
+        timestamp,
+        published_text,
+        view_count,
+        webpage_url: Some(format!("https://www.youtube.com/shorts/{id}")),
+        thumbnails,
         ..Default::default()
     })
 }
@@ -1191,6 +1424,210 @@ pub async fn fetch_video_comments(
     Ok(page)
 }
 
+/// Fetch a subscribed channel's `/shorts` tab directly via InnerTube `browse` (`EgZzaG9ydHPyBgUKA5oBAA%3D%3D`).
+pub async fn fetch_channel_shorts(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    channel_id: &str,
+) -> Result<Vec<VideoItem>> {
+    let clean_ch = channel_id.trim();
+    if clean_ch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "browseId": clean_ch,
+        "params": "EgZzaG9ydHPyBgUKA5oBAA%3D%3D"
+    });
+    let req = client
+        .post("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload);
+    let resp = apply_innertube_web_headers(req, session).send().await?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    let root: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Parse(format!("Invalid channel shorts JSON: {e}")))?;
+
+    let ch_name = root
+        .pointer("/metadata/channelMetadataRenderer/title")
+        .or_else(|| root.pointer("/header/c4TabbedHeaderRenderer/title"))
+        .or_else(|| root.pointer("/header/pageHeaderRenderer/pageTitle"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let mut page = parse_innertube_browse_json(&root);
+    for v in &mut page.videos {
+        if v.channel_id.is_none() {
+            v.channel_id = Some(clean_ch.to_string());
+        }
+        if v.display_uploader() == "Unknown" {
+            if let Some(ref name) = ch_name {
+                v.uploader = Some(name.clone());
+                v.channel = Some(name.clone());
+            }
+        }
+        if v.duration.is_none() {
+            v.duration = Some(60);
+        }
+        if v.duration_string.is_none() {
+            v.duration_string = Some("SHORT".to_string());
+        }
+    }
+    Ok(page.videos)
+}
+
+/// Fetch algorithm-suggested Shorts from YouTube `FEwhat_to_watch` shelves / continuations.
+pub async fn fetch_suggested_shorts(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    continuation: Option<&str>,
+) -> Result<InnerTubeShelfPage> {
+    let mut page = if let Some(sess) = session {
+        fetch_innertube_shelf(client, sess, "FEwhat_to_watch", continuation).await?
+    } else {
+        let mut payload = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": INNERTUBE_CLIENT_VERSION,
+                    "hl": "en",
+                    "gl": "US"
+                }
+            }
+        });
+        if let Some(cont) = continuation.filter(|c| !c.is_empty()) {
+            payload["continuation"] = serde_json::Value::String(cont.to_string());
+        } else {
+            payload["browseId"] = serde_json::Value::String("FEwhat_to_watch".to_string());
+        }
+        let req = client
+            .post("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&payload);
+        let resp = apply_innertube_web_headers(req, None).send().await?;
+        if !resp.status().is_success() {
+            return Ok(InnerTubeShelfPage::default());
+        }
+        let root: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Parse(format!("Invalid browse JSON: {e}")))?;
+        parse_innertube_browse_json(&root)
+    };
+
+    page.videos.retain(|v| {
+        v.is_shorts()
+            || v.duration_string.as_deref() == Some("SHORT")
+            || v.webpage_url
+                .as_deref()
+                .map(|u| u.contains("/shorts/"))
+                .unwrap_or(false)
+    });
+    Ok(page)
+}
+
+/// Fetch missing `(uploader, view_count, published_text, timestamp)` for any video via InnerTube `/next`.
+pub async fn fetch_video_card_enrichment(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    video_id: &str,
+) -> Option<(Option<String>, Option<u64>, Option<String>, Option<i64>)> {
+    let clean_id = video_id.trim_start_matches("RD");
+    if clean_id.is_empty() {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "videoId": clean_id
+    });
+    let req = client
+        .post("https://www.youtube.com/youtubei/v1/next?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(8))
+        .json(&payload);
+    let resp = apply_innertube_web_headers(req, session).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+
+    let mut primary: Option<&serde_json::Value> = None;
+    let mut secondary: Option<&serde_json::Value> = None;
+    let mut reel_hdr: Option<&serde_json::Value> = None;
+    if let Some(arr) = json
+        .pointer("/contents/twoColumnWatchNextResults/results/results/contents")
+        .and_then(|v| v.as_array())
+    {
+        for item in arr {
+            if primary.is_none() {
+                primary = item.get("videoPrimaryInfoRenderer");
+            }
+            if secondary.is_none() {
+                secondary = item.get("videoSecondaryInfoRenderer");
+            }
+            if reel_hdr.is_none() {
+                reel_hdr = item.get("reelPlayerHeaderRenderer");
+            }
+        }
+    }
+
+    let uploader = secondary
+        .and_then(|s| extract_yt_text(s.pointer("/owner/videoOwnerRenderer/title")))
+        .or_else(|| reel_hdr.and_then(|r| extract_yt_text(r.get("channelTitleText"))));
+
+    let view_count = primary
+        .and_then(|p| {
+            p.pointer("/viewCount/videoViewCountRenderer/originalViewCount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    extract_yt_text(p.pointer("/viewCount/videoViewCountRenderer/viewCount"))
+                        .and_then(|s| parse_rough_views(&s))
+                })
+        })
+        .or_else(|| {
+            first_string_by_key(&json, "originalViewCount")
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+
+    let rel_text = primary
+        .and_then(|p| extract_yt_text(p.get("relativeDateText")))
+        .or_else(|| reel_hdr.and_then(|r| extract_yt_text(r.get("timestampText"))));
+    let date_text = primary.and_then(|p| extract_yt_text(p.get("dateText")));
+    let published_text = rel_text.clone().or_else(|| date_text.clone());
+
+    let now = now_unix_secs();
+    let timestamp = rel_text
+        .as_deref()
+        .and_then(|s| parse_relative_age_to_unix(s, now))
+        .or_else(|| date_text.as_deref().and_then(parse_english_short_date_to_unix));
+
+    if uploader.is_none() && view_count.is_none() && published_text.is_none() && timestamp.is_none()
+    {
+        return None;
+    }
+    Some((uploader, view_count, published_text, timestamp))
+}
+
 /// Fetch replies for a parent comment thread using its InnerTube continuation token.
 pub async fn fetch_comment_replies(
     client: &reqwest::Client,
@@ -1788,5 +2225,68 @@ mod tests {
                 ("vid_lockup_64".to_string(), 64)
             ]
         );
+    }
+
+    #[test]
+    fn test_lockup_combined_delimiter_and_new_badge_and_shorts_lockup() {
+        let combined_lockup = serde_json::json!({
+            "items": [
+                {
+                    "lockupViewModel": {
+                        "contentId": "comb_001",
+                        "metadata": {
+                            "lockupMetadataViewModel": {
+                                "title": { "content": "Continuation Card Title" },
+                                "image": { "decoratedAvatarViewModel": { "a11yLabel": "Go to channel SystemsLab" } },
+                                "metadata": {
+                                    "contentMetadataViewModel": {
+                                        "metadataRows": [
+                                            { "metadataParts": [{ "text": { "content": "42K views • 2 hours ago" } }] },
+                                            { "badges": [{ "badgeViewModel": { "badgeText": "New" } }] }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                {
+                    "shortsLockupViewModel": {
+                        "entityId": "shorts-shelf-item-V8rT6UI3Crg",
+                        "accessibilityText": "Making Gunpowder From Scratch, 805 thousand views - play Short",
+                        "overlayMetadata": {
+                            "primaryText": { "content": "Making Gunpowder From Scratch" },
+                            "secondaryText": { "content": "805K views" }
+                        },
+                        "onTap": {
+                            "innertubeCommand": {
+                                "reelWatchEndpoint": {
+                                    "videoId": "V8rT6UI3Crg"
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let page = parse_innertube_browse_json(&combined_lockup);
+        assert_eq!(page.videos.len(), 2);
+
+        let v0 = &page.videos[0];
+        assert_eq!(v0.id, "comb_001");
+        assert_eq!(v0.display_uploader(), "SystemsLab");
+        assert_eq!(v0.view_count, Some(42_000));
+        assert_eq!(v0.published_text.as_deref(), Some("2 hours ago"));
+        assert!(v0.timestamp.is_some());
+        assert!(v0.is_new_release(now_unix_secs()));
+
+        let v1 = &page.videos[1];
+        assert_eq!(v1.id, "V8rT6UI3Crg");
+        assert_eq!(v1.view_count, Some(805_000));
+        assert!(v1.is_shorts());
+        assert_eq!(v1.duration_string.as_deref(), Some("SHORT"));
+
+        assert!(parse_english_short_date_to_unix("Nov 15, 2026").is_some());
     }
 }

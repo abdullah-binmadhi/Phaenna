@@ -4,12 +4,21 @@ use crate::error::Result;
 use sqlx::SqlitePool;
 
 pub const RECOMMENDED: &str = "recommended";
+pub const SHORTS_SUGGESTED: &str = "shorts_suggested";
+pub const SHORTS_SUBSCRIBED: &str = "shorts_subscribed";
 pub const SUBSCRIPTIONS: &str = "subscriptions";
 pub const HISTORY: &str = "history";
 pub const WATCH_LATER: &str = "watch_later";
 
 #[allow(dead_code)]
-pub const ALL_FEEDS: &[&str] = &[RECOMMENDED, SUBSCRIPTIONS, HISTORY, WATCH_LATER];
+pub const ALL_FEEDS: &[&str] = &[
+    RECOMMENDED,
+    SHORTS_SUGGESTED,
+    SHORTS_SUBSCRIBED,
+    SUBSCRIPTIONS,
+    HISTORY,
+    WATCH_LATER,
+];
 
 /// Record the timestamp when a feed was successfully fetched.
 pub async fn mark_synced(pool: &SqlitePool, key: &str, now: i64) -> Result<()> {

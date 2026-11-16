@@ -3,7 +3,8 @@
 
 use crate::db::cache::{format_duration_secs, VideoItem};
 use crate::state::{
-    centered_rect, occluded_by_modal, ActiveOverlay, AppState, Category, ContentFilter, SortOrder,
+    centered_rect, occluded_by_modal, ActiveOverlay, AppState, Category, ContentFilter,
+    ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::render_thumbnail_cover;
 use ratatui::{
@@ -344,6 +345,88 @@ pub fn home_layout(frame_area: Rect) -> [Rect; 4] {
     [chunks[0], chunks[1], chunks[2], chunks[3]]
 }
 
+/// Effective grid area after reserving the 1-row Shorts source selector bar when on the Shorts shelf.
+pub fn effective_grid_area(grid_area: Rect, active_cat: Category) -> Rect {
+    if active_cat == Category::Shorts && grid_area.height >= 4 {
+        Rect::new(
+            grid_area.x,
+            grid_area.y + 1,
+            grid_area.width,
+            grid_area.height - 1,
+        )
+    } else {
+        grid_area
+    }
+}
+
+/// Hit-test the 1-row Shorts source filter pills (`Algorithm Suggested` vs `Subscribed`).
+pub fn shorts_source_at(
+    grid_area: Rect,
+    sug_len: usize,
+    sub_len: usize,
+    col: u16,
+    row: u16,
+) -> Option<ShortsSource> {
+    if row != grid_area.y || grid_area.height < 4 {
+        return None;
+    }
+    let sug_label = format!(" * Algorithm Suggested ({sug_len}) ");
+    let sub_label = format!(" Subscribed ({sub_len}) ");
+    let sug_start = grid_area.x + 1 + " Shorts Source: ".chars().count() as u16;
+    let sug_end = sug_start + sug_label.chars().count() as u16;
+    let sub_start = sug_end + 1;
+    let sub_end = sub_start + sub_label.chars().count() as u16;
+    if col >= sug_start && col < sug_end {
+        Some(ShortsSource::Suggested)
+    } else if col >= sub_start && col < sub_end {
+        Some(ShortsSource::Subscribed)
+    } else {
+        None
+    }
+}
+
+fn render_shorts_filter_bar(frame: &mut Frame, bar_area: Rect, state: &AppState) {
+    let theme = state.base_theme();
+    let sug_len = state.shorts_suggested.len();
+    let sub_len = state.shorts_subscribed.len();
+    let sug_active = state.shorts_source == ShortsSource::Suggested;
+    let sub_active = state.shorts_source == ShortsSource::Subscribed;
+
+    let sug_lbl = if sug_active {
+        format!(" * Algorithm Suggested ({sug_len}) ")
+    } else {
+        format!("   Algorithm Suggested ({sug_len}) ")
+    };
+    let sub_lbl = if sub_active {
+        format!(" * Subscribed ({sub_len}) ")
+    } else {
+        format!("   Subscribed ({sub_len}) ")
+    };
+
+    let active_st = Style::default()
+        .fg(Color::Black)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let idle_st = Style::default()
+        .fg(theme.text)
+        .bg(Color::Rgb(26, 30, 42));
+
+    let line = Line::from(vec![
+        Span::styled(" Shorts Source: ", Style::default().fg(theme.text_dim)),
+        Span::styled(sug_lbl, if sug_active { active_st } else { idle_st }),
+        Span::raw(" "),
+        Span::styled(sub_lbl, if sub_active { active_st } else { idle_st }),
+        Span::styled(
+            "   ·  [S] Switch Source  ·  [n] Load More  ·  [Enter/Space] Watch",
+            Style::default().fg(theme.text_dim),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(bar_area.x + 1, bar_area.y, bar_area.width.saturating_sub(2), 1),
+    );
+}
+
 pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: Option<Rect>) {
     let [top_area, hero_area, grid_area, footer_area] = home_layout(frame.area());
     render_top_bar(frame, top_area, state);
@@ -358,7 +441,15 @@ pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: O
     if active_cat == Category::ContinueWatching && !state.continue_watching_grid_mode {
         render_continue_watching_deck(frame, grid_area, state, modal_rect);
     } else {
-        render_video_grid(frame, grid_area, state, modal_rect);
+        let card_grid_area = effective_grid_area(grid_area, active_cat);
+        if active_cat == Category::Shorts && grid_area.height >= 4 {
+            render_shorts_filter_bar(
+                frame,
+                Rect::new(grid_area.x, grid_area.y, grid_area.width, 1),
+                state,
+            );
+        }
+        render_video_grid(frame, card_grid_area, state, modal_rect);
     }
 
     render_footer_dock(frame, footer_area, state);
@@ -533,7 +624,13 @@ fn render_hero_stage(
     let active_cat_label = state
         .categories
         .get(state.active_category)
-        .map(|(c, _)| c.label().to_uppercase())
+        .map(|(c, _)| {
+            if *c == Category::Shorts {
+                format!("SHORTS · {}", state.shorts_source.label().to_uppercase())
+            } else {
+                c.label().to_uppercase()
+            }
+        })
         .unwrap_or_else(|| "FEED".to_string());
     let now_unix = now_unix_home();
     let views_part = video.compact_views(true);
@@ -1280,7 +1377,7 @@ fn render_video_grid(
 
     if let Some(sy) = m.status_row_y {
         let active_cat = state.categories[state.active_category].0;
-        let feed_key = active_cat.feed_key();
+        let feed_key = state.active_feed_key_for(active_cat);
         let has_more = active_cat != Category::ContinueWatching
             && (!state.exhausted_feeds.contains(feed_key)
                 || state.feed_continuations.contains_key(feed_key));
@@ -1365,8 +1462,9 @@ fn render_footer_dock(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(" ? ", key), Span::styled(" Matrix   ", txt),
         Span::styled(" q ", sec), Span::styled(" Quit     ", txt),
         Span::styled("  ·  ", Style::default().fg(theme.divider)),
-        Span::styled(" Tab/1-5 ", sec), Span::styled(" Switch Shelf  ", txt),
-        Span::styled(" PgDn/n ", key), Span::styled(" Load More", txt),
+        Span::styled(" Tab/1-6 ", sec), Span::styled(" Switch Shelf  ", txt),
+        Span::styled(" S ", key), Span::styled(" Shorts Src  ", txt),
+        Span::styled(" PgDn/n ", sec), Span::styled(" Load More", txt),
     ]);
 
     frame.render_widget(Paragraph::new(row1), rows[1]);
@@ -1375,7 +1473,7 @@ fn render_footer_dock(frame: &mut Frame, area: Rect, state: &AppState) {
 
 pub fn render_filter_modal(frame: &mut Frame, state: &AppState) {
     let theme = state.base_theme();
-    let area = centered_rect(60, 56, frame.area());
+    let area = centered_rect(64, 66, frame.area());
     frame.render_widget(Clear, area);
 
     let blk = Block::default()
@@ -1396,6 +1494,7 @@ pub fn render_filter_modal(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
+            Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(2),
@@ -1470,11 +1569,42 @@ pub fn render_filter_modal(frame: &mut Frame, state: &AppState) {
         chunks[1],
     );
 
+    let shorts_sources = [ShortsSource::Suggested, ShortsSource::Subscribed];
+    let shorts_spans: Vec<Span> = shorts_sources
+        .iter()
+        .enumerate()
+        .map(|(i, ss)| {
+            let active = *ss == state.shorts_source;
+            let cursor = state.filter_modal_section == 2 && state.filter_modal_option == i;
+            let st = if cursor {
+                Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)
+            } else if active {
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Span::styled(format!(" [{}] ", ss.label()), st)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(shorts_spans)).block(
+            Block::default()
+                .title(" Shorts Feed Source ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if state.filter_modal_section == 2 {
+                    theme.border_focus
+                } else {
+                    theme.border_idle
+                })),
+        ),
+        chunks[2],
+    );
+
     frame.render_widget(
         Paragraph::new("[Up/Down] Switch Row · [Left/Right] Cycle · [Enter / Esc] Apply & Close")
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.text_dim)),
-        chunks[2],
+        chunks[3],
     );
 }
 
@@ -1589,5 +1719,59 @@ mod tests {
             .join("");
         assert!(all_text.contains("[NEW]"), "Expected [NEW] badge in card telemetry");
         assert!(all_text.contains("128K"), "Expected view count in card telemetry");
+    }
+
+    #[test]
+    fn test_shorts_shelf_between_home_and_subscriptions_and_filter_bar() {
+        let mut st = AppState::new(Config::default());
+        assert_eq!(st.categories[1].0, Category::Recommended);
+        assert_eq!(st.categories[2].0, Category::Shorts);
+        assert_eq!(st.categories[3].0, Category::Subscriptions);
+
+        st.active_category = 2;
+        st.shorts_suggested = vec![VideoItem {
+            id: "sh_sug_01".to_string(),
+            title: "Quick Physics Fact".to_string(),
+            uploader: Some("AlgoCreator".to_string()),
+            duration: Some(45),
+            duration_string: Some("SHORT".to_string()),
+            view_count: Some(950_000),
+            published_text: Some("5 hours ago".to_string()),
+            timestamp: Some(now_unix_home() - 3600 * 5),
+            ..Default::default()
+        }];
+        st.shorts_subscribed = vec![VideoItem {
+            id: "sh_sub_01".to_string(),
+            title: "Subscribed Short".to_string(),
+            uploader: Some("Veritasium".to_string()),
+            duration: Some(58),
+            duration_string: Some("SHORT".to_string()),
+            ..Default::default()
+        }];
+        st.sync_active_shorts_list();
+
+        let area = Rect::new(0, 0, 140, 40);
+        let [_, _, grid_area, _] = home_layout(area);
+        assert_eq!(
+            shorts_source_at(grid_area, 1, 1, grid_area.x + 20, grid_area.y),
+            Some(ShortsSource::Suggested)
+        );
+        let eff = effective_grid_area(grid_area, Category::Shorts);
+        assert_eq!(eff.y, grid_area.y + 1);
+
+        let backend = TestBackend::new(140, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_home_screen(f, &mut st, None)).unwrap();
+
+        let buf = term.backend().buffer();
+        let all_text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(all_text.contains("Algorithm Suggested (1)"));
+        assert!(all_text.contains("Subscribed (1)"));
+        assert!(all_text.contains("Quick Physics Fact"));
     }
 }

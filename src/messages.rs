@@ -4,7 +4,7 @@ use crate::api::dislike::DislikeInfo;
 use crate::api::innertube::VideoComment;
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
-use crate::db::cache::VideoItem;
+use crate::db::cache::{VideoItem, VideoStatsUpdate};
 use crate::services::auth::{ChallengeKind, DeviceCodeSession, GoogleAccountSession};
 use crate::services::cast::CastDevice;
 use crate::services::updater::UpdateInfo;
@@ -29,6 +29,9 @@ pub enum AppMessage {
         feed_key: String,
         current: usize,
         total: usize,
+    },
+    VideosMetadataEnriched {
+        updates: Vec<VideoStatsUpdate>,
     },
 
     // Search & Drill-down

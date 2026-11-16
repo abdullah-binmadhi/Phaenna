@@ -523,6 +523,36 @@ pub async fn search_cached_videos(pool: &SqlitePool, query: &str) -> Result<Vec<
     Ok(rows.iter().map(row_to_video).collect())
 }
 
+pub type VideoStatsUpdate = (String, Option<String>, Option<u64>, Option<String>, Option<i64>);
+
+pub async fn enrich_video_stats(pool: &SqlitePool, updates: &[VideoStatsUpdate]) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (id, uploader, view_count, published_text, timestamp) in updates {
+        let clean = id.trim_start_matches("RD");
+        sqlx::query(
+            "UPDATE videos SET
+                channel_name = CASE WHEN ? IS NOT NULL AND (channel_name = 'Unknown' OR channel_name = '') THEN ? ELSE channel_name END,
+                view_count = COALESCE(?, view_count),
+                published_text = COALESCE(?, published_text),
+                published_at = COALESCE(?, published_at)
+             WHERE id = ?",
+        )
+        .bind(uploader.as_deref())
+        .bind(uploader.as_deref())
+        .bind(view_count.map(|c| c as i64))
+        .bind(published_text.as_deref())
+        .bind(*timestamp)
+        .bind(clean)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

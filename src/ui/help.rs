@@ -58,7 +58,8 @@ pub fn render_help_modal(frame: &mut Frame, state: &AppState) {
             vec![
                 Line::from(vec![Span::styled(" h/l, j/k     ", key), Span::styled("Move grid / queue cursor", desc)]),
                 Line::from(vec![Span::styled(" PgDn / ^d    ", key), Span::styled("Scroll down & auto-load more", desc)]),
-                Line::from(vec![Span::styled(" Tab / 1..5   ", key), Span::styled("Switch shelf ([1] Continue Watching)", desc)]),
+                Line::from(vec![Span::styled(" Tab / 1..6   ", key), Span::styled("Switch shelf ([1] Queue · [3] Shorts)", desc)]),
+                Line::from(vec![Span::styled(" S            ", key), Span::styled("Switch Shorts: Suggested / Subscribed", desc)]),
                 Line::from(vec![Span::styled(" a / +        ", key), Span::styled("Save video to Continue Watching", desc)]),
                 Line::from(vec![Span::styled(" x/d · K/J    ", key), Span::styled("Remove / reorder in Continue Watching", desc)]),
             ],

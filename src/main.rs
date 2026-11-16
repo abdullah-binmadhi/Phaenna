@@ -11,7 +11,8 @@ mod ui;
 
 use crate::api::dislike::fetch_dislikes;
 use crate::api::innertube::{
-    browse_id_for_feed_key, fetch_channel_rss, fetch_comment_replies, fetch_innertube_shelf,
+    browse_id_for_feed_key, fetch_channel_rss, fetch_channel_shorts, fetch_comment_replies,
+    fetch_innertube_shelf, fetch_suggested_shorts, fetch_video_card_enrichment,
     fetch_video_comments, innertube_edit_watch_later, post_video_comment,
     report_youtube_watch_progress, VideoComment,
 };
@@ -28,10 +29,13 @@ use crate::api::ytdlp::{
 use crate::config::{Config, Player, Quality};
 use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
-    batch_upsert_feed, get_all_cached_videos, get_feed_videos, get_thumb_blob,
+    batch_upsert_feed, enrich_video_stats, get_all_cached_videos, get_feed_videos, get_thumb_blob,
     search_cached_videos, store_thumb_blob, upsert_video, VideoItem,
 };
-use crate::db::sync::{is_stale, last_synced, mark_synced, HISTORY, RECOMMENDED, SUBSCRIPTIONS, WATCH_LATER};
+use crate::db::sync::{
+    is_stale, last_synced, mark_synced, HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED,
+    SUBSCRIPTIONS, WATCH_LATER,
+};
 use crate::db::user::{
     add_to_watch_later, clear_finished_continue_watching, compute_user_analytics,
     get_all_progress_map, get_continue_watching, get_continue_watching_meta_map,
@@ -60,12 +64,13 @@ use crate::services::updater::{
 };
 use crate::state::{
     ActiveOverlay, AppState, Category, ContentFilter, DetailViewMode, DownloadJobState, Screen,
-    SortOrder,
+    ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::home::{
-    compute_grid_metrics, continue_watching_row_at, footer_action_at, grid_card_index_at,
-    grid_columns, home_layout, top_bar_shelf_at, HomeFooterAction,
+    compute_grid_metrics, continue_watching_row_at, effective_grid_area, footer_action_at,
+    grid_card_index_at, grid_columns, home_layout, shorts_source_at, top_bar_shelf_at,
+    HomeFooterAction,
 };
 use crate::ui::settings::{filtered_hub_items, HubActionId};
 use clap::{Parser, Subcommand};
@@ -397,13 +402,21 @@ async fn hydrate_state_from_db(state: &mut AppState, pool: &SqlitePool) {
     }
 
     for (cat, items) in &mut state.categories {
-        if *cat == Category::ContinueWatching {
+        if *cat == Category::ContinueWatching || *cat == Category::Shorts {
             continue;
         }
         if let Ok(cached) = get_feed_videos(pool, cat.feed_key()).await {
             *items = cached;
         }
     }
+
+    if let Ok(cached_sug) = get_feed_videos(pool, SHORTS_SUGGESTED).await {
+        state.shorts_suggested = cached_sug;
+    }
+    if let Ok(cached_sub) = get_feed_videos(pool, SHORTS_SUBSCRIBED).await {
+        state.shorts_subscribed = cached_sub;
+    }
+    state.sync_active_shorts_list();
 
     if let Ok(local_hist) = get_local_watch_history_videos(pool, 200).await {
         if let Some((_, hist_list)) = state
@@ -627,6 +640,313 @@ fn trigger_swr_feed_refreshes(
                 .await;
         });
     }
+
+    // Refresh Shorts (Algorithm Suggested + Subscribed) concurrently
+    let sub_channel_ids: Vec<String> = state
+        .categories
+        .iter()
+        .find(|(c, _)| *c == Category::Subscriptions)
+        .map(|(_, list)| {
+            let mut ch_seen = HashSet::new();
+            let mut ch_ids = Vec::new();
+            for v in list {
+                if let Some(ref cid) = v.channel_id {
+                    if cid.starts_with("UC") && ch_seen.insert(cid.clone()) {
+                        ch_ids.push(cid.clone());
+                        if ch_ids.len() >= 10 {
+                            break;
+                        }
+                    }
+                }
+            }
+            ch_ids
+        })
+        .unwrap_or_default();
+
+    let sug_empty = state.shorts_suggested.is_empty();
+    state.loading_feeds.insert(SHORTS_SUGGESTED.to_string());
+    {
+        let p_sh = pool.clone();
+        let tx_sh = tx.clone();
+        let c_sh = client.clone();
+        let sess_sh = session_opt.clone();
+        let ck_sh = cookies.clone();
+        tokio::spawn(async move {
+            let stale = force
+                || sug_empty
+                || is_stale(&p_sh, SHORTS_SUGGESTED, cfg_cache.recommended_ttl, now_unix())
+                    .await
+                    .unwrap_or(true);
+            if !stale {
+                let _ = tx_sh
+                    .send(AppMessage::FeedLoaded {
+                        feed_key: SHORTS_SUGGESTED.to_string(),
+                        items: Vec::new(),
+                        continuation: None,
+                        is_from_cache: true,
+                    })
+                    .await;
+                return;
+            }
+            let mut fetched = Vec::new();
+            let mut next_cont = None;
+            if let Ok(mut p1) = fetch_suggested_shorts(&c_sh, sess_sh.as_ref(), None).await {
+                next_cont = p1.continuation.take();
+                fetched.append(&mut p1.videos);
+                for _ in 0..2 {
+                    if fetched.len() >= 18 {
+                        break;
+                    }
+                    let Some(tok) = next_cont.take() else {
+                        break;
+                    };
+                    if let Ok(p2) = fetch_suggested_shorts(&c_sh, sess_sh.as_ref(), Some(&tok)).await {
+                        let mut seen: HashSet<String> = fetched.iter().map(|v| v.id.clone()).collect();
+                        for v in p2.videos {
+                            if seen.insert(v.id.clone()) {
+                                fetched.push(v);
+                            }
+                        }
+                        next_cont = p2.continuation;
+                    } else {
+                        next_cont = Some(tok);
+                        break;
+                    }
+                }
+            }
+            if fetched.is_empty() {
+                let fallback = search_youtube(ck_sh.as_deref(), "#shorts", 20).await;
+                fetched = filter_short_items(fallback);
+            }
+            let ts = now_unix();
+            if !fetched.is_empty() {
+                let _ = batch_upsert_feed(&p_sh, SHORTS_SUGGESTED, &fetched, ts).await;
+                let _ = mark_synced(&p_sh, SHORTS_SUGGESTED, ts).await;
+            }
+            let _ = tx_sh
+                .send(AppMessage::FeedLoaded {
+                    feed_key: SHORTS_SUGGESTED.to_string(),
+                    items: fetched,
+                    continuation: next_cont,
+                    is_from_cache: false,
+                })
+                .await;
+        });
+    }
+
+    let sub_shorts_empty = state.shorts_subscribed.is_empty();
+    state.loading_feeds.insert(SHORTS_SUBSCRIBED.to_string());
+    {
+        let p_sub = pool.clone();
+        let tx_sub = tx.clone();
+        let c_sub = client.clone();
+        let sess_sub = session_opt.clone();
+        let sub_ttl = cfg_cache.subscriptions_ttl;
+        tokio::spawn(async move {
+            let stale = force
+                || sub_shorts_empty
+                || is_stale(&p_sub, SHORTS_SUBSCRIBED, sub_ttl, now_unix())
+                    .await
+                    .unwrap_or(true);
+            if !stale {
+                let _ = tx_sub
+                    .send(AppMessage::FeedLoaded {
+                        feed_key: SHORTS_SUBSCRIBED.to_string(),
+                        items: Vec::new(),
+                        continuation: None,
+                        is_from_cache: true,
+                    })
+                    .await;
+                return;
+            }
+            let fetched = fetch_subscribed_shorts_merged(
+                &p_sub,
+                &c_sub,
+                sess_sub.as_ref(),
+                sub_channel_ids,
+                8,
+            )
+            .await;
+            let ts = now_unix();
+            if !fetched.is_empty() {
+                let _ = batch_upsert_feed(&p_sub, SHORTS_SUBSCRIBED, &fetched, ts).await;
+                let _ = mark_synced(&p_sub, SHORTS_SUBSCRIBED, ts).await;
+            }
+            let _ = tx_sub
+                .send(AppMessage::FeedLoaded {
+                    feed_key: SHORTS_SUBSCRIBED.to_string(),
+                    items: fetched,
+                    continuation: None,
+                    is_from_cache: false,
+                })
+                .await;
+        });
+    }
+}
+
+fn filter_short_items(items: Vec<VideoItem>) -> Vec<VideoItem> {
+    items
+        .into_iter()
+        .filter_map(|mut v| {
+            let is_s = v.is_shorts()
+                || v.duration_string.as_deref() == Some("SHORT")
+                || v.webpage_url
+                    .as_deref()
+                    .map(|u| u.contains("/shorts/"))
+                    .unwrap_or(false);
+            if !is_s {
+                return None;
+            }
+            if v.duration_string.is_none() {
+                v.duration_string = Some("SHORT".to_string());
+            }
+            Some(v)
+        })
+        .collect()
+}
+
+async fn fetch_subscribed_shorts_merged(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    session: Option<&crate::services::auth::GoogleAccountSession>,
+    seed_channel_ids: Vec<String>,
+    max_channels: usize,
+) -> Vec<VideoItem> {
+    let mut sub_items = get_feed_videos(pool, SUBSCRIPTIONS)
+        .await
+        .unwrap_or_default();
+    if sub_items.is_empty() {
+        if let Some(sess) = session {
+            if let Ok(page) = fetch_innertube_shelf(client, sess, "FEsubscriptions", None).await {
+                sub_items = page.videos;
+            }
+        }
+    }
+
+    let mut ch_seen = HashSet::new();
+    let mut ch_ids = Vec::new();
+    for cid in seed_channel_ids {
+        if cid.starts_with("UC") && ch_seen.insert(cid.clone()) {
+            ch_ids.push(cid);
+        }
+    }
+    for v in &sub_items {
+        if let Some(ref cid) = v.channel_id {
+            if cid.starts_with("UC") && ch_seen.insert(cid.clone()) {
+                ch_ids.push(cid.clone());
+                if ch_ids.len() >= max_channels {
+                    break;
+                }
+            }
+        }
+    }
+    ch_ids.truncate(max_channels);
+
+    let mut seen_vids = HashSet::new();
+    let mut out = Vec::new();
+
+    for mut v in sub_items {
+        let is_s = v.is_shorts()
+            || v.duration_string.as_deref() == Some("SHORT")
+            || v.webpage_url
+                .as_deref()
+                .map(|u| u.contains("/shorts/"))
+                .unwrap_or(false);
+        if is_s && seen_vids.insert(v.clean_id().to_string()) {
+            if v.duration_string.is_none() {
+                v.duration_string = Some("SHORT".to_string());
+            }
+            out.push(v);
+        }
+    }
+
+    let mut handles = Vec::with_capacity(ch_ids.len());
+    for cid in ch_ids {
+        let c = client.clone();
+        let s = session.cloned();
+        handles.push(tokio::spawn(async move {
+            fetch_channel_shorts(&c, s.as_ref(), &cid)
+                .await
+                .unwrap_or_default()
+        }));
+    }
+
+    let mut per_channel: Vec<Vec<VideoItem>> = Vec::new();
+    for h in handles {
+        if let Ok(vids) = h.await {
+            if !vids.is_empty() {
+                per_channel.push(vids);
+            }
+        }
+    }
+
+    let max_depth = per_channel.iter().map(|v| v.len()).max().unwrap_or(0).min(8);
+    for round in 0..max_depth {
+        for ch_vids in &per_channel {
+            if let Some(v) = ch_vids.get(round) {
+                if seen_vids.insert(v.clean_id().to_string()) {
+                    out.push(v.clone());
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn spawn_card_metadata_enrichment(
+    items: &[VideoItem],
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+    session: Option<crate::services::auth::GoogleAccountSession>,
+) {
+    let missing_ids: Vec<String> = items
+        .iter()
+        .filter(|v| {
+            v.view_count.is_none()
+                || (v.timestamp.is_none() && v.published_text.is_none())
+                || v.display_uploader() == "Unknown"
+        })
+        .take(18)
+        .map(|v| v.id.clone())
+        .collect();
+
+    if missing_ids.is_empty() {
+        return;
+    }
+
+    let p_e = pool.clone();
+    let tx_e = tx.clone();
+    let c_e = client.clone();
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(6));
+        let mut handles = Vec::with_capacity(missing_ids.len());
+        for vid in missing_ids {
+            let permit = sem.clone().acquire_owned().await;
+            let c_i = c_e.clone();
+            let s_i = session.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = permit;
+                fetch_video_card_enrichment(&c_i, s_i.as_ref(), &vid)
+                    .await
+                    .map(|(up, vw, pt, ts)| (vid, up, vw, pt, ts))
+            }));
+        }
+
+        let mut updates = Vec::new();
+        for h in handles {
+            if let Ok(Some(upd)) = h.await {
+                updates.push(upd);
+            }
+        }
+        if !updates.is_empty() {
+            let _ = enrich_video_stats(&p_e, &updates).await;
+            let _ = tx_e
+                .send(AppMessage::VideosMetadataEnriched { updates })
+                .await;
+        }
+    });
 }
 
 fn spawn_thumb_loader(
@@ -783,8 +1103,23 @@ async fn handle_app_message(
                         *list = merged;
                     }
                 }
+            } else if !is_from_cache && (feed_key == SHORTS_SUGGESTED || feed_key == SHORTS_SUBSCRIBED) {
+                let enrich_slice = items.clone();
+                if feed_key == SHORTS_SUGGESTED {
+                    state.shorts_suggested = items;
+                } else {
+                    state.shorts_subscribed = items;
+                }
+                state.sync_active_shorts_list();
+                spawn_card_metadata_enrichment(
+                    &enrich_slice,
+                    pool,
+                    tx,
+                    client,
+                    state.auth_vault.active_account().cloned(),
+                );
             } else if !is_from_cache && !items.is_empty() {
-                let filtered_items = if feed_key == RECOMMENDED {
+                let filtered_items: Vec<VideoItem> = if feed_key == RECOMMENDED {
                     items
                         .into_iter()
                         .filter(|v| !state.is_video_watched(&v.id))
@@ -792,6 +1127,13 @@ async fn handle_app_message(
                 } else {
                     items
                 };
+                spawn_card_metadata_enrichment(
+                    &filtered_items,
+                    pool,
+                    tx,
+                    client,
+                    state.auth_vault.active_account().cloned(),
+                );
                 if let Some((_, list)) = state
                     .categories
                     .iter_mut()
@@ -809,9 +1151,41 @@ async fn handle_app_message(
             current,
             total,
         } => {
-            if state.categories[state.active_category].0.feed_key() == feed_key {
+            if state.active_feed_key_for(state.categories[state.active_category].0) == feed_key {
                 state.pagination_progress = Some((current, total));
             }
+        }
+        AppMessage::VideosMetadataEnriched { updates } => {
+            let apply_updates = |list: &mut Vec<VideoItem>| {
+                for (vid, up, vw, pt, ts) in &updates {
+                    let clean = vid.trim_start_matches("RD");
+                    if let Some(item) = list
+                        .iter_mut()
+                        .find(|v| v.id == *vid || v.clean_id() == clean)
+                    {
+                        if let Some(u) = up {
+                            if item.display_uploader() == "Unknown" {
+                                item.uploader = Some(u.clone());
+                                item.channel = Some(u.clone());
+                            }
+                        }
+                        if item.view_count.is_none() {
+                            item.view_count = *vw;
+                        }
+                        if item.published_text.is_none() {
+                            item.published_text = pt.clone();
+                        }
+                        if item.timestamp.is_none() {
+                            item.timestamp = *ts;
+                        }
+                    }
+                }
+            };
+            for (_, list) in &mut state.categories {
+                apply_updates(list);
+            }
+            apply_updates(&mut state.shorts_suggested);
+            apply_updates(&mut state.shorts_subscribed);
         }
         AppMessage::MoreFeedLoaded {
             feed_key,
@@ -835,13 +1209,34 @@ async fn handle_app_message(
                 }
             }
 
-            let target_cat = state
-                .categories
-                .iter()
-                .find(|(c, _)| c.feed_key() == feed_key)
-                .map(|(c, _)| *c);
-            let mut added = 0usize;
-            if let Some((_, list)) = state
+            let target_cat = if feed_key == SHORTS_SUGGESTED || feed_key == SHORTS_SUBSCRIBED {
+                Some(Category::Shorts)
+            } else {
+                state
+                    .categories
+                    .iter()
+                    .find(|(c, _)| c.feed_key() == feed_key)
+                    .map(|(c, _)| *c)
+            };
+            let mut added_items: Vec<VideoItem> = Vec::new();
+            if feed_key == SHORTS_SUGGESTED || feed_key == SHORTS_SUBSCRIBED {
+                let target_buf = if feed_key == SHORTS_SUGGESTED {
+                    &mut state.shorts_suggested
+                } else {
+                    &mut state.shorts_subscribed
+                };
+                let mut seen: HashSet<String> = target_buf.iter().map(|v| v.id.clone()).collect();
+                for v in &items {
+                    if seen.insert(v.id.clone()) {
+                        target_buf.push(v.clone());
+                        added_items.push(v.clone());
+                    }
+                }
+                if !items.is_empty() {
+                    let _ = batch_upsert_feed(pool, &feed_key, target_buf, now_unix()).await;
+                }
+                state.sync_active_shorts_list();
+            } else if let Some((_, list)) = state
                 .categories
                 .iter_mut()
                 .find(|(c, _)| c.feed_key() == feed_key)
@@ -856,15 +1251,22 @@ async fn handle_app_message(
                     }
                     if seen.insert(v.id.clone()) {
                         list.push(v.clone());
-                        added += 1;
+                        added_items.push(v.clone());
                     }
                 }
                 if !items.is_empty() {
                     let _ = batch_upsert_feed(pool, &feed_key, list, now_unix()).await;
                 }
             }
-            if added > 0 {
-                state.show_toast(format!("Loaded +{added} videos"));
+            if !added_items.is_empty() {
+                spawn_card_metadata_enrichment(
+                    &added_items,
+                    pool,
+                    tx,
+                    client,
+                    state.auth_vault.active_account().cloned(),
+                );
+                state.show_toast(format!("Loaded +{} videos", added_items.len()));
             } else if state.feed_continuations.contains_key(&feed_key) {
                 if let Some(cat) = target_cat {
                     maybe_trigger_infinite_scroll_for(cat, state, pool, tx, client, true);
@@ -1763,6 +2165,25 @@ fn maybe_trigger_infinite_scroll(
     maybe_trigger_infinite_scroll_for(cat, state, pool, tx, client, force);
 }
 
+fn set_shorts_source(
+    src: ShortsSource,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    state.shorts_source = src;
+    state.sync_active_shorts_list();
+    let is_empty = match src {
+        ShortsSource::Suggested => state.shorts_suggested.is_empty(),
+        ShortsSource::Subscribed => state.shorts_subscribed.is_empty(),
+    };
+    state.show_toast(format!("Shorts: {}", src.label()));
+    if is_empty {
+        maybe_trigger_infinite_scroll_for(Category::Shorts, state, pool, tx, client, true);
+    }
+}
+
 fn maybe_trigger_infinite_scroll_for(
     cat: Category,
     state: &mut AppState,
@@ -1774,7 +2195,7 @@ fn maybe_trigger_infinite_scroll_for(
     let Some(url) = cat.url() else {
         return;
     };
-    let key = cat.feed_key().to_string();
+    let key = state.active_feed_key_for(cat).to_string();
     if state.is_fetching_more {
         return;
     }
@@ -1798,17 +2219,83 @@ fn maybe_trigger_infinite_scroll_for(
     state.is_fetching_more = true;
     state.last_pagination_at = Some(Instant::now());
 
-    // Fast path: signed-in InnerTube continuation token
-    if let (Some(session), Some(browse_id), Some(token)) = (
+    // Dedicated Shorts pagination path (Suggested via InnerTube / Subscribed across channels)
+    if key == SHORTS_SUGGESTED {
+        let client_clone = client.clone();
+        let tx_m = tx.clone();
+        let sess_opt = state.auth_vault.active_account().cloned();
+        let tok_opt = state.feed_continuations.get(&key).cloned();
+        let ck = state.config.cookies_path().ok();
+        tokio::spawn(async move {
+            let mut items = Vec::new();
+            let mut next_cont = tok_opt;
+            for _ in 0..2 {
+                if let Ok(page) =
+                    fetch_suggested_shorts(&client_clone, sess_opt.as_ref(), next_cont.as_deref())
+                        .await
+                {
+                    let mut seen: HashSet<String> = items.iter().map(|v: &VideoItem| v.id.clone()).collect();
+                    for v in page.videos {
+                        if seen.insert(v.id.clone()) {
+                            items.push(v);
+                        }
+                    }
+                    next_cont = page.continuation;
+                    if items.len() >= 8 || next_cont.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if items.is_empty() && next_cont.is_none() {
+                let raw = search_youtube(ck.as_deref(), "#shorts", 18).await;
+                items = filter_short_items(raw);
+            }
+            let _ = tx_m
+                .send(AppMessage::MoreFeedLoaded {
+                    feed_key: key,
+                    items,
+                    continuation: next_cont,
+                })
+                .await;
+        });
+        return;
+    }
+
+    if key == SHORTS_SUBSCRIBED {
+        let client_clone = client.clone();
+        let tx_m = tx.clone();
+        let p_inf = pool.clone();
+        let sess_opt = state.auth_vault.active_account().cloned();
+        tokio::spawn(async move {
+            let items =
+                fetch_subscribed_shorts_merged(&p_inf, &client_clone, sess_opt.as_ref(), Vec::new(), 20)
+                    .await;
+            let _ = tx_m
+                .send(AppMessage::MoreFeedLoaded {
+                    feed_key: key,
+                    items,
+                    continuation: None,
+                })
+                .await;
+        });
+        return;
+    }
+
+    // Fast path: signed-in InnerTube shelf (works even if continuation token was None after cached boot)
+    if let (Some(session), Some(browse_id)) = (
         state.auth_vault.active_account().cloned(),
         browse_id_for_feed_key(&key),
-        state.feed_continuations.get(&key).cloned(),
     ) {
+        let tok_opt = state.feed_continuations.get(&key).cloned();
         let client_clone = client.clone();
         let tx_m = tx.clone();
         let p_inf = pool.clone();
         tokio::spawn(async move {
-            match fetch_innertube_shelf(&client_clone, &session, browse_id, Some(&token)).await {
+            match fetch_innertube_shelf(&client_clone, &session, browse_id, tok_opt.as_deref())
+                .await
+            {
                 Ok(page) => {
                     let _ = sync_youtube_watched_items(
                         &p_inf,
@@ -1840,7 +2327,7 @@ fn maybe_trigger_infinite_scroll_for(
         return;
     }
 
-    // Fallback path: yt-dlp playlist slice
+    // Fallback path: yt-dlp playlist slice (with approximate_date enabled)
     let start = current_len + 1;
     let end = start + 23;
     let cookies = state.config.cookies_path().ok();
@@ -2128,12 +2615,25 @@ async fn handle_mouse_event(
                 }
             }
             if mouse.row >= grid_area.y && mouse.row < grid_area.y + grid_area.height {
+                if active_cat == Category::Shorts {
+                    if let Some(src) = shorts_source_at(
+                        grid_area,
+                        state.shorts_suggested.len(),
+                        state.shorts_subscribed.len(),
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        set_shorts_source(src, state, pool, tx, client);
+                        return true;
+                    }
+                }
+                let card_grid = effective_grid_area(grid_area, active_cat);
                 let total = state.current_filtered_videos().len();
                 let scroll = state.grid_scroll_rows[state.active_category];
                 let hit = if cw_deck {
                     continue_watching_row_at(grid_area, mouse.column, mouse.row, scroll, total)
                 } else {
-                    grid_card_index_at(grid_area, mouse.column, mouse.row, scroll, total)
+                    grid_card_index_at(card_grid, mouse.column, mouse.row, scroll, total)
                 };
                 if let Some(idx) = hit {
                     if state.category_cursors[state.active_category] == idx {
@@ -2495,15 +2995,16 @@ async fn handle_key_event(
 
     // 3. Home Global Keybindings
     let list_len = state.current_filtered_videos().len();
+    let active_cat = state.categories[state.active_category].0;
+    let cw_deck = active_cat == Category::ContinueWatching && !state.continue_watching_grid_mode;
     let (cols, visible_rows) = crossterm::terminal::size()
         .map(|(w, h)| {
             let [_, _, grid_area, _] = home_layout(ratatui::layout::Rect::new(0, 0, w, h));
-            let m = compute_grid_metrics(grid_area);
+            let card_grid = effective_grid_area(grid_area, active_cat);
+            let m = compute_grid_metrics(card_grid);
             (m.cols, m.visible_rows)
         })
         .unwrap_or((3, 2));
-    let active_cat = state.categories[state.active_category].0;
-    let cw_deck = active_cat == Category::ContinueWatching && !state.continue_watching_grid_mode;
 
     match code {
         KeyCode::Char('q') => return true,
@@ -2559,6 +3060,17 @@ async fn handle_key_event(
         }
         KeyCode::Char('n') | KeyCode::Char(']') => {
             maybe_trigger_infinite_scroll(state, pool, tx, client, true);
+        }
+        KeyCode::Char('S') => {
+            if let Some(shorts_idx) = state.categories.iter().position(|(c, _)| *c == Category::Shorts)
+            {
+                if state.active_category != shorts_idx {
+                    state.active_category = shorts_idx;
+                } else {
+                    let next = state.shorts_source.toggle();
+                    set_shorts_source(next, state, pool, tx, client);
+                }
+            }
         }
         KeyCode::Char('w') => {
             if let Some(v) = state.current_home_video() {
@@ -2641,6 +3153,7 @@ async fn handle_key_event(
         KeyCode::Char('3') => state.active_category = 2.min(state.categories.len() - 1),
         KeyCode::Char('4') => state.active_category = 3.min(state.categories.len() - 1),
         KeyCode::Char('5') => state.active_category = 4.min(state.categories.len() - 1),
+        KeyCode::Char('6') => state.active_category = 5.min(state.categories.len() - 1),
         KeyCode::Tab => {
             state.active_category = (state.active_category + 1) % state.categories.len();
         }
@@ -2763,8 +3276,12 @@ async fn handle_overlay_key(
             KeyCode::Esc | KeyCode::Char('f') | KeyCode::Enter => {
                 state.overlay = ActiveOverlay::None;
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
-                state.filter_modal_section = 1 - state.filter_modal_section;
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.filter_modal_section = (state.filter_modal_section + 2) % 3;
+                state.filter_modal_option = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.filter_modal_section = (state.filter_modal_section + 1) % 3;
                 state.filter_modal_option = 0;
             }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Left | KeyCode::Char('h') => {
@@ -2777,7 +3294,7 @@ async fn handle_overlay_key(
                         2 => ContentFilter::Shorts,
                         _ => ContentFilter::All,
                     };
-                } else {
+                } else if state.filter_modal_section == 1 {
                     let next = (state.filter_modal_option as isize + dir).rem_euclid(5) as usize;
                     state.filter_modal_option = next;
                     state.sort_order = match next {
@@ -2787,6 +3304,15 @@ async fn handle_overlay_key(
                         4 => SortOrder::ChannelAZ,
                         _ => SortOrder::Default,
                     };
+                } else {
+                    let next = (state.filter_modal_option as isize + dir).rem_euclid(2) as usize;
+                    state.filter_modal_option = next;
+                    let src = if next == 1 {
+                        ShortsSource::Subscribed
+                    } else {
+                        ShortsSource::Suggested
+                    };
+                    set_shorts_source(src, state, pool, tx, client);
                 }
             }
             _ => {}

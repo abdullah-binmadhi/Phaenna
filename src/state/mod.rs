@@ -7,7 +7,9 @@ use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::config::{Config, Quality};
 use crate::db::cache::VideoItem;
-use crate::db::sync::{HISTORY, RECOMMENDED, SUBSCRIPTIONS, WATCH_LATER};
+use crate::db::sync::{
+    HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED, SUBSCRIPTIONS, WATCH_LATER,
+};
 use crate::db::user::{ContinueWatchingMeta, UserAnalytics, WatchLaterSource};
 use crate::services::auth::{AuthVault, LoginUiState};
 use crate::services::calendar::{compute_week_bounds, local_tz_offset_secs, CalendarFilter, WeekBounds};
@@ -58,6 +60,7 @@ pub enum ActiveOverlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Category {
     Recommended,
+    Shorts,
     Subscriptions,
     History,
     WatchLater,
@@ -65,10 +68,11 @@ pub enum Category {
 }
 
 impl Category {
-    pub fn all_shelves() -> [Category; 5] {
+    pub fn all_shelves() -> [Category; 6] {
         [
             Category::ContinueWatching,
             Category::Recommended,
+            Category::Shorts,
             Category::Subscriptions,
             Category::History,
             Category::WatchLater,
@@ -79,6 +83,7 @@ impl Category {
         match self {
             Category::ContinueWatching => "Continue Watching",
             Category::Recommended => "Home Feed",
+            Category::Shorts => "Shorts",
             Category::Subscriptions => "Subscriptions",
             Category::History => "History",
             Category::WatchLater => "Watch Later",
@@ -89,6 +94,7 @@ impl Category {
         match self {
             Category::ContinueWatching => "continue_watching",
             Category::Recommended => RECOMMENDED,
+            Category::Shorts => "shorts",
             Category::Subscriptions => SUBSCRIPTIONS,
             Category::History => HISTORY,
             Category::WatchLater => WATCH_LATER,
@@ -98,10 +104,40 @@ impl Category {
     pub fn url(&self) -> Option<&'static str> {
         match self {
             Category::Recommended => Some("https://www.youtube.com"),
+            Category::Shorts => Some("https://www.youtube.com/shorts"),
             Category::Subscriptions => Some("https://www.youtube.com/feed/subscriptions"),
             Category::History => Some("https://www.youtube.com/feed/history"),
             Category::WatchLater => Some("https://www.youtube.com/playlist?list=WL"),
             Category::ContinueWatching => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortsSource {
+    Suggested,
+    Subscribed,
+}
+
+impl ShortsSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            ShortsSource::Suggested => "Algorithm Suggested",
+            ShortsSource::Subscribed => "Subscribed",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            ShortsSource::Suggested => ShortsSource::Subscribed,
+            ShortsSource::Subscribed => ShortsSource::Suggested,
+        }
+    }
+
+    pub fn feed_key(self) -> &'static str {
+        match self {
+            ShortsSource::Suggested => SHORTS_SUGGESTED,
+            ShortsSource::Subscribed => SHORTS_SUBSCRIBED,
         }
     }
 }
@@ -166,6 +202,9 @@ pub struct AppState {
     pub grid_scroll_rows: Vec<usize>,
     pub content_filter: ContentFilter,
     pub sort_order: SortOrder,
+    pub shorts_source: ShortsSource,
+    pub shorts_suggested: Vec<VideoItem>,
+    pub shorts_subscribed: Vec<VideoItem>,
 
     // User library fast-lookup caches
     pub watched_ids: HashSet<String>,
@@ -313,6 +352,9 @@ impl AppState {
             grid_scroll_rows: vec![0; n_cats],
             content_filter: ContentFilter::All,
             sort_order: SortOrder::Default,
+            shorts_source: ShortsSource::Suggested,
+            shorts_suggested: Vec::new(),
+            shorts_subscribed: Vec::new(),
 
             watched_ids: HashSet::new(),
             progress_map: HashMap::new(),
@@ -460,6 +502,39 @@ impl AppState {
         self.category_cursors[self.active_category]
     }
 
+    pub fn active_shorts_feed_key(&self) -> &'static str {
+        self.shorts_source.feed_key()
+    }
+
+    pub fn active_feed_key_for(&self, cat: Category) -> &'static str {
+        if cat == Category::Shorts {
+            self.active_shorts_feed_key()
+        } else {
+            cat.feed_key()
+        }
+    }
+
+    pub fn sync_active_shorts_list(&mut self) {
+        let items = match self.shorts_source {
+            ShortsSource::Suggested => self.shorts_suggested.clone(),
+            ShortsSource::Subscribed => self.shorts_subscribed.clone(),
+        };
+        if let Some(idx) = self
+            .categories
+            .iter()
+            .position(|(c, _)| *c == Category::Shorts)
+        {
+            let new_len = items.len();
+            self.categories[idx].1 = items;
+            if self.category_cursors[idx] >= new_len {
+                self.category_cursors[idx] = new_len.saturating_sub(1);
+            }
+            if self.grid_scroll_rows[idx] >= new_len {
+                self.grid_scroll_rows[idx] = 0;
+            }
+        }
+    }
+
     pub fn current_filtered_videos(&self) -> Vec<VideoItem> {
         let (cat, raw_list) = if self.active_category < self.categories.len() {
             (self.categories[self.active_category].0, &self.categories[self.active_category].1)
@@ -476,6 +551,9 @@ impl AppState {
             .filter(|v| {
                 if cat == Category::Recommended && self.is_video_watched(&v.id) {
                     return false;
+                }
+                if cat == Category::Shorts {
+                    return true;
                 }
                 match self.content_filter {
                     ContentFilter::All => true,
@@ -642,6 +720,11 @@ impl AppState {
                 }
             }
         }
+        for v in self.shorts_suggested.iter().chain(self.shorts_subscribed.iter()) {
+            if seen.insert(v.id.clone()) {
+                all.push(v.clone());
+            }
+        }
         all
     }
 
@@ -715,7 +798,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::None => return None,
         ActiveOverlay::Search => (76, 78),
         ActiveOverlay::Login => (84, 78),
-        ActiveOverlay::Filter => (60, 56),
+        ActiveOverlay::Filter => (64, 66),
         ActiveOverlay::PlayOptions => (86, 62),
         ActiveOverlay::Settings => (82, 74),
         ActiveOverlay::Help => (80, 74),

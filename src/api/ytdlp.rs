@@ -1,6 +1,6 @@
 //! Cancellation-safe `yt-dlp` JSON runner, feed pagination, detail extractor, and chapter parser.
 
-use crate::api::innertube::parse_iso8601_unix;
+use crate::api::innertube::{parse_iso8601_unix, parse_relative_age_to_unix, parse_rough_views};
 use crate::api::player::find_binary;
 use crate::api::subtitles::{parse_ytdlp_subtitles_json, SubtitleTrack};
 use crate::db::cache::{VideoChapter, VideoItem};
@@ -21,7 +21,17 @@ fn parse_ytdlp_json_line(line: &str) -> Option<VideoItem> {
 
 fn enrich_ytdlp_dates(val: &Value, mut item: VideoItem) -> VideoItem {
     if item.timestamp.is_none() {
-        if let Some(ud) = val.get("upload_date").and_then(|v| v.as_str()) {
+        item.timestamp = val
+            .get("release_timestamp")
+            .and_then(|v| v.as_i64())
+            .or_else(|| val.get("approximate_date").and_then(|v| v.as_i64()));
+    }
+    if item.timestamp.is_none() {
+        let ud_opt = val
+            .get("upload_date")
+            .or_else(|| val.get("release_date"))
+            .and_then(|v| v.as_str());
+        if let Some(ud) = ud_opt {
             if ud.len() == 8 && ud.chars().all(|c| c.is_ascii_digit()) {
                 let iso = format!("{}-{}-{}T12:00:00Z", &ud[0..4], &ud[4..6], &ud[6..8]);
                 if let Some(ts) = parse_iso8601_unix(&iso) {
@@ -31,10 +41,53 @@ fn enrich_ytdlp_dates(val: &Value, mut item: VideoItem) -> VideoItem {
         }
     }
     if item.published_text.is_none() {
-        if let Some(ud) = val.get("upload_date").and_then(|v| v.as_str()) {
+        if let Some(rel) = val
+            .get("published_time_text")
+            .or_else(|| val.get("published_text"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            item.published_text = Some(rel.to_string());
+        } else if let Some(ud) = val
+            .get("upload_date")
+            .or_else(|| val.get("release_date"))
+            .and_then(|v| v.as_str())
+        {
             if ud.len() == 8 && ud.chars().all(|c| c.is_ascii_digit()) {
                 item.published_text = Some(format!("{}-{}-{}", &ud[0..4], &ud[4..6], &ud[6..8]));
             }
+        }
+    }
+    if item.timestamp.is_none() {
+        if let Some(ref pub_txt) = item.published_text {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            item.timestamp = parse_relative_age_to_unix(pub_txt, now);
+        }
+    }
+    if item.view_count.is_none() {
+        item.view_count = val
+            .get("view_count_text")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rough_views);
+    }
+    if item.duration.is_none() && item.duration_string.is_none() {
+        let is_short_url = item
+            .webpage_url
+            .as_deref()
+            .map(|u| u.contains("/shorts/"))
+            .unwrap_or(false)
+            || val
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|u| u.contains("/shorts/"))
+                .unwrap_or(false);
+        if is_short_url {
+            item.duration = Some(60);
+            item.duration_string = Some("SHORT".to_string());
         }
     }
     item
@@ -64,7 +117,7 @@ pub async fn fetch_feed_range(
     apply_cookies(&mut cmd, cookies_path);
     cmd.args([
         "--extractor-args",
-        "youtubetab:skip=authcheck",
+        "youtubetab:skip=authcheck;approximate_date",
         "--flat-playlist",
         "--ignore-errors",
         "-j",
@@ -97,7 +150,7 @@ pub async fn fetch_feed_range_stream(
     apply_cookies(&mut cmd, cookies_path);
     cmd.args([
         "--extractor-args",
-        "youtubetab:skip=authcheck",
+        "youtubetab:skip=authcheck;approximate_date",
         "--flat-playlist",
         "--ignore-errors",
         "-j",
@@ -163,7 +216,7 @@ pub async fn search_youtube(
     apply_cookies(&mut cmd, cookies_path);
     cmd.args([
         "--extractor-args",
-        "youtubetab:skip=authcheck",
+        "youtubetab:skip=authcheck;approximate_date",
         "--flat-playlist",
         "--ignore-errors",
         "-j",
