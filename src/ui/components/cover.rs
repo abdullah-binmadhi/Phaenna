@@ -1,7 +1,7 @@
-//! High-definition 16:9 edge-to-edge cover thumbnail pipeline:
+//! High-definition aspect-accurate thumbnail pipeline:
 //! - Automatic 4:3 letterbox + solid vertical pillar trimming
-//! - Cell-exact `(width * font_w, height * font_h)` cover pre-scaling (zero right-side gaps!)
-//! - Atomic Kitty ID allocation (`>= 100_000`) with `Lanczos3` / `CatmullRom` sampling
+//! - 100% full-frame proportional scaling (`FilterType::Lanczos3`) with centered cell fit (zero crop!)
+//! - Atomic Kitty ID allocation (`>= 100_000`)
 //! - Distortion-free Halfblock (`▀`) fallback cover widget for universal terminals
 
 use crate::db::cache::VideoItem;
@@ -59,6 +59,15 @@ fn detect_solid_side_pillars(img: &DynamicImage) -> Option<(u32, u32)> {
             .max(p[2].abs_diff(q[2]))
     };
 
+    let is_neutral = |p: &image::Rgb<u8>| -> bool {
+        let hi = p[0].max(p[1]).max(p[2]);
+        let lo = p[0].min(p[1]).min(p[2]);
+        hi - lo <= 16
+    };
+    if !is_neutral(&left_ref) || !is_neutral(&right_ref) || max_diff(&left_ref, &right_ref) > 20 {
+        return None;
+    }
+
     let mut left_edge = 0u32;
     while left_edge < w / 3 {
         if y_samples
@@ -81,14 +90,25 @@ fn detect_solid_side_pillars(img: &DynamicImage) -> Option<(u32, u32)> {
         right_edge -= 1;
     }
 
-    if left_edge >= w / 12 && right_edge <= w - w / 12 && right_edge > left_edge + w / 4 {
+    let right_pillar_w = w.saturating_sub(1).saturating_sub(right_edge);
+    let symmetric = left_edge.abs_diff(right_pillar_w) <= 16;
+    let center_differs = y_samples
+        .iter()
+        .any(|&y| max_diff(rgb.get_pixel(w / 2, y), &left_ref) > 15);
+
+    if symmetric
+        && center_differs
+        && left_edge >= w / 12
+        && right_edge <= w - w / 12
+        && right_edge > left_edge + w / 4
+    {
         Some((left_edge, right_edge - left_edge + 1))
     } else {
         None
     }
 }
 
-/// Normalize any fetched thumbnail into an edge-to-edge 16:9 HD master (`960x540`..`1280x720`).
+/// Strip genuine dead letterbox/pillar bars and normalize thumbnail resolution proportionally (100% uncropped).
 pub fn prepare_16_9_thumbnail(img: DynamicImage) -> DynamicImage {
     if img.width() == 0 || img.height() == 0 {
         return img;
@@ -107,14 +127,35 @@ pub fn prepare_16_9_thumbnail(img: DynamicImage) -> DynamicImage {
         clean = clean.crop_imm(start_x, 0, active_w, h);
     }
 
-    // Ensure every master thumbnail is true 16:9 so narrow 4:3 / portrait thumbnails fill cards cleanly.
-    let target_w = if clean.width() >= 1200 { 1280 } else { 960 };
-    let target_h = (target_w * 9) / 16;
-    if clean.width() != target_w || clean.height() != target_h {
-        clean.resize_to_fill(target_w, target_h, FilterType::Lanczos3)
+    // Preserve exact aspect ratio so 100% of the thumbnail stays visible (HD cap: 1280x720).
+    let (max_w, max_h) = if clean.width() >= 1200 {
+        (1280, 720)
+    } else {
+        (960, 720)
+    };
+    if clean.width() > max_w || clean.height() > max_h || clean.width() < 640 {
+        clean.resize(max_w, max_h, FilterType::Lanczos3)
     } else {
         clean
     }
+}
+
+/// Compute a centered sub-`Rect` inside `area` matching `img_w:img_h` under cell pixel size `font_size`.
+pub fn fit_centered_rect(area: Rect, img_w: u32, img_h: u32, font_size: (u16, u16)) -> Rect {
+    if area.width == 0 || area.height == 0 || img_w == 0 || img_h == 0 {
+        return area;
+    }
+    let fw = font_size.0.max(1) as f64;
+    let fh = font_size.1.max(1) as f64;
+    let box_w = area.width as f64 * fw;
+    let box_h = area.height as f64 * fh;
+    let scale = (box_w / img_w as f64).min(box_h / img_h as f64);
+
+    let fit_cols = ((img_w as f64 * scale / fw).round() as u16).clamp(1, area.width);
+    let fit_rows = ((img_h as f64 * scale / fh).round() as u16).clamp(1, area.height);
+    let fit_x = area.x + (area.width.saturating_sub(fit_cols)) / 2;
+    let fit_y = area.y + (area.height.saturating_sub(fit_rows)) / 2;
+    Rect::new(fit_x, fit_y, fit_cols, fit_rows)
 }
 
 pub fn build_stateful_protocol(
@@ -125,7 +166,7 @@ pub fn build_stateful_protocol(
     picker.new_resize_protocol(img)
 }
 
-/// Render an edge-to-edge 100%-width/height cover thumbnail into `area` (zero right-side dead space).
+/// Render 100% of the full thumbnail at accurate aspect scale, centered inside `area`.
 pub fn render_thumbnail_cover(
     frame: &mut Frame,
     area: Rect,
@@ -137,7 +178,15 @@ pub fn render_thumbnail_cover(
         return;
     }
 
-    let key = (video_id.to_string(), area.width, area.height);
+    let (fit_rect, font_size) = match (&state.picker, state.raw_thumbs.get(video_id)) {
+        (Some(picker), Some(raw_img)) => (
+            fit_centered_rect(area, raw_img.width(), raw_img.height(), picker.font_size),
+            picker.font_size,
+        ),
+        _ => (area, (8, 16)),
+    };
+
+    let key = (video_id.to_string(), fit_rect.width, fit_rect.height);
     if !state.image_cache.contains_key(&key) {
         if let (Some(ref mut picker), Some(raw_img)) =
             (&mut state.picker, state.raw_thumbs.get(video_id))
@@ -145,11 +194,11 @@ pub fn render_thumbnail_cover(
             if state.image_cache.len() >= 180 {
                 state.image_cache.clear();
             }
-            let (fw, fh) = picker.font_size;
-            let px_w = (area.width as u32 * fw.max(6) as u32).max(32);
-            let px_h = (area.height as u32 * fh.max(12) as u32).max(32);
-            let covered = raw_img.resize_to_fill(px_w, px_h, FilterType::CatmullRom);
-            let proto = build_stateful_protocol(picker, covered);
+            let (fw, fh) = font_size;
+            let px_w = (fit_rect.width as u32 * fw.max(6) as u32).max(32);
+            let px_h = (fit_rect.height as u32 * fh.max(12) as u32).max(32);
+            let scaled = raw_img.resize(px_w, px_h, FilterType::Lanczos3);
+            let proto = build_stateful_protocol(picker, scaled);
             state.image_cache.insert(key.clone(), proto);
         }
     }
@@ -157,7 +206,7 @@ pub fn render_thumbnail_cover(
     if let Some(proto) = state.image_cache.get_mut(&key) {
         frame.render_stateful_widget(
             StatefulImage::new(None).resize(Resize::Fit(Some(FilterType::Lanczos3))),
-            area,
+            fit_rect,
             proto,
         );
     } else if let Some(img) = state.raw_thumbs.get(video_id) {
@@ -333,31 +382,38 @@ pub fn color_from_id(id: &str) -> Color {
     palette[(hash as usize) % palette.len()]
 }
 
-/// Crisp 2-rows-per-cell Unicode half-block (`▀`) cover image widget for zero-dependency terminals.
+/// Crisp aspect-accurate Unicode half-block (`▀`) thumbnail widget for zero-dependency terminals.
 pub struct HalfblockCover<'a> {
     pub image: &'a DynamicImage,
 }
 
 impl<'a> Widget for HalfblockCover<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
+        if area.width == 0 || area.height == 0 || self.image.width() == 0 || self.image.height() == 0
+        {
             return;
         }
-        let target_w = area.width as u32;
-        let target_h = (area.height as u32) * 2;
+        let fit = fit_centered_rect(area, self.image.width(), self.image.height(), (1, 2));
+        let target_w = fit.width as u32;
+        let target_h = (fit.height as u32) * 2;
         let resized = self
             .image
-            .resize_to_fill(target_w, target_h, FilterType::CatmullRom)
+            .resize(target_w, target_h, FilterType::Lanczos3)
             .to_rgb8();
 
-        for row in 0..area.height {
+        let render_rows = resized.height().div_ceil(2).min(fit.height as u32) as u16;
+        let render_cols = resized.width().min(fit.width as u32) as u16;
+        let start_x = fit.x + (fit.width.saturating_sub(render_cols)) / 2;
+        let start_y = fit.y + (fit.height.saturating_sub(render_rows)) / 2;
+
+        for row in 0..render_rows {
             let py_top = (row as u32) * 2;
-            let py_bot = py_top + 1;
-            for col in 0..area.width {
+            let py_bot = (py_top + 1).min(resized.height().saturating_sub(1));
+            for col in 0..render_cols {
                 let px = col as u32;
                 let top = resized.get_pixel(px, py_top);
-                let bot = resized.get_pixel(px, py_bot.min(target_h - 1));
-                let cell = &mut buf[(area.x + col, area.y + row)];
+                let bot = resized.get_pixel(px, py_bot);
+                let cell = &mut buf[(start_x + col, start_y + row)];
                 cell.set_char('▀')
                     .set_fg(Color::Rgb(top[0], top[1], top[2]))
                     .set_bg(Color::Rgb(bot[0], bot[1], bot[2]));
@@ -394,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_solid_side_pillar_crop_and_portrait_to_16_9() {
+    fn test_solid_side_pillar_crop_and_full_thumbnail_aspect_preserved() {
         let mut raw = image::RgbImage::new(480, 360);
         for y in 0..360 {
             for x in 0..480 {
@@ -406,9 +462,22 @@ mod tests {
             }
         }
         let prepped = prepare_16_9_thumbnail(DynamicImage::ImageRgb8(raw));
-        assert_eq!(prepped.width(), 960);
-        assert_eq!(prepped.height(), 540);
-        let px = prepped.to_rgb8().get_pixel(5, 270).0;
+        // Middle 240x360 (2:3 aspect) scales cleanly to 480x720 with zero vertical crop.
+        assert_eq!(prepped.width(), 480);
+        assert_eq!(prepped.height(), 720);
+        let px = prepped.to_rgb8().get_pixel(5, 360).0;
         assert_ne!(px, [96, 96, 96], "Grey side pillars should be cropped out");
+
+        // Verify wide card box (36x7 @ 10x22 cells -> 360x154px = 2.34:1) keeps 16:9 image uncropped & centered.
+        let area = Rect::new(2, 1, 36, 7);
+        let fit_16_9 = fit_centered_rect(area, 1280, 720, (10, 22));
+        assert_eq!(fit_16_9.height, 7);
+        assert_eq!(fit_16_9.width, 27);
+        assert!(fit_16_9.x > area.x);
+
+        // Verify vertical 9:16 Short thumbnail scales cleanly inside card height without cropping.
+        let fit_9_16 = fit_centered_rect(area, 405, 720, (10, 22));
+        assert_eq!(fit_9_16.height, 7);
+        assert_eq!(fit_9_16.width, 9);
     }
 }
