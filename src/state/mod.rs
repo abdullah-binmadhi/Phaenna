@@ -55,6 +55,7 @@ pub enum ActiveOverlay {
     Cast,
     Download,
     Update,
+    ConfirmQuit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -313,6 +314,7 @@ pub struct AppState {
     pub is_updating: bool,
     pub update_completed_version: Option<String>,
     pub should_quit: bool,
+    pub quit_confirm_yes: bool,
 
     // Toast & focused-card stock-ticker marquee
     pub toast: Option<(String, Instant)>,
@@ -461,6 +463,7 @@ impl AppState {
             is_updating: false,
             update_completed_version: None,
             should_quit: false,
+            quit_confirm_yes: false,
 
             toast: None,
             ticker_step: 0,
@@ -557,7 +560,7 @@ impl AppState {
         let mut filtered: Vec<VideoItem> = raw_list
             .iter()
             .filter(|v| {
-                if cat == Category::Recommended && self.is_video_watched(&v.id) {
+                if cat == Category::Recommended && (self.is_video_watched(&v.id) || v.is_shorts()) {
                     return false;
                 }
                 if cat == Category::Shorts {
@@ -600,7 +603,7 @@ impl AppState {
         {
             self.categories[idx]
                 .1
-                .retain(|v| !watched.contains(&v.id) && !watched.contains(v.clean_id()));
+                .retain(|v| !v.is_shorts() && !watched.contains(&v.id) && !watched.contains(v.clean_id()));
             let new_len = self.categories[idx].1.len();
             if self.category_cursors[idx] >= new_len {
                 self.category_cursors[idx] = new_len.saturating_sub(1);
@@ -820,6 +823,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::Cast => (68, 60),
         ActiveOverlay::Download => (68, 52),
         ActiveOverlay::Update => (66, 54),
+        ActiveOverlay::ConfirmQuit => (50, 30),
     };
     Some(centered_rect(px, py, frame_area))
 }
@@ -891,5 +895,68 @@ mod tests {
             .1;
         assert_eq!(hist_items.len(), 1);
         assert_eq!(hist_items[0].id, "home_v1");
+    }
+
+    #[test]
+    fn test_shorts_excluded_from_home_feed_only_live_in_shorts() {
+        let mut st = AppState::new(Config::default());
+        let long_vid = VideoItem {
+            id: "long_home_1".into(),
+            title: "Deep Architecture Talk".into(),
+            duration: Some(1200),
+            ..Default::default()
+        };
+        let short_by_dur = VideoItem {
+            id: "short_dur_1".into(),
+            title: "45s Clip".into(),
+            duration: Some(45),
+            ..Default::default()
+        };
+        let short_by_url = VideoItem {
+            id: "short_url_1".into(),
+            title: "Shorts URL Clip".into(),
+            webpage_url: Some("https://www.youtube.com/shorts/short_url_1".into()),
+            ..Default::default()
+        };
+        let short_by_label = VideoItem {
+            id: "short_lbl_1".into(),
+            title: "Tagged Short".into(),
+            duration_string: Some("SHORT".into()),
+            ..Default::default()
+        };
+
+        if let Some((_, rec)) = st
+            .categories
+            .iter_mut()
+            .find(|(c, _)| *c == Category::Recommended)
+        {
+            *rec = vec![
+                long_vid.clone(),
+                short_by_dur.clone(),
+                short_by_url.clone(),
+                short_by_label.clone(),
+            ];
+        }
+        st.active_category = st
+            .categories
+            .iter()
+            .position(|(c, _)| *c == Category::Recommended)
+            .unwrap();
+
+        let rec_filtered = st.current_filtered_videos();
+        assert_eq!(rec_filtered.len(), 1);
+        assert_eq!(rec_filtered[0].id, "long_home_1");
+
+        st.prune_watched_from_recommended();
+        assert_eq!(st.categories[st.active_category].1.len(), 1);
+
+        st.shorts_suggested = vec![short_by_dur, short_by_url, short_by_label];
+        st.sync_active_shorts_list();
+        st.active_category = st
+            .categories
+            .iter()
+            .position(|(c, _)| *c == Category::Shorts)
+            .unwrap();
+        assert_eq!(st.current_filtered_videos().len(), 3);
     }
 }

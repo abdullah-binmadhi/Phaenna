@@ -67,6 +67,7 @@ use crate::state::{
     ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
+use crate::ui::help::confirm_quit_button_rects;
 use crate::ui::home::{
     compute_grid_metrics, continue_watching_row_at, effective_grid_area, footer_action_at,
     grid_card_index_at, grid_columns, home_layout, shorts_source_at, top_bar_shelf_at,
@@ -337,6 +338,9 @@ async fn main() -> anyhow::Result<()> {
                     if handle_mouse_event(mouse, &mut state, &pool, &tx, &client).await {
                         needs_redraw = true;
                     }
+                    if state.should_quit {
+                        break;
+                    }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     needs_redraw = true;
@@ -405,7 +409,10 @@ async fn hydrate_state_from_db(state: &mut AppState, pool: &SqlitePool) {
         if *cat == Category::ContinueWatching || *cat == Category::Shorts {
             continue;
         }
-        if let Ok(cached) = get_feed_videos(pool, cat.feed_key()).await {
+        if let Ok(mut cached) = get_feed_videos(pool, cat.feed_key()).await {
+            if *cat == Category::Recommended {
+                cached.retain(|v| !v.is_shorts());
+            }
             *items = cached;
         }
     }
@@ -530,7 +537,8 @@ fn trigger_swr_feed_refreshes(
                                 .videos
                                 .into_iter()
                                 .filter(|v| {
-                                    !watched_set.contains(&v.id)
+                                    !v.is_shorts()
+                                        && !watched_set.contains(&v.id)
                                         && !watched_set.contains(v.clean_id())
                                         && !overlay_watched.contains(v.id.as_str())
                                         && !overlay_watched.contains(v.clean_id())
@@ -567,7 +575,8 @@ fn trigger_swr_feed_refreshes(
                                     fetched.iter().map(|v| v.id.clone()).collect();
                                 for v in page2.videos {
                                     if key_s == RECOMMENDED
-                                        && (watched_set.contains(&v.id)
+                                        && (v.is_shorts()
+                                            || watched_set.contains(&v.id)
                                             || watched_set.contains(v.clean_id())
                                             || overlay_watched.contains(v.id.as_str())
                                             || overlay_watched.contains(v.clean_id()))
@@ -593,7 +602,9 @@ fn trigger_swr_feed_refreshes(
                     fetched = raw
                         .into_iter()
                         .filter(|v| {
-                            !watched_set.contains(&v.id) && !watched_set.contains(v.clean_id())
+                            !v.is_shorts()
+                                && !watched_set.contains(&v.id)
+                                && !watched_set.contains(v.clean_id())
                         })
                         .collect();
                 } else {
@@ -788,13 +799,7 @@ fn filter_short_items(items: Vec<VideoItem>) -> Vec<VideoItem> {
     items
         .into_iter()
         .filter_map(|mut v| {
-            let is_s = v.is_shorts()
-                || v.duration_string.as_deref() == Some("SHORT")
-                || v.webpage_url
-                    .as_deref()
-                    .map(|u| u.contains("/shorts/"))
-                    .unwrap_or(false);
-            if !is_s {
+            if !v.is_shorts() {
                 return None;
             }
             if v.duration_string.is_none() {
@@ -846,13 +851,7 @@ async fn fetch_subscribed_shorts_merged(
     let mut out = Vec::new();
 
     for mut v in sub_items {
-        let is_s = v.is_shorts()
-            || v.duration_string.as_deref() == Some("SHORT")
-            || v.webpage_url
-                .as_deref()
-                .map(|u| u.contains("/shorts/"))
-                .unwrap_or(false);
-        if is_s && seen_vids.insert(v.clean_id().to_string()) {
+        if v.is_shorts() && seen_vids.insert(v.clean_id().to_string()) {
             if v.duration_string.is_none() {
                 v.duration_string = Some("SHORT".to_string());
             }
@@ -1122,7 +1121,7 @@ async fn handle_app_message(
                 let filtered_items: Vec<VideoItem> = if feed_key == RECOMMENDED {
                     items
                         .into_iter()
-                        .filter(|v| !state.is_video_watched(&v.id))
+                        .filter(|v| !v.is_shorts() && !state.is_video_watched(&v.id))
                         .collect()
                 } else {
                     items
@@ -1244,7 +1243,8 @@ async fn handle_app_message(
                 let mut seen: HashSet<String> = list.iter().map(|v| v.id.clone()).collect();
                 for v in &items {
                     if feed_key == RECOMMENDED
-                        && (state.watched_ids.contains(&v.id)
+                        && (v.is_shorts()
+                            || state.watched_ids.contains(&v.id)
                             || state.watched_ids.contains(v.clean_id()))
                     {
                         continue;
@@ -2591,6 +2591,34 @@ async fn handle_mouse_event(
     let frame_area = ratatui::layout::Rect::new(0, 0, w, h);
 
     if state.overlay != ActiveOverlay::None || state.screen != Screen::Home {
+        if state.overlay == ActiveOverlay::ConfirmQuit {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let (exit_btn, cancel_btn) = confirm_quit_button_rects(frame_area);
+                let in_rect = |r: ratatui::layout::Rect| -> bool {
+                    r.width > 0
+                        && r.height > 0
+                        && mouse.column >= r.x
+                        && mouse.column < r.x + r.width
+                        && mouse.row >= r.y
+                        && mouse.row < r.y + r.height
+                };
+                if in_rect(exit_btn) {
+                    state.should_quit = true;
+                } else if in_rect(cancel_btn)
+                    || crate::state::active_modal_rect(frame_area, ActiveOverlay::ConfirmQuit)
+                        .map(|m| !in_rect(m))
+                        .unwrap_or(false)
+                {
+                    state.overlay = ActiveOverlay::None;
+                }
+                return true;
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.overlay = ActiveOverlay::None;
+                return true;
+            }
+            return false;
+        }
         if state.overlay == ActiveOverlay::None && state.screen == Screen::Detail {
             let in_rect = |r: ratatui::layout::Rect| -> bool {
                 r.width > 0
@@ -2724,7 +2752,7 @@ async fn handle_mouse_event(
                     HomeFooterAction::Settings => state.overlay = ActiveOverlay::Settings,
                     HomeFooterAction::Setup => state.overlay = ActiveOverlay::Setup,
                     HomeFooterAction::Help => state.overlay = ActiveOverlay::Help,
-                    HomeFooterAction::Quit => {}
+                    HomeFooterAction::Quit => open_confirm_quit(state),
                 }
                 return true;
             }
@@ -2757,6 +2785,11 @@ async fn handle_mouse_event(
         _ => {}
     }
     false
+}
+
+fn open_confirm_quit(state: &mut AppState) {
+    state.quit_confirm_yes = false;
+    state.overlay = ActiveOverlay::ConfirmQuit;
 }
 
 /// Returns true only when application should quit.
@@ -3012,7 +3045,7 @@ async fn handle_key_event(
                 KeyCode::Char('C') => execute_hub_action(HubActionId::CastScan, state, pool, tx, client).await,
                 KeyCode::Char('s') | KeyCode::Char(',') => state.overlay = ActiveOverlay::Settings,
                 KeyCode::Char('?') => state.overlay = ActiveOverlay::Help,
-                KeyCode::Char('q') => return true,
+                KeyCode::Char('q') => open_confirm_quit(state),
                 _ => {}
             }
             return false;
@@ -3044,7 +3077,7 @@ async fn handle_key_event(
                         pin_video_to_continue_watching(&v, state, pool).await;
                     }
                 }
-                KeyCode::Char('q') => return true,
+                KeyCode::Char('q') => open_confirm_quit(state),
                 _ => {}
             }
             return false;
@@ -3066,7 +3099,7 @@ async fn handle_key_event(
         .unwrap_or((3, 2));
 
     match code {
-        KeyCode::Char('q') => return true,
+        KeyCode::Char('q') => open_confirm_quit(state),
         KeyCode::Char('?') => state.overlay = ActiveOverlay::Help,
         KeyCode::Char('/') => {
             state.overlay = ActiveOverlay::Search;
@@ -3732,6 +3765,30 @@ async fn handle_overlay_key(
                         state.is_updating = true;
                         spawn_self_update(client.clone(), info, tx.clone());
                     }
+                }
+            }
+            _ => {}
+        },
+        ActiveOverlay::ConfirmQuit => match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => state.should_quit = true,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                state.overlay = ActiveOverlay::None;
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => {
+                state.quit_confirm_yes = !state.quit_confirm_yes;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if state.quit_confirm_yes {
+                    state.should_quit = true;
+                } else {
+                    state.overlay = ActiveOverlay::None;
                 }
             }
             _ => {}

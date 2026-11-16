@@ -245,7 +245,13 @@ impl VideoItem {
     }
 
     pub fn is_shorts(&self) -> bool {
-        self.duration.map(|d| d <= 60).unwrap_or(false)
+        self.duration_string.as_deref() == Some("SHORT")
+            || self
+                .webpage_url
+                .as_deref()
+                .map(|u| u.contains("/shorts/"))
+                .unwrap_or(false)
+            || self.duration.map(|d| d <= 60).unwrap_or(false)
     }
 }
 

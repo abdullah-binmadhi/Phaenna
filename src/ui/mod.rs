@@ -47,6 +47,7 @@ pub fn render_app(frame: &mut Frame, state: &mut AppState) {
         ActiveOverlay::Cast => cast::render_cast_modal(frame, state),
         ActiveOverlay::Download => download::render_download_modal(frame, state),
         ActiveOverlay::Update => update_modal::render_update_modal(frame, state),
+        ActiveOverlay::ConfirmQuit => help::render_confirm_quit_modal(frame, state),
     }
 
     if let Some((ref msg, _)) = state.toast {

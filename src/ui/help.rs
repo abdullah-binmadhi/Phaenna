@@ -1,11 +1,11 @@
 //! Responsive 2x2 Bento Shortcut Matrix (`?`) & Non-Blocking Floating Toast.
 
-use crate::state::{centered_rect, AppState};
+use crate::state::{active_modal_rect, centered_rect, ActiveOverlay, AppState};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -146,6 +146,138 @@ pub fn render_toast(frame: &mut Frame, msg: &str, state: &AppState) {
     frame.render_widget(p, rect);
 }
 
+fn confirm_quit_rows(modal_area: Rect) -> [Rect; 3] {
+    let inner = Rect::new(
+        modal_area.x.saturating_add(1),
+        modal_area.y.saturating_add(1),
+        modal_area.width.saturating_sub(2),
+        modal_area.height.saturating_sub(2),
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Min(2),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    [chunks[0], chunks[1], chunks[2]]
+}
+
+/// Deterministic hit-test rectangles `(exit_btn, cancel_btn)` for the quit confirmation modal.
+pub fn confirm_quit_button_rects(frame_area: Rect) -> (Rect, Rect) {
+    let modal = active_modal_rect(frame_area, ActiveOverlay::ConfirmQuit)
+        .unwrap_or_else(|| centered_rect(50, 30, frame_area));
+    let [_, btn_row, _] = confirm_quit_rows(modal);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(8),
+            Constraint::Percentage(39),
+            Constraint::Percentage(6),
+            Constraint::Percentage(39),
+            Constraint::Percentage(8),
+        ])
+        .split(btn_row);
+    (cols[1], cols[3])
+}
+
+pub fn render_confirm_quit_modal(frame: &mut Frame, state: &AppState) {
+    let theme = state.base_theme();
+    let area = active_modal_rect(frame.area(), ActiveOverlay::ConfirmQuit)
+        .unwrap_or_else(|| centered_rect(50, 30, frame.area()));
+    frame.render_widget(Clear, area);
+
+    let outer = Block::default()
+        .title(Span::styled(
+            " CONFIRM EXIT ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary));
+    frame.render_widget(outer, area);
+
+    let [msg_row, _, hint_row] = confirm_quit_rows(area);
+    let (exit_rect, cancel_rect) = confirm_quit_button_rects(frame.area());
+
+    let prompt = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Do you want to exit Phaenna?",
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Press Enter on your selection, [y] to exit, or [n / Esc] to cancel.",
+            Style::default().fg(theme.text_dim),
+        )),
+    ])
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: true });
+    frame.render_widget(prompt, msg_row);
+
+    let exit_active = state.quit_confirm_yes;
+    let exit_color = Color::Rgb(239, 68, 68);
+    let exit_style = if exit_active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(exit_color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(exit_color).add_modifier(Modifier::BOLD)
+    };
+    let exit_btn = Paragraph::new("Exit Phaenna (y)")
+        .alignment(Alignment::Center)
+        .style(exit_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if exit_active {
+                    exit_color
+                } else {
+                    theme.border_idle
+                })),
+        );
+    frame.render_widget(exit_btn, exit_rect);
+
+    let cancel_active = !state.quit_confirm_yes;
+    let cancel_style = if cancel_active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme.primary)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    let cancel_btn = Paragraph::new("Cancel (n)")
+        .alignment(Alignment::Center)
+        .style(cancel_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if cancel_active {
+                    theme.primary
+                } else {
+                    theme.border_idle
+                })),
+        );
+    frame.render_widget(cancel_btn, cancel_rect);
+
+    frame.render_widget(
+        Paragraph::new("[Left/Right] Select · [y] Exit · [n / Esc / q] Cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.text_dim)),
+        hint_row,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +294,31 @@ mod tests {
             render_toast(f, "Loaded 24 videos from SQLite WAL", &st);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn test_confirm_quit_modal_renders_and_exposes_buttons() {
+        let mut st = AppState::new(Config::default());
+        st.overlay = ActiveOverlay::ConfirmQuit;
+        let area = Rect::new(0, 0, 120, 40);
+        let (exit_r, cancel_r) = confirm_quit_button_rects(area);
+        assert!(exit_r.width > 10 && cancel_r.width > 10);
+        assert!(exit_r.x + exit_r.width < cancel_r.x);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_confirm_quit_modal(f, &st)).unwrap();
+
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("Do you want to exit Phaenna?"));
+        assert!(text.contains("Exit Phaenna (y)"));
+        assert!(text.contains("Cancel (n)"));
     }
 }

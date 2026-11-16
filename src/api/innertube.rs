@@ -1598,14 +1598,7 @@ pub async fn fetch_suggested_shorts(
         parse_innertube_browse_json(&root)
     };
 
-    page.videos.retain(|v| {
-        v.is_shorts()
-            || v.duration_string.as_deref() == Some("SHORT")
-            || v.webpage_url
-                .as_deref()
-                .map(|u| u.contains("/shorts/"))
-                .unwrap_or(false)
-    });
+    page.videos.retain(|v| v.is_shorts());
     Ok(page)
 }
 
