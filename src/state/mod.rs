@@ -5,7 +5,7 @@ use crate::api::innertube::VideoComment;
 use crate::api::player::{detect_dependencies, DependencyStatus};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
-use crate::config::{Config, Quality};
+use crate::config::{Config, Player, Quality, SponsorBlockMode, VideoShaderMode};
 use crate::db::cache::VideoItem;
 use crate::db::sync::{
     HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED, SUBSCRIPTIONS, WATCH_LATER,
@@ -14,6 +14,7 @@ use crate::db::user::{ContinueWatchingMeta, UserAnalytics, WatchLaterSource};
 use crate::services::auth::{AuthVault, LoginUiState};
 use crate::services::calendar::{compute_week_bounds, local_tz_offset_secs, CalendarFilter, WeekBounds};
 use crate::services::cast::CastDevice;
+use crate::services::ipc::{LiveIpcEvent, LiveMediaTrack, PlayerCommand};
 use crate::services::remote::RemoteServerHandle;
 use crate::services::tailored::{LiveTunerConfig, TailoredMatch};
 use crate::services::updater::UpdateInfo;
@@ -22,6 +23,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -285,6 +287,7 @@ pub struct AppState {
     pub active_playback_dur: f64,
     pub active_session_id: u64,
     pub sponsor_skips_session: u32,
+    pub live_playback: LivePlaybackControlState,
 
     // Intelligence dashboards
     pub analytics: UserAnalytics,
@@ -433,6 +436,7 @@ impl AppState {
             active_playback_dur: 0.0,
             active_session_id: 0,
             sponsor_skips_session: 0,
+            live_playback: LivePlaybackControlState::default(),
 
             analytics: UserAnalytics::default(),
             analytics_loaded: false,
@@ -505,6 +509,93 @@ impl AppState {
             if ts.elapsed().as_secs() >= 4 {
                 self.toast = None;
             }
+        }
+    }
+
+    pub fn has_live_ipc(&self) -> bool {
+        self.active_playback_video_id.is_some() && self.live_playback.cmd_tx.is_some()
+    }
+
+    pub fn send_player_cmd(&self, cmd: PlayerCommand) -> bool {
+        if let Some(ref tx) = self.live_playback.cmd_tx {
+            tx.send(cmd).is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub fn reset_live_playback(&mut self) {
+        self.live_playback = LivePlaybackControlState {
+            sub_visible: self.config.subtitles_enabled,
+            ..Default::default()
+        };
+    }
+
+    pub fn apply_live_ipc_event(&mut self, ev: LiveIpcEvent) {
+        match ev {
+            LiveIpcEvent::Paused(v) => self.live_playback.paused = v,
+            LiveIpcEvent::Volume(v) => self.live_playback.volume = v,
+            LiveIpcEvent::Muted(v) => self.live_playback.muted = v,
+            LiveIpcEvent::Speed(v) => self.live_playback.speed = v,
+            LiveIpcEvent::AudioId(v) => self.live_playback.active_aid = v,
+            LiveIpcEvent::SubId(v) => self.live_playback.active_sid = v,
+            LiveIpcEvent::SubVisible(v) => self.live_playback.sub_visible = v,
+            LiveIpcEvent::SubDelay(s) => self.live_playback.sub_delay_ms = (s * 1000.0).round() as i32,
+            LiveIpcEvent::AudioDelay(s) => {
+                self.live_playback.audio_delay_ms = (s * 1000.0).round() as i32;
+            }
+            LiveIpcEvent::OnTop(v) => self.live_playback.ontop = v,
+            LiveIpcEvent::LoopVideo(v) => self.live_playback.loop_video = v,
+            LiveIpcEvent::Brightness(v) => self.live_playback.brightness = v,
+            LiveIpcEvent::Contrast(v) => self.live_playback.contrast = v,
+            LiveIpcEvent::Saturation(v) => self.live_playback.saturation = v,
+            LiveIpcEvent::Gamma(v) => self.live_playback.gamma = v,
+            LiveIpcEvent::Tracks { audio, sub } => {
+                if let Some(sel) = audio.iter().find(|t| t.selected) {
+                    self.live_playback.active_aid = Some(sel.id);
+                }
+                if let Some(sel) = sub.iter().find(|t| t.selected) {
+                    self.live_playback.active_sid = Some(sel.id);
+                }
+                self.live_playback.audio_tracks = audio;
+                self.live_playback.sub_tracks = sub;
+            }
+        }
+    }
+
+    /// Pick matching audio track ID from live `mpv` `track-list` for Original vs. Dubbed audio.
+    pub fn find_audio_track_for_dub(&self, want_dub: bool) -> Option<i64> {
+        let tracks = &self.live_playback.audio_tracks;
+        if tracks.len() < 2 {
+            return None;
+        }
+        if want_dub {
+            let pref_lang = self.config.dub_lang.to_lowercase();
+            tracks
+                .iter()
+                .find(|t| {
+                    t.is_dubbed
+                        && t.lang
+                            .as_deref()
+                            .map(|l| l.to_lowercase().starts_with(&pref_lang))
+                            .unwrap_or(false)
+                })
+                .or_else(|| tracks.iter().find(|t| t.is_dubbed))
+                .or_else(|| {
+                    tracks.iter().find(|t| {
+                        t.lang
+                            .as_deref()
+                            .map(|l| l.to_lowercase().starts_with(&pref_lang))
+                            .unwrap_or(false)
+                    })
+                })
+                .map(|t| t.id)
+        } else {
+            tracks
+                .iter()
+                .find(|t| t.is_original && !t.is_dubbed)
+                .or_else(|| tracks.iter().find(|t| !t.is_dubbed))
+                .map(|t| t.id)
         }
     }
 
@@ -783,6 +874,104 @@ impl AppState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlayOptionsHit {
+    FocusSection(usize),
+    SelectQuality(usize),
+    SelectPlayer(Player),
+    ToggleDub,
+    CycleDubLang,
+    ToggleMultistreams,
+    ToggleLoudnorm,
+    AudioDelayDelta(i32),
+    SelectAudioTrack(i64),
+    ToggleSubtitles,
+    CycleSubStyle,
+    SubDelayDelta(i32),
+    SelectSubTrack(i64),
+    SelectSponsorBlock(SponsorBlockMode),
+    ToggleSkipOutro,
+    SelectShader(VideoShaderMode),
+    TogglePause,
+    SeekDelta(f64),
+    SeekRatio(f64),
+    ChapterStep(i32),
+    SetSpeed(f64),
+    VolumeDelta(i64),
+    ToggleMute,
+    PictureDelta(&'static str, i64),
+    ResetPicture,
+    ToggleOnTop,
+    ToggleLoop,
+    LaunchOrRelaunch,
+    StopPlayer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NowPlayingHit {
+    TogglePause,
+    SeekBack,
+    SeekFwd,
+    ToggleDub,
+    SpeedStep(i8),
+    VolumeDelta(i64),
+    ToggleMute,
+    CycleShader,
+    OpenStudio,
+    StopPlayer,
+}
+
+#[derive(Debug, Clone)]
+pub struct LivePlaybackControlState {
+    pub paused: bool,
+    pub volume: i64,
+    pub muted: bool,
+    pub speed: f64,
+    pub audio_delay_ms: i32,
+    pub sub_delay_ms: i32,
+    pub sub_visible: bool,
+    pub active_aid: Option<i64>,
+    pub active_sid: Option<i64>,
+    pub ontop: bool,
+    pub loop_video: bool,
+    pub brightness: i64,
+    pub contrast: i64,
+    pub saturation: i64,
+    pub gamma: i64,
+    pub audio_tracks: Vec<LiveMediaTrack>,
+    pub sub_tracks: Vec<LiveMediaTrack>,
+    pub cmd_tx: Option<UnboundedSender<PlayerCommand>>,
+    pub play_hitboxes: Vec<(Rect, PlayOptionsHit)>,
+    pub now_playing_hitboxes: Vec<(Rect, NowPlayingHit)>,
+}
+
+impl Default for LivePlaybackControlState {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            volume: 100,
+            muted: false,
+            speed: 1.0,
+            audio_delay_ms: 0,
+            sub_delay_ms: 0,
+            sub_visible: true,
+            active_aid: None,
+            active_sid: None,
+            ontop: false,
+            loop_video: false,
+            brightness: 0,
+            contrast: 0,
+            saturation: 0,
+            gamma: 0,
+            audio_tracks: Vec::new(),
+            sub_tracks: Vec::new(),
+            cmd_tx: None,
+            play_hitboxes: Vec::new(),
+            now_playing_hitboxes: Vec::new(),
+        }
+    }
+}
+
 pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -810,7 +999,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::Search => (76, 78),
         ActiveOverlay::Login => (84, 78),
         ActiveOverlay::Filter => (64, 66),
-        ActiveOverlay::PlayOptions => (86, 62),
+        ActiveOverlay::PlayOptions => (92, 80),
         ActiveOverlay::Settings => (82, 74),
         ActiveOverlay::Help => (80, 74),
         ActiveOverlay::Setup => (74, 68),

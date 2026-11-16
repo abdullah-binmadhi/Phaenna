@@ -97,13 +97,16 @@ pub async fn fetch_sponsor_segments(
     parse_sponsor_segments_json(&body)
 }
 
-pub fn filter_segments_for_mode(
+pub fn filter_segments_for_mode_with_outro(
     segments: &[SponsorSegment],
     mode: SponsorBlockMode,
+    skip_outro: bool,
 ) -> Vec<SponsorSegment> {
     segments
         .iter()
-        .filter(|seg| seg.action_type == "skip" && mode.auto_skips_category(&seg.category))
+        .filter(|seg| {
+            seg.action_type == "skip" && mode.auto_skips_category_with_outro(&seg.category, skip_outro)
+        })
         .cloned()
         .collect()
 }
@@ -187,14 +190,16 @@ mod tests {
         assert_eq!(segs[0].uuid, "uuid-1"); // Sorted by start_time
         assert_eq!(segs[1].uuid, "uuid-2");
 
-        let sponsor_only = filter_segments_for_mode(&segs, SponsorBlockMode::SponsorOnly);
+        let sponsor_only =
+            filter_segments_for_mode_with_outro(&segs, SponsorBlockMode::SponsorOnly, false);
         assert_eq!(sponsor_only.len(), 1);
         assert_eq!(sponsor_only[0].category, "sponsor");
 
-        let all_skips = filter_segments_for_mode(&segs, SponsorBlockMode::AutoSkipAll);
+        let all_skips =
+            filter_segments_for_mode_with_outro(&segs, SponsorBlockMode::AutoSkipAll, false);
         assert_eq!(all_skips.len(), 2); // Excludes actionType="poi"
 
-        let none = filter_segments_for_mode(&segs, SponsorBlockMode::Off);
+        let none = filter_segments_for_mode_with_outro(&segs, SponsorBlockMode::Off, false);
         assert!(none.is_empty());
     }
 }

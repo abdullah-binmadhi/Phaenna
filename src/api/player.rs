@@ -1,10 +1,9 @@
 //! Cross-platform binary detector & non-blocking external video player launcher.
 
-use crate::config::Player;
+use crate::config::{DubPreference, Player, VideoShaderMode};
 use crate::error::{AppError, Result};
 use crate::services::shaders::{mpv_mastering_flags, prepare_video_shaders, VideoMasteringProfile};
 use crate::services::substyler::SubtitleStyleConfig;
-use crate::config::VideoShaderMode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -123,68 +122,103 @@ pub struct PlayOptions {
     pub sub_style: SubtitleStyleConfig,
     pub shader_mode: VideoShaderMode,
     pub mastering_profile: VideoMasteringProfile,
+    pub dub_preference: DubPreference,
+    pub dub_lang: String,
+    pub audio_multistreams: bool,
+    pub audio_loudnorm: bool,
 }
+
+pub const LOUDNORM_FILTER: &str = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]";
 
 pub fn youtube_watch_url(video_id: &str) -> String {
     let clean_id = video_id.trim_start_matches("RD");
     format!("https://www.youtube.com/watch?v={}", clean_id)
 }
 
-/// Build arguments for `mpv` cleanly (pure function for unit testing).
-pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
-    let mut args = vec![
-        "--hwdec=auto-safe".to_string(),
-        "--vo=gpu-next".to_string(),
-        "--gpu-api=auto".to_string(),
-        "--cache=yes".to_string(),
-        "--demuxer-max-bytes=512MiB".to_string(),
-        "--demuxer-max-back-bytes=128MiB".to_string(),
-        "--force-window=immediate".to_string(),
-        format!("--force-media-title={}", opts.title),
+fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
+    let mut flags = vec![
+        "hwdec=auto-safe".to_string(),
+        "vo=gpu-next".to_string(),
+        "gpu-api=auto".to_string(),
+        "cache=yes".to_string(),
+        "demuxer-max-bytes=512MiB".to_string(),
+        "demuxer-max-back-bytes=128MiB".to_string(),
+        format!("force-media-title={}", opts.title),
     ];
 
     if opts.local_file.is_none() {
-        args.push(format!("--ytdl-format={}", opts.quality_format));
-        args.push(
-            "--ytdl-raw-options-append=format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr"
+        flags.push(format!("ytdl-format={}", opts.quality_format));
+        flags.push(
+            "ytdl-raw-options-append=format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr"
                 .to_string(),
         );
+        if opts.audio_multistreams {
+            flags.push("ytdl-raw-options-append=audio-multistreams=".to_string());
+        }
         if let Some(ref cpath) = opts.cookies_path {
             if cpath.exists() {
-                args.push(format!(
-                    "--ytdl-raw-options-append=cookies={}",
+                flags.push(format!(
+                    "ytdl-raw-options-append=cookies={}",
                     cpath.to_string_lossy()
                 ));
-                args.push("--ytdl-raw-options-append=mark-watched=".to_string());
+                flags.push("ytdl-raw-options-append=mark-watched=".to_string());
             }
         }
     }
 
-    if let Some(ref sock) = opts.ipc_socket {
-        args.push(format!("--input-ipc-server={}", sock));
+    let alang = match opts.dub_preference {
+        DubPreference::OriginalOnly => "und,orig,en".to_string(),
+        DubPreference::PreferDubbed => {
+            if opts.dub_lang.trim().is_empty() {
+                "en".to_string()
+            } else {
+                opts.dub_lang.trim().to_string()
+            }
+        }
+    };
+    flags.push(format!("alang={alang}"));
+
+    if opts.audio_loudnorm {
+        flags.push(format!("af={LOUDNORM_FILTER}"));
     }
 
     if let Some(start) = opts.start_pos {
         if start > 3.0 {
-            args.push(format!("--start={:.1}", start));
+            flags.push(format!("start={:.1}", start));
         }
     }
 
     if opts.subtitles_enabled {
         let lang = opts.sub_lang.as_deref().unwrap_or("en,eng");
-        args.push(format!("--slang={}", lang));
-        args.push("--sub-auto=fuzzy".to_string());
+        flags.push(format!("slang={}", lang));
+        flags.push("sub-auto=fuzzy".to_string());
         if let Some(ref sub_url) = opts.sub_url {
-            args.push(format!("--sub-file={}", sub_url));
+            flags.push(format!("sub-file={}", sub_url));
         }
-        args.extend(opts.sub_style.to_mpv_flags());
+        for flag in opts.sub_style.to_mpv_flags() {
+            flags.push(flag.trim_start_matches("--").to_string());
+        }
     }
 
     if let Some(shaders) = prepare_video_shaders(opts.shader_mode) {
-        args.push(format!("--glsl-shaders={}", shaders));
-        args.extend(mpv_mastering_flags(opts.shader_mode, opts.mastering_profile));
+        flags.push(format!("glsl-shaders={}", shaders));
+        for flag in mpv_mastering_flags(opts.shader_mode, opts.mastering_profile) {
+            flags.push(flag.trim_start_matches("--").to_string());
+        }
     }
 
+    flags
+}
+
+/// Build arguments for `mpv` cleanly (pure function for unit testing).
+pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
+    let mut args = vec!["--force-window=immediate".to_string()];
+    if let Some(ref sock) = opts.ipc_socket {
+        args.push(format!("--input-ipc-server={}", sock));
+    }
+    for kv in shared_mpv_kv_flags(opts) {
+        args.push(format!("--{kv}"));
+    }
     let target = opts
         .local_file
         .as_ref()
@@ -195,65 +229,12 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
 }
 
 /// Build arguments for macOS `iina-cli` translating all Reference 4K shaders,
-/// AV1/VP9 format selection, cookies, and mastering flags via `--mpv-*` parity.
+/// AV1/VP9 format selection, dub preference, loudnorm, cookies, and mastering flags via `--mpv-*`.
 pub fn build_iina_args(opts: &PlayOptions) -> Vec<String> {
-    let mut args = vec![
-        "--no-stdin".to_string(),
-        "--mpv-hwdec=auto-safe".to_string(),
-        "--mpv-vo=gpu-next".to_string(),
-        "--mpv-gpu-api=auto".to_string(),
-        "--mpv-cache=yes".to_string(),
-        "--mpv-demuxer-max-bytes=512MiB".to_string(),
-        "--mpv-demuxer-max-back-bytes=128MiB".to_string(),
-        format!("--mpv-force-media-title={}", opts.title),
-    ];
-
-    if opts.local_file.is_none() {
-        args.push(format!("--mpv-ytdl-format={}", opts.quality_format));
-        args.push(
-            "--mpv-ytdl-raw-options-append=format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr"
-                .to_string(),
-        );
-        if let Some(ref cpath) = opts.cookies_path {
-            if cpath.exists() {
-                args.push(format!(
-                    "--mpv-ytdl-raw-options-append=cookies={}",
-                    cpath.to_string_lossy()
-                ));
-                args.push("--mpv-ytdl-raw-options-append=mark-watched=".to_string());
-            }
-        }
+    let mut args = vec!["--no-stdin".to_string()];
+    for kv in shared_mpv_kv_flags(opts) {
+        args.push(format!("--mpv-{kv}"));
     }
-
-    if let Some(start) = opts.start_pos {
-        if start > 3.0 {
-            args.push(format!("--mpv-start={:.1}", start));
-        }
-    }
-
-    if opts.subtitles_enabled {
-        let lang = opts.sub_lang.as_deref().unwrap_or("en,eng");
-        args.push(format!("--mpv-slang={}", lang));
-        args.push("--mpv-sub-auto=fuzzy".to_string());
-        if let Some(ref sub_url) = opts.sub_url {
-            args.push(format!("--mpv-sub-file={}", sub_url));
-        }
-        for flag in opts.sub_style.to_mpv_flags() {
-            if let Some(trimmed) = flag.strip_prefix("--") {
-                args.push(format!("--mpv-{}", trimmed));
-            }
-        }
-    }
-
-    if let Some(shaders) = prepare_video_shaders(opts.shader_mode) {
-        args.push(format!("--mpv-glsl-shaders={}", shaders));
-        for flag in mpv_mastering_flags(opts.shader_mode, opts.mastering_profile) {
-            if let Some(trimmed) = flag.strip_prefix("--") {
-                args.push(format!("--mpv-{}", trimmed));
-            }
-        }
-    }
-
     let target = opts
         .local_file
         .as_ref()
@@ -383,6 +364,10 @@ mod tests {
             sub_style: SubtitleStyleConfig::default(),
             shader_mode: VideoShaderMode::Balanced,
             mastering_profile: VideoMasteringProfile::StandardHd,
+            dub_preference: DubPreference::OriginalOnly,
+            dub_lang: "en".to_string(),
+            audio_multistreams: true,
+            audio_loudnorm: true,
         };
 
         let args = build_mpv_args(&opts);
@@ -391,6 +376,9 @@ mod tests {
         assert!(args.iter().any(|a| a.starts_with("--glsl-shaders=")));
         assert!(args.iter().any(|a| a == "--demuxer-max-bytes=512MiB"));
         assert!(args.iter().any(|a| a.contains("format-sort=res:2160")));
+        assert!(args.iter().any(|a| a == "--ytdl-raw-options-append=audio-multistreams="));
+        assert!(args.iter().any(|a| a == "--alang=und,orig,en"));
+        assert!(args.iter().any(|a| a.starts_with("--af=lavfi=")));
         assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
     }
 
@@ -411,6 +399,10 @@ mod tests {
             sub_style: SubtitleStyleConfig::default(),
             shader_mode: VideoShaderMode::Reference4K,
             mastering_profile: VideoMasteringProfile::StandardHd,
+            dub_preference: DubPreference::PreferDubbed,
+            dub_lang: "ar".to_string(),
+            audio_multistreams: true,
+            audio_loudnorm: false,
         };
 
         let args = build_iina_args(&opts);
@@ -419,6 +411,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--mpv-deband=yes"));
         assert!(args.iter().any(|a| a == "--mpv-tone-mapping=spline"));
         assert!(args.iter().any(|a| a == "--mpv-start=18.0"));
+        assert!(args.iter().any(|a| a == "--mpv-alang=ar"));
         assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
     }
 }

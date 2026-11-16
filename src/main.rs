@@ -20,13 +20,13 @@ use crate::api::player::{
     detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
 };
 use crate::api::sponsorblock::{
-    fetch_sponsor_segments, filter_segments_for_mode, from_db_rows, to_db_rows,
+    fetch_sponsor_segments, filter_segments_for_mode_with_outro, from_db_rows, to_db_rows,
 };
 use crate::api::ytdlp::{
     fetch_channel_videos, fetch_feed_range, fetch_feed_range_stream, fetch_video_details,
     search_youtube,
 };
-use crate::config::{Config, Player, Quality};
+use crate::config::{next_dub_lang, Config, Player, Quality, VideoShaderMode};
 use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
     batch_upsert_feed, enrich_video_stats, get_all_cached_videos, get_feed_videos, get_thumb_blob,
@@ -55,7 +55,9 @@ use crate::services::auth::{
 use crate::services::calendar::{bucket_videos_by_week, compute_week_bounds};
 use crate::services::cast::{discover_devices, resolve_tv_stream_url, start_casting};
 use crate::services::downloader::{spawn_download_task, DownloadTask};
-use crate::services::ipc::{spawn_mpv_ipc_monitor, IpcMonitorConfig};
+use crate::services::ipc::{
+    spawn_mpv_ipc_monitor, IpcMonitorConfig, LiveIpcEvent, PlayerCommand,
+};
 use crate::services::remote::start_remote_server;
 use crate::services::shaders::{download_neural_shader_pack, VideoMasteringProfile};
 use crate::services::tailored::{build_questions, score_discovery_pool};
@@ -63,8 +65,8 @@ use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
 };
 use crate::state::{
-    ActiveOverlay, AppState, Category, ContentFilter, DetailViewMode, DownloadJobState, Screen,
-    ShortsSource, SortOrder,
+    ActiveOverlay, AppState, Category, ContentFilter, DetailViewMode, DownloadJobState,
+    NowPlayingHit, PlayOptionsHit, Screen, ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::help::confirm_quit_button_rects;
@@ -1481,6 +1483,7 @@ async fn handle_app_message(
             session_id,
             sock_path,
         } => {
+            state.reset_live_playback();
             state.active_playback_video_id = Some(video_id.clone());
             state.active_playback_title = Some(title.clone());
             state.active_session_id = session_id;
@@ -1496,6 +1499,30 @@ async fn handle_app_message(
                 let _ = handle
                     .state_tx
                     .send(serde_json::to_string(&*rst).unwrap_or_default());
+            }
+        }
+        AppMessage::PlaybackCommandReady { session_id, cmd_tx } => {
+            if session_id == state.active_session_id {
+                state.live_playback.cmd_tx = Some(cmd_tx);
+            }
+        }
+        AppMessage::PlaybackTelemetryUpdated { session_id, event } => {
+            if session_id == state.active_session_id {
+                let ev_copy = event.clone();
+                state.apply_live_ipc_event(event);
+                if let Some(ref handle) = state.remote_handle {
+                    let mut rst = handle.state.write().await;
+                    match ev_copy {
+                        LiveIpcEvent::Paused(p) => rst.is_playing = !p,
+                        LiveIpcEvent::Volume(v) => rst.volume = v as i32,
+                        LiveIpcEvent::Speed(s) => rst.speed = s,
+                        LiveIpcEvent::SubVisible(sv) => rst.sub_active = sv,
+                        _ => {}
+                    }
+                    let _ = handle
+                        .state_tx
+                        .send(serde_json::to_string(&*rst).unwrap_or_default());
+                }
             }
         }
         AppMessage::PlaybackProgressUpdated {
@@ -1578,6 +1605,7 @@ async fn handle_app_message(
                 state.active_playback_title = None;
                 state.active_playback_pos = 0.0;
                 state.active_playback_dur = 0.0;
+                state.reset_live_playback();
 
                 if let Some(vid) = finished_vid {
                     if finished_pos > 3.0 {
@@ -1963,7 +1991,15 @@ async fn start_nonblocking_playback(
         .unwrap_or(state.config.quality);
     let session_id = state.active_session_id.wrapping_add(1).max(1);
     let sock_path = ipc_socket_path(video.clean_id(), session_id);
-    let start_pos = start_override.or_else(|| state.progress_map.get(&video.id).map(|(p, _)| *p));
+    let start_pos = start_override.or_else(|| {
+        state.progress_map.get(&video.id).and_then(|(p, dur)| {
+            if *dur > 10.0 && *p >= *dur - 8.0 {
+                None
+            } else {
+                Some(*p)
+            }
+        })
+    });
     let local_file = state
         .offline_paths
         .get(&video.id)
@@ -1984,11 +2020,16 @@ async fn start_nonblocking_playback(
         let _ = state.auth_vault.sync_isolated_cookie_jar(cpath);
     }
 
+    let ytdl_format = quality.ytdl_format_with_dub(
+        state.config.dub_preference,
+        &state.config.dub_lang,
+        state.config.audio_multistreams,
+    );
     let opts = PlayOptions {
         video_id: video.id.clone(),
         title: video.title.clone(),
         local_file,
-        quality_format: quality.ytdl_format().to_string(),
+        quality_format: ytdl_format,
         player: state.config.player,
         cookies_path: cookies_path.clone(),
         start_pos,
@@ -2003,6 +2044,10 @@ async fn start_nonblocking_playback(
         sub_style: state.config.subtitle_style.clone(),
         shader_mode: state.config.shader_mode,
         mastering_profile: VideoMasteringProfile::from_metadata(video.duration, &video.title),
+        dub_preference: state.config.dub_preference,
+        dub_lang: state.config.dub_lang.clone(),
+        audio_multistreams: state.config.audio_multistreams,
+        audio_loudnorm: state.config.audio_loudnorm,
     };
 
     match spawn_player(&opts) {
@@ -2079,7 +2124,11 @@ async fn start_nonblocking_playback(
                         .await
                         .unwrap_or_default()
                 };
-                sb_segs = filter_segments_for_mode(&sb_segs, state.config.sponsorblock_mode);
+                sb_segs = filter_segments_for_mode_with_outro(
+                    &sb_segs,
+                    state.config.sponsorblock_mode,
+                    state.config.skip_outro,
+                );
 
                 let _ = tx
                     .send(AppMessage::PlaybackStarted {
@@ -2578,6 +2627,313 @@ async fn execute_hub_action(
     }
 }
 
+async fn toggle_dub_live_or_config(
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    state.config.dub_preference = state.config.dub_preference.toggle();
+    let want_dub = state.config.dub_preference.is_dub_on();
+    let _ = state.config.save();
+
+    if state.has_live_ipc() {
+        if let Some(aid) = state.find_audio_track_for_dub(want_dub) {
+            state.send_player_cmd(PlayerCommand::SetAudioTrack(aid));
+            state.show_toast(if want_dub {
+                format!("Switched live to Dubbed Audio (track #{aid})")
+            } else {
+                format!("Switched live to Original Audio (track #{aid})")
+            });
+        } else {
+            // Single audio stream loaded; seamlessly reload at current timestamp with updated dub filter
+            relaunch_live_video_from_pos(state, pool, tx, client).await;
+            state.show_toast(format!("Audio Dub: {} (reloading at timestamp)", state.config.dub_preference.label()));
+        }
+    } else {
+        state.show_toast(format!("Audio Dub: {}", state.config.dub_preference.label()));
+    }
+}
+
+async fn relaunch_live_video_from_pos(
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let resume_at = if state.active_playback_pos > 2.0 {
+        Some(state.active_playback_pos)
+    } else {
+        None
+    };
+    let target_vid = if let Some(ref vid_id) = state.active_playback_video_id {
+        state
+            .all_known_videos()
+            .into_iter()
+            .find(|v| v.id == *vid_id)
+            .or_else(|| state.active_selected_video())
+    } else {
+        state.active_selected_video()
+    };
+    if state.has_live_ipc() {
+        state.send_player_cmd(PlayerCommand::Stop);
+    }
+    if let Some(v) = target_vid {
+        start_nonblocking_playback(&v, resume_at, state, pool, tx, client).await;
+    }
+}
+
+fn apply_shader_mode(state: &mut AppState, mode: VideoShaderMode) {
+    state.config.shader_mode = mode;
+    let _ = state.config.save();
+    if state.has_live_ipc() {
+        let prof = state
+            .active_selected_video()
+            .map(|v| VideoMasteringProfile::from_metadata(v.duration, &v.title))
+            .unwrap_or(VideoMasteringProfile::StandardHd);
+        state.send_player_cmd(PlayerCommand::SetShaderMode(mode, prof));
+        state.show_toast(format!("Live 4K Shader: {}", mode.short_label()));
+    } else {
+        state.show_toast(format!("4K Shader: {}", mode.short_label()));
+    }
+}
+
+async fn apply_play_options_hit(
+    hit: PlayOptionsHit,
+    click_col: u16,
+    hit_rect: ratatui::layout::Rect,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    match hit {
+        PlayOptionsHit::FocusSection(sec) => state.play_modal_section = sec.min(4),
+        PlayOptionsHit::SelectQuality(i) => {
+            if let Some(q) = Quality::ALL.get(i).copied() {
+                state.play_quality_idx = i;
+                state.config.quality = q;
+                let _ = state.config.save();
+            }
+        }
+        PlayOptionsHit::SelectPlayer(pl) => {
+            state.config.player = pl;
+            let _ = state.config.save();
+        }
+        PlayOptionsHit::ToggleDub => {
+            toggle_dub_live_or_config(state, pool, tx, client).await;
+        }
+        PlayOptionsHit::CycleDubLang => {
+            state.config.dub_lang = next_dub_lang(&state.config.dub_lang);
+            let _ = state.config.save();
+            if state.has_live_ipc() && state.config.dub_preference.is_dub_on() {
+                if let Some(aid) = state.find_audio_track_for_dub(true) {
+                    state.send_player_cmd(PlayerCommand::SetAudioTrack(aid));
+                }
+            }
+        }
+        PlayOptionsHit::ToggleMultistreams => {
+            state.config.audio_multistreams = !state.config.audio_multistreams;
+            let _ = state.config.save();
+        }
+        PlayOptionsHit::ToggleLoudnorm => {
+            state.config.audio_loudnorm = !state.config.audio_loudnorm;
+            let _ = state.config.save();
+            if state.has_live_ipc() {
+                state.send_player_cmd(PlayerCommand::SetLoudnorm(state.config.audio_loudnorm));
+            }
+        }
+        PlayOptionsHit::AudioDelayDelta(delta_ms) => {
+            state.live_playback.audio_delay_ms =
+                (state.live_playback.audio_delay_ms + delta_ms).clamp(-5000, 5000);
+            state.send_player_cmd(PlayerCommand::SetAudioDelay(
+                state.live_playback.audio_delay_ms as f64 / 1000.0,
+            ));
+        }
+        PlayOptionsHit::SelectAudioTrack(aid) => {
+            state.live_playback.active_aid = Some(aid);
+            state.send_player_cmd(PlayerCommand::SetAudioTrack(aid));
+            if let Some(tr) = state.live_playback.audio_tracks.iter().find(|t| t.id == aid) {
+                state.config.dub_preference = if tr.is_dubbed {
+                    crate::config::DubPreference::PreferDubbed
+                } else {
+                    crate::config::DubPreference::OriginalOnly
+                };
+                let _ = state.config.save();
+            }
+        }
+        PlayOptionsHit::ToggleSubtitles => {
+            if state.has_live_ipc() {
+                state.live_playback.sub_visible = !state.live_playback.sub_visible;
+                state.config.subtitles_enabled = state.live_playback.sub_visible;
+                state.send_player_cmd(PlayerCommand::SetSubVisible(state.live_playback.sub_visible));
+            } else {
+                state.config.subtitles_enabled = !state.config.subtitles_enabled;
+            }
+            let _ = state.config.save();
+        }
+        PlayOptionsHit::CycleSubStyle => {
+            state.config.subtitle_style.cycle_preset();
+            let _ = state.config.save();
+        }
+        PlayOptionsHit::SubDelayDelta(delta_ms) => {
+            state.live_playback.sub_delay_ms =
+                (state.live_playback.sub_delay_ms + delta_ms).clamp(-10000, 10000);
+            state.send_player_cmd(PlayerCommand::SetSubDelay(
+                state.live_playback.sub_delay_ms as f64 / 1000.0,
+            ));
+        }
+        PlayOptionsHit::SelectSubTrack(sid) => {
+            state.live_playback.active_sid = Some(sid);
+            state.live_playback.sub_visible = true;
+            state.send_player_cmd(PlayerCommand::SetSubTrack(sid));
+        }
+        PlayOptionsHit::SelectSponsorBlock(mode) => {
+            state.config.sponsorblock_mode = mode;
+            let _ = state.config.save();
+        }
+        PlayOptionsHit::ToggleSkipOutro => {
+            state.config.skip_outro = !state.config.skip_outro;
+            let _ = state.config.save();
+        }
+        PlayOptionsHit::SelectShader(mode) => {
+            apply_shader_mode(state, mode);
+        }
+        PlayOptionsHit::TogglePause => {
+            state.live_playback.paused = !state.live_playback.paused;
+            state.send_player_cmd(PlayerCommand::TogglePause);
+        }
+        PlayOptionsHit::SeekDelta(delta) => {
+            state.send_player_cmd(PlayerCommand::SeekRelative(delta));
+        }
+        PlayOptionsHit::SeekRatio(_) => {
+            if state.active_playback_dur > 0.0 && hit_rect.width > 12 {
+                let bar_span = hit_rect.width.saturating_sub(14).max(1) as f64;
+                let rel = (click_col.saturating_sub(hit_rect.x + 1) as f64 / bar_span).clamp(0.0, 0.99);
+                let target = state.active_playback_dur * rel;
+                state.active_playback_pos = target;
+                state.send_player_cmd(PlayerCommand::SeekAbsolute(target));
+            }
+        }
+        PlayOptionsHit::ChapterStep(step) => {
+            state.send_player_cmd(PlayerCommand::ChapterStep(step));
+        }
+        PlayOptionsHit::SetSpeed(spd) => {
+            state.live_playback.speed = spd;
+            state.send_player_cmd(PlayerCommand::SetSpeed(spd));
+        }
+        PlayOptionsHit::VolumeDelta(delta) => {
+            state.live_playback.volume = (state.live_playback.volume + delta).clamp(0, 150);
+            state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
+        }
+        PlayOptionsHit::ToggleMute => {
+            state.live_playback.muted = !state.live_playback.muted;
+            state.send_player_cmd(PlayerCommand::ToggleMute);
+        }
+        PlayOptionsHit::PictureDelta(prop, delta) => {
+            let next_val = match prop {
+                "brightness" => {
+                    state.live_playback.brightness =
+                        (state.live_playback.brightness + delta).clamp(-50, 50);
+                    state.live_playback.brightness
+                }
+                "contrast" => {
+                    state.live_playback.contrast =
+                        (state.live_playback.contrast + delta).clamp(-50, 50);
+                    state.live_playback.contrast
+                }
+                "saturation" => {
+                    state.live_playback.saturation =
+                        (state.live_playback.saturation + delta).clamp(-50, 50);
+                    state.live_playback.saturation
+                }
+                _ => {
+                    state.live_playback.gamma =
+                        (state.live_playback.gamma + delta).clamp(-50, 50);
+                    state.live_playback.gamma
+                }
+            };
+            state.send_player_cmd(PlayerCommand::SetPictureProp { prop, value: next_val });
+        }
+        PlayOptionsHit::ResetPicture => {
+            state.live_playback.brightness = 0;
+            state.live_playback.contrast = 0;
+            state.live_playback.saturation = 0;
+            state.live_playback.gamma = 0;
+            state.send_player_cmd(PlayerCommand::ResetPicture);
+        }
+        PlayOptionsHit::ToggleOnTop => {
+            state.live_playback.ontop = !state.live_playback.ontop;
+            state.send_player_cmd(PlayerCommand::SetOnTop(state.live_playback.ontop));
+        }
+        PlayOptionsHit::ToggleLoop => {
+            state.live_playback.loop_video = !state.live_playback.loop_video;
+            state.send_player_cmd(PlayerCommand::SetLoop(state.live_playback.loop_video));
+        }
+        PlayOptionsHit::LaunchOrRelaunch => {
+            state.overlay = ActiveOverlay::None;
+            if state.has_live_ipc() {
+                relaunch_live_video_from_pos(state, pool, tx, client).await;
+            } else if let Some(v) = state.active_selected_video() {
+                start_nonblocking_playback(&v, None, state, pool, tx, client).await;
+            }
+        }
+        PlayOptionsHit::StopPlayer => {
+            state.send_player_cmd(PlayerCommand::Stop);
+            state.overlay = ActiveOverlay::None;
+            state.show_toast("Stopped playback");
+        }
+    }
+}
+
+async fn apply_now_playing_hit(
+    hit: NowPlayingHit,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    match hit {
+        NowPlayingHit::TogglePause => {
+            state.live_playback.paused = !state.live_playback.paused;
+            state.send_player_cmd(PlayerCommand::TogglePause);
+        }
+        NowPlayingHit::SeekBack => {
+            state.send_player_cmd(PlayerCommand::SeekRelative(-10.0));
+        }
+        NowPlayingHit::SeekFwd => {
+            state.send_player_cmd(PlayerCommand::SeekRelative(10.0));
+        }
+        NowPlayingHit::ToggleDub => {
+            toggle_dub_live_or_config(state, pool, tx, client).await;
+        }
+        NowPlayingHit::SpeedStep(dir) => {
+            let next = (state.live_playback.speed + (dir as f64) * 0.25).clamp(0.5, 2.5);
+            state.live_playback.speed = next;
+            state.send_player_cmd(PlayerCommand::SetSpeed(next));
+        }
+        NowPlayingHit::VolumeDelta(delta) => {
+            state.live_playback.volume = (state.live_playback.volume + delta).clamp(0, 150);
+            state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
+        }
+        NowPlayingHit::ToggleMute => {
+            state.live_playback.muted = !state.live_playback.muted;
+            state.send_player_cmd(PlayerCommand::ToggleMute);
+        }
+        NowPlayingHit::CycleShader => {
+            let next = state.config.shader_mode.next();
+            apply_shader_mode(state, next);
+        }
+        NowPlayingHit::OpenStudio => {
+            state.overlay = ActiveOverlay::PlayOptions;
+        }
+        NowPlayingHit::StopPlayer => {
+            state.send_player_cmd(PlayerCommand::Stop);
+            state.show_toast("Stopped playback");
+        }
+    }
+}
+
 async fn handle_mouse_event(
     mouse: MouseEvent,
     state: &mut AppState,
@@ -2619,6 +2975,40 @@ async fn handle_mouse_event(
             }
             return false;
         }
+        if state.overlay == ActiveOverlay::PlayOptions {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let in_rect = |r: ratatui::layout::Rect| -> bool {
+                    r.width > 0
+                        && r.height > 0
+                        && mouse.column >= r.x
+                        && mouse.column < r.x + r.width
+                        && mouse.row >= r.y
+                        && mouse.row < r.y + r.height
+                };
+                if let Some((rect, hit)) = state
+                    .live_playback
+                    .play_hitboxes
+                    .iter()
+                    .find(|(r, h)| in_rect(*r) && !matches!(h, PlayOptionsHit::FocusSection(_)))
+                    .or_else(|| {
+                        state
+                            .live_playback
+                            .play_hitboxes
+                            .iter()
+                            .find(|(r, _)| in_rect(*r))
+                    })
+                    .cloned()
+                {
+                    apply_play_options_hit(hit, mouse.column, rect, state, pool, tx, client).await;
+                    return true;
+                }
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.overlay = ActiveOverlay::None;
+                return true;
+            }
+            return false;
+        }
         if state.overlay == ActiveOverlay::None && state.screen == Screen::Detail {
             let in_rect = |r: ratatui::layout::Rect| -> bool {
                 r.width > 0
@@ -2628,6 +3018,18 @@ async fn handle_mouse_event(
                     && mouse.row >= r.y
                     && mouse.row < r.y + r.height
             };
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some((_, hit)) = state
+                    .live_playback
+                    .now_playing_hitboxes
+                    .iter()
+                    .find(|(r, _)| in_rect(*r))
+                    .copied()
+                {
+                    apply_now_playing_hit(hit, state, pool, tx, client).await;
+                    return true;
+                }
+            }
 
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2695,6 +3097,23 @@ async fn handle_mouse_event(
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some((_, hit)) = state
+                .live_playback
+                .now_playing_hitboxes
+                .iter()
+                .find(|(r, _)| {
+                    r.width > 0
+                        && r.height > 0
+                        && mouse.column >= r.x
+                        && mouse.column < r.x + r.width
+                        && mouse.row >= r.y
+                        && mouse.row < r.y + r.height
+                })
+                .copied()
+            {
+                apply_now_playing_hit(hit, state, pool, tx, client).await;
+                return true;
+            }
             if mouse.row == top_area.y {
                 if let Some(idx) = top_bar_shelf_at(&state.categories, mouse.column) {
                     state.active_category = idx;
@@ -3411,11 +3830,15 @@ async fn handle_overlay_key(
         },
         ActiveOverlay::PlayOptions => match code {
             KeyCode::Esc | KeyCode::Char('p') => state.overlay = ActiveOverlay::None,
-            KeyCode::Left | KeyCode::Char('h') => {
-                state.play_modal_section = state.play_modal_section.saturating_sub(1);
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                state.play_modal_section = if state.play_modal_section == 0 {
+                    4
+                } else {
+                    state.play_modal_section - 1
+                };
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                state.play_modal_section = (state.play_modal_section + 1).min(3);
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                state.play_modal_section = (state.play_modal_section + 1) % 5;
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
                 let down = matches!(code, KeyCode::Down | KeyCode::Char('j'));
@@ -3429,19 +3852,119 @@ async fn handle_overlay_key(
                         };
                         state.config.quality = Quality::ALL[state.play_quality_idx];
                     }
-                    1 => state.config.player = state.config.player.next(),
+                    1 => {
+                        toggle_dub_live_or_config(state, pool, tx, client).await;
+                        return;
+                    }
                     2 => state.config.sponsorblock_mode = state.config.sponsorblock_mode.next(),
-                    _ => state.config.subtitles_enabled = !state.config.subtitles_enabled,
+                    3 => {
+                        let next = if down {
+                            state.config.shader_mode.next()
+                        } else {
+                            let mut cur = state.config.shader_mode;
+                            for _ in 0..4 {
+                                cur = cur.next();
+                            }
+                            cur
+                        };
+                        apply_shader_mode(state, next);
+                        return;
+                    }
+                    _ => {
+                        let delta = if down { -5 } else { 5 };
+                        state.live_playback.volume =
+                            (state.live_playback.volume + delta).clamp(0, 150);
+                        state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
+                        return;
+                    }
                 }
                 let _ = state.config.save();
             }
-            KeyCode::Char('s') => {
-                state.config.shader_mode = state.config.shader_mode.next();
+            KeyCode::Char('d') => toggle_dub_live_or_config(state, pool, tx, client).await,
+            KeyCode::Char('L') => {
+                state.config.dub_lang = next_dub_lang(&state.config.dub_lang);
                 let _ = state.config.save();
+                if state.has_live_ipc() && state.config.dub_preference.is_dub_on() {
+                    if let Some(aid) = state.find_audio_track_for_dub(true) {
+                        state.send_player_cmd(PlayerCommand::SetAudioTrack(aid));
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                state.config.audio_loudnorm = !state.config.audio_loudnorm;
+                let _ = state.config.save();
+                state.send_player_cmd(PlayerCommand::SetLoudnorm(state.config.audio_loudnorm));
+            }
+            KeyCode::Char('c') => {
+                if state.has_live_ipc() {
+                    state.live_playback.sub_visible = !state.live_playback.sub_visible;
+                    state.config.subtitles_enabled = state.live_playback.sub_visible;
+                    state.send_player_cmd(PlayerCommand::SetSubVisible(
+                        state.live_playback.sub_visible,
+                    ));
+                } else {
+                    state.config.subtitles_enabled = !state.config.subtitles_enabled;
+                }
+                let _ = state.config.save();
+            }
+            KeyCode::Char('y') => {
+                state.config.subtitle_style.cycle_preset();
+                let _ = state.config.save();
+            }
+            KeyCode::Char('o') => {
+                state.config.skip_outro = !state.config.skip_outro;
+                let _ = state.config.save();
+            }
+            KeyCode::Char('s') => {
+                let next = state.config.shader_mode.next();
+                apply_shader_mode(state, next);
+            }
+            KeyCode::Char(' ') => {
+                if state.has_live_ipc() {
+                    state.live_playback.paused = !state.live_playback.paused;
+                    state.send_player_cmd(PlayerCommand::TogglePause);
+                } else {
+                    toggle_dub_live_or_config(state, pool, tx, client).await;
+                }
+            }
+            KeyCode::Char('-') => {
+                state.live_playback.volume = (state.live_playback.volume - 5).clamp(0, 150);
+                state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                state.live_playback.volume = (state.live_playback.volume + 5).clamp(0, 150);
+                state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
+            }
+            KeyCode::Char('[') => {
+                let next = (state.live_playback.speed - 0.25).clamp(0.5, 2.5);
+                state.live_playback.speed = next;
+                state.send_player_cmd(PlayerCommand::SetSpeed(next));
+            }
+            KeyCode::Char(']') => {
+                let next = (state.live_playback.speed + 0.25).clamp(0.5, 2.5);
+                state.live_playback.speed = next;
+                state.send_player_cmd(PlayerCommand::SetSpeed(next));
+            }
+            KeyCode::Char('M') => {
+                state.live_playback.muted = !state.live_playback.muted;
+                state.send_player_cmd(PlayerCommand::ToggleMute);
+            }
+            KeyCode::Char('0') => {
+                state.live_playback.brightness = 0;
+                state.live_playback.contrast = 0;
+                state.live_playback.saturation = 0;
+                state.live_playback.gamma = 0;
+                state.send_player_cmd(PlayerCommand::ResetPicture);
+            }
+            KeyCode::Char('X') => {
+                state.send_player_cmd(PlayerCommand::Stop);
+                state.overlay = ActiveOverlay::None;
             }
             KeyCode::Enter => {
                 state.overlay = ActiveOverlay::None;
-                if let Some(v) = state.active_selected_video() {
+                if state.has_live_ipc() {
+                    relaunch_live_video_from_pos(state, pool, tx, client).await;
+                } else if let Some(v) = state.active_selected_video() {
                     start_nonblocking_playback(&v, None, state, pool, tx, client).await;
                 }
             }

@@ -286,14 +286,24 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
     let area = frame.area();
     let now_unix = unix_now_secs();
 
+    let show_np = state.has_live_ipc() && area.height >= 24;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(14),
-            Constraint::Length(1),
-        ])
+        .constraints(if show_np {
+            vec![
+                Constraint::Length(3),
+                Constraint::Min(14),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ]
+        } else {
+            vec![
+                Constraint::Length(3),
+                Constraint::Min(14),
+                Constraint::Length(1),
+            ]
+        })
         .split(area);
 
     render_header_bar(frame, rows[0], state, &video, &pal, now_unix);
@@ -338,7 +348,13 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
         render_comments_panel(frame, right_stack[1], state, &pal);
     }
 
-    render_footer_legend(frame, rows[2], state, &pal);
+    if show_np {
+        crate::ui::play_options::render_now_playing_bar(frame, rows[2], state);
+        render_footer_legend(frame, rows[3], state, &pal);
+    } else {
+        state.live_playback.now_playing_hitboxes.clear();
+        render_footer_legend(frame, rows[2], state, &pal);
+    }
 }
 
 fn render_header_bar(

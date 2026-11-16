@@ -7,8 +7,10 @@ use crate::api::subtitles::SubtitleTrack;
 use crate::db::cache::{VideoItem, VideoStatsUpdate};
 use crate::services::auth::{ChallengeKind, DeviceCodeSession, GoogleAccountSession};
 use crate::services::cast::CastDevice;
+use crate::services::ipc::{LiveIpcEvent, PlayerCommand};
 use crate::services::updater::UpdateInfo;
 use std::collections::HashMap;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug)]
 #[allow(dead_code, clippy::large_enum_variant)]
@@ -110,6 +112,14 @@ pub enum AppMessage {
         title: String,
         session_id: u64,
         sock_path: String,
+    },
+    PlaybackCommandReady {
+        session_id: u64,
+        cmd_tx: UnboundedSender<PlayerCommand>,
+    },
+    PlaybackTelemetryUpdated {
+        session_id: u64,
+        event: LiveIpcEvent,
     },
     PlaybackProgressUpdated {
         video_id: String,

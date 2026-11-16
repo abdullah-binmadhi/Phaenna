@@ -89,6 +89,90 @@ impl Quality {
         }
     }
 
+    pub fn video_selectors(self) -> &'static [&'static str] {
+        match self {
+            Quality::Best => &[
+                "bestvideo[height<=?4320][vcodec^=av01]",
+                "bestvideo[height<=?4320][vcodec^=vp9]",
+                "bestvideo[height<=?4320]",
+                "bestvideo",
+            ],
+            Quality::P2160 => &["bestvideo[height<=?2160][fps>=?50]", "bestvideo[height<=?2160]"],
+            Quality::P1440 => &["bestvideo[height<=?1440][fps>=?50]", "bestvideo[height<=?1440]"],
+            Quality::P1080 => &["bestvideo[height<=?1080][fps>=?50]", "bestvideo[height<=?1080]"],
+            Quality::P720 => &["bestvideo[height<=?720][fps>=?50]", "bestvideo[height<=?720]"],
+            Quality::P480 => &["bestvideo[height<=?480]"],
+            Quality::P360 => &["bestvideo[height<=?360]"],
+            Quality::AudioOnly => &[],
+        }
+    }
+
+    /// Build a `yt-dlp` format selector honoring Original vs. Dubbed audio and multi-stream loading.
+    pub fn ytdl_format_with_dub(
+        self,
+        dub: DubPreference,
+        dub_lang: &str,
+        multistreams: bool,
+    ) -> String {
+        let lang: String = dub_lang
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(8)
+            .collect();
+        let lang = if lang.is_empty() { "en" } else { lang.as_str() };
+
+        let primary_audio = match dub {
+            DubPreference::OriginalOnly => "bestaudio[format_note!*=dubbed]".to_string(),
+            DubPreference::PreferDubbed => {
+                format!("bestaudio[format_note*=dubbed][language^={lang}]")
+            }
+        };
+        let alt_audio = match dub {
+            DubPreference::OriginalOnly => {
+                format!("bestaudio[format_note*=dubbed][language^={lang}]")
+            }
+            DubPreference::PreferDubbed => "bestaudio[format_note!*=dubbed]".to_string(),
+        };
+
+        if self == Quality::AudioOnly {
+            return match dub {
+                DubPreference::OriginalOnly => {
+                    "bestaudio[format_note!*=dubbed]/bestaudio/best".to_string()
+                }
+                DubPreference::PreferDubbed => format!(
+                    "bestaudio[format_note*=dubbed][language^={lang}]/bestaudio[format_note*=dubbed]/bestaudio[language^={lang}]/bestaudio/best"
+                ),
+            };
+        }
+
+        let mut branches: Vec<String> = Vec::new();
+        let vs = self.video_selectors();
+        if multistreams {
+            if let Some(first_v) = vs.first() {
+                branches.push(format!("{first_v}+{primary_audio}+{alt_audio}"));
+            }
+            let primary_v = vs.last().copied().unwrap_or("bestvideo");
+            if Some(&primary_v) != vs.first() {
+                branches.push(format!("{primary_v}+{primary_audio}+{alt_audio}"));
+            }
+        }
+        for v in vs {
+            branches.push(format!("{v}+{primary_audio}"));
+        }
+        if dub == DubPreference::PreferDubbed {
+            if let Some(first_v) = vs.first() {
+                branches.push(format!("{first_v}+bestaudio[format_note*=dubbed]"));
+                branches.push(format!("{first_v}+bestaudio[language^={lang}]"));
+            }
+        }
+        for v in vs {
+            branches.push(format!("{v}+bestaudio"));
+        }
+        branches.push("best".to_string());
+        branches.join("/")
+    }
+
     pub const fn short_badge(self) -> &'static str {
         match self {
             Quality::Best => "4K-AV1",
@@ -264,12 +348,85 @@ impl SponsorBlockMode {
     }
 
     pub fn auto_skips_category(self, category: &str) -> bool {
+        self.auto_skips_category_with_outro(category, false)
+    }
+
+    pub fn auto_skips_category_with_outro(self, category: &str, skip_outro: bool) -> bool {
+        if category == "outro" && !skip_outro {
+            return false;
+        }
         match self {
             Self::AutoSkipAll => true,
             Self::SponsorOnly => category == "sponsor",
             Self::ShowChaptersOnly | Self::Off => false,
         }
     }
+}
+
+/// Controls whether YouTube multi-language AI/creator audio dubbing is used or suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DubPreference {
+    #[default]
+    OriginalOnly,
+    PreferDubbed,
+}
+
+#[allow(dead_code)]
+impl DubPreference {
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::OriginalOnly => Self::PreferDubbed,
+            Self::PreferDubbed => Self::OriginalOnly,
+        }
+    }
+
+    pub const fn is_dub_on(self) -> bool {
+        matches!(self, Self::PreferDubbed)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OriginalOnly => "OFF (Original Audio)",
+            Self::PreferDubbed => "ON (Dubbed Track)",
+        }
+    }
+
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::OriginalOnly => "ORIG",
+            Self::PreferDubbed => "DUB",
+        }
+    }
+}
+
+pub const DUB_LANGUAGES: &[(&str, &str)] = &[
+    ("en", "English (en)"),
+    ("ar", "Arabic (ar)"),
+    ("ja", "Japanese (ja)"),
+    ("es", "Spanish (es)"),
+    ("fr", "French (fr)"),
+    ("de", "German (de)"),
+    ("ko", "Korean (ko)"),
+    ("pt", "Portuguese (pt)"),
+    ("hi", "Hindi (hi)"),
+];
+
+pub fn dub_lang_label(code: &str) -> &'static str {
+    DUB_LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, l)| *l)
+        .unwrap_or("English (en)")
+}
+
+pub fn next_dub_lang(current: &str) -> String {
+    let idx = DUB_LANGUAGES
+        .iter()
+        .position(|(c, _)| *c == current)
+        .map(|i| (i + 1) % DUB_LANGUAGES.len())
+        .unwrap_or(0);
+    DUB_LANGUAGES[idx].0.to_string()
 }
 
 /// Optional Google OAuth2 client settings for in-app Device Code & Kitty Split PKCE flows.
@@ -386,6 +543,10 @@ fn default_sub_lang() -> String {
     "English".to_string()
 }
 
+fn default_dub_lang() -> String {
+    "en".to_string()
+}
+
 fn default_theme_index() -> usize {
     2 // Phaenna
 }
@@ -402,7 +563,17 @@ pub struct Config {
     #[serde(default = "default_sub_lang")]
     pub default_sub_lang: String,
     #[serde(default)]
+    pub dub_preference: DubPreference,
+    #[serde(default = "default_dub_lang")]
+    pub dub_lang: String,
+    #[serde(default = "default_true")]
+    pub audio_multistreams: bool,
+    #[serde(default)]
+    pub audio_loudnorm: bool,
+    #[serde(default)]
     pub sponsorblock_mode: SponsorBlockMode,
+    #[serde(default)]
+    pub skip_outro: bool,
     #[serde(default)]
     pub shader_mode: VideoShaderMode,
     #[serde(default = "default_true")]
@@ -434,7 +605,12 @@ impl Default for Config {
             player: Player::default(),
             subtitles_enabled: true,
             default_sub_lang: default_sub_lang(),
+            dub_preference: DubPreference::default(),
+            dub_lang: default_dub_lang(),
+            audio_multistreams: true,
+            audio_loudnorm: false,
             sponsorblock_mode: SponsorBlockMode::default(),
+            skip_outro: false,
             shader_mode: VideoShaderMode::default(),
             ambilight_enabled: true,
             theme_index: default_theme_index(),
@@ -559,6 +735,11 @@ mod tests {
         assert!(Quality::P1080.ytdl_format().contains("1080"));
         assert_eq!(Quality::AudioOnly.ytdl_format(), "bestaudio/best");
         assert_eq!(Quality::P2160.short_badge(), "4K60");
+        let orig = Quality::Best.ytdl_format_with_dub(DubPreference::OriginalOnly, "en", true);
+        assert!(orig.contains("format_note!*=dubbed"));
+        let dubbed = Quality::Best.ytdl_format_with_dub(DubPreference::PreferDubbed, "ar", true);
+        assert!(dubbed.contains("format_note*=dubbed"));
+        assert!(dubbed.contains("language^=ar"));
     }
 
     #[test]
@@ -573,6 +754,8 @@ mod tests {
         let sb = SponsorBlockMode::AutoSkipAll;
         assert!(sb.auto_skips_category("sponsor"));
         assert!(sb.auto_skips_category("intro"));
+        assert!(!sb.auto_skips_category("outro"));
+        assert!(sb.auto_skips_category_with_outro("outro", true));
         let sb2 = sb.next();
         assert_eq!(sb2, SponsorBlockMode::SponsorOnly);
         assert!(sb2.auto_skips_category("sponsor"));

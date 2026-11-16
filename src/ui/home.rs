@@ -428,9 +428,19 @@ fn render_shorts_filter_bar(frame: &mut Frame, bar_area: Rect, state: &AppState)
 }
 
 pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: Option<Rect>) {
-    let [top_area, hero_area, grid_area, footer_area] = home_layout(frame.area());
+    let [top_area, hero_area, mut grid_area, footer_area] = home_layout(frame.area());
     render_top_bar(frame, top_area, state);
     render_hero_stage(frame, hero_area, state, modal_rect);
+
+    let show_now_playing = state.has_live_ipc() && grid_area.height >= 12;
+    let now_playing_area = if show_now_playing {
+        let bar = Rect::new(grid_area.x, grid_area.y + grid_area.height - 1, grid_area.width, 1);
+        grid_area.height -= 1;
+        Some(bar)
+    } else {
+        state.live_playback.now_playing_hitboxes.clear();
+        None
+    };
 
     let active_cat = state
         .categories
@@ -452,6 +462,9 @@ pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: O
         render_video_grid(frame, card_grid_area, state, modal_rect);
     }
 
+    if let Some(bar_rect) = now_playing_area {
+        crate::ui::play_options::render_now_playing_bar(frame, bar_rect, state);
+    }
     render_footer_dock(frame, footer_area, state);
 }
 
