@@ -17,9 +17,10 @@
 
 ## Demo
 
-[![Watch Phaenna 1660x1080 60fps Demo](https://github.com/abdullah-binmadhi/Phaenna/releases/download/media/phaenna-preview.png)](https://github.com/abdullah-binmadhi/Phaenna/releases/download/media/phaenna-demo.mp4)
 
-> Click the preview above to watch the full **1660x1080 60fps Showcase Video** ([`phaenna-demo.mp4`](https://github.com/abdullah-binmadhi/Phaenna/releases/download/media/phaenna-demo.mp4)).
+
+https://github.com/user-attachments/assets/4659ad96-2629-4fd2-a739-0ab5614630d4
+
 
 ---
 
