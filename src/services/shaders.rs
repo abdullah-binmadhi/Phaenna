@@ -7,7 +7,7 @@
 //! 4. `04_anime4k_restore.glsl` (`LUMA` 2x): Gradient clamp & line-art thinness reconstruction for stylized animation.
 //! 5. Optional neural CNN upscaler (`FSRCNNX_x2_16-0-4-1.glsl`) downloadable into local shader cache.
 
-use crate::config::VideoShaderMode;
+use crate::config::{PerformanceMode, VideoShaderMode};
 use std::path::PathBuf;
 
 const FSRCNNX_URL: &str =
@@ -34,6 +34,31 @@ impl VideoMasteringProfile {
         }
     }
 }
+
+/// 0. Featherweight single-pass Luma RCAS sharpening (`Efficient` mode, zero 2x framebuffer allocation).
+const SHADER_LIGHT_CAS: &str = r#"//!DESC Phaenna-Efficient-Light-CAS
+//!HOOK LUMA
+//!BIND HOOKED
+
+vec4 hook() {
+    vec2 pt = HOOKED_pt;
+    vec2 pos = HOOKED_pos;
+    float c = HOOKED_tex(pos).x;
+    float n = HOOKED_tex(pos + vec2(0.0, -pt.y)).x;
+    float s = HOOKED_tex(pos + vec2(0.0,  pt.y)).x;
+    float e = HOOKED_tex(pos + vec2( pt.x, 0.0)).x;
+    float w = HOOKED_tex(pos + vec2(-pt.x, 0.0)).x;
+
+    float mn = min(c, min(min(n, s), min(e, w)));
+    float mx = max(c, max(max(n, s), max(e, w)));
+    float hit_min = mn / max(4.0 * mx, 1e-5);
+    float hit_max = (1.0 - mx) / max(4.0 * mn - 4.0, -1e-5);
+    float lobe = max(-hit_min, hit_max);
+    float weight = clamp(lobe, -0.04, 0.0);
+    float out_y = (c + (n + s + e + w) * weight) / (1.0 + 4.0 * weight);
+    return vec4(clamp(out_y, mn, mx), 0.0, 0.0, 1.0);
+}
+"#;
 
 /// 1. Edge-preserving bilateral deblocker & deringer for YouTube DCT compression macroblocks.
 const SHADER_DEBLOCK_DERING: &str = r#"//!DESC Phaenna-Ref4K-Deblock-Dering
@@ -223,8 +248,8 @@ pub async fn download_neural_shader_pack(
     Ok(dest)
 }
 
-/// Write GLSL shader files to the local cache directory and return colon/semicolon-separated paths.
-pub fn prepare_video_shaders(mode: VideoShaderMode) -> Option<String> {
+/// Write GLSL shader files to local cache tailored by `PerformanceMode`.
+pub fn prepare_video_shaders_for(mode: VideoShaderMode, perf: PerformanceMode) -> Option<String> {
     if mode == VideoShaderMode::Off {
         return None;
     }
@@ -232,11 +257,19 @@ pub fn prepare_video_shaders(mode: VideoShaderMode) -> Option<String> {
     let dir = shader_cache_dir();
     let _ = std::fs::create_dir_all(&dir);
 
+    #[cfg(windows)]
+    let sep = ";";
+    #[cfg(not(windows))]
+    let sep = ":";
+
+    if perf == PerformanceMode::Efficient {
+        let cas_path = dir.join("00_light_cas.glsl");
+        let _ = std::fs::write(&cas_path, SHADER_LIGHT_CAS);
+        return Some(cas_path.to_string_lossy().into_owned());
+    }
+
     let deblock_path = dir.join("01_deblock_dering.glsl");
     let chroma_path = dir.join("02_chroma_guided.glsl");
-    let superres_path = dir.join("03_superres_4k_rcas.glsl");
-    let anime_path = dir.join("04_anime4k_restore.glsl");
-
     let _ = std::fs::write(&deblock_path, SHADER_DEBLOCK_DERING);
     let _ = std::fs::write(&chroma_path, SHADER_CHROMA_GUIDED);
 
@@ -244,6 +277,13 @@ pub fn prepare_video_shaders(mode: VideoShaderMode) -> Option<String> {
         deblock_path.to_string_lossy().into_owned(),
         chroma_path.to_string_lossy().into_owned(),
     ];
+
+    if perf == PerformanceMode::Balanced {
+        return Some(list.join(sep));
+    }
+
+    let superres_path = dir.join("03_superres_4k_rcas.glsl");
+    let anime_path = dir.join("04_anime4k_restore.glsl");
 
     match mode {
         VideoShaderMode::Off => unreachable!(),
@@ -267,52 +307,84 @@ pub fn prepare_video_shaders(mode: VideoShaderMode) -> Option<String> {
         }
     }
 
-    #[cfg(windows)]
-    let sep = ";";
-    #[cfg(not(windows))]
-    let sep = ":";
-
     Some(list.join(sep))
 }
 
-/// Generate adaptive mpv/libplacebo mastering flags complementing Reference 4K GLSL shaders.
-pub fn mpv_mastering_flags(
+/// Generate adaptive mpv/libplacebo mastering flags keyed to shader mode and `PerformanceMode`.
+pub fn mpv_mastering_flags_for(
     mode: VideoShaderMode,
     profile: VideoMasteringProfile,
+    perf: PerformanceMode,
 ) -> Vec<String> {
-    if mode == VideoShaderMode::Off {
-        return Vec::new();
+    match perf {
+        PerformanceMode::Efficient => {
+            let mut flags = vec![
+                "--scale=spline36".to_string(),
+                "--dscale=mitchell".to_string(),
+                "--cscale=bilinear".to_string(),
+                "--deband=no".to_string(),
+                "--temporal-dither=no".to_string(),
+                "--tone-mapping=spline".to_string(),
+                "--vd-lavc-fast=yes".to_string(),
+            ];
+            if mode == VideoShaderMode::Off {
+                flags.retain(|f| !f.starts_with("--deband"));
+            }
+            flags
+        }
+        PerformanceMode::Balanced => {
+            if mode == VideoShaderMode::Off {
+                return Vec::new();
+            }
+            vec![
+                "--scale=ewa_lanczos".to_string(),
+                "--dscale=mitchell".to_string(),
+                "--cscale=ewa_lanczos".to_string(),
+                "--deband=yes".to_string(),
+                "--deband-iterations=1".to_string(),
+                "--deband-threshold=42".to_string(),
+                "--deband-range=16".to_string(),
+                "--deband-grain=12".to_string(),
+                "--temporal-dither=no".to_string(),
+                "--tone-mapping=spline".to_string(),
+                "--hdr-compute-peak=yes".to_string(),
+                "--gamut-mapping-mode=clip".to_string(),
+            ]
+        }
+        PerformanceMode::Quality => {
+            if mode == VideoShaderMode::Off {
+                return Vec::new();
+            }
+            let deband_iters = if mode == VideoShaderMode::Balanced
+                && profile == VideoMasteringProfile::HighFrameRate
+            {
+                1
+            } else {
+                3
+            };
+            vec![
+                "--scale=ewa_lanczossharp".to_string(),
+                "--scale-antiring=0.7".to_string(),
+                "--dscale=mitchell".to_string(),
+                "--dscale-antiring=0.7".to_string(),
+                "--cscale=ewa_lanczossharp".to_string(),
+                "--cscale-antiring=0.7".to_string(),
+                "--correct-downscaling=yes".to_string(),
+                "--linear-downscaling=yes".to_string(),
+                "--sigmoid-upscaling=yes".to_string(),
+                "--deband=yes".to_string(),
+                format!("--deband-iterations={deband_iters}"),
+                "--deband-threshold=48".to_string(),
+                "--deband-range=24".to_string(),
+                "--deband-grain=16".to_string(),
+                "--dither-depth=auto".to_string(),
+                "--temporal-dither=yes".to_string(),
+                "--tone-mapping=spline".to_string(),
+                "--hdr-compute-peak=yes".to_string(),
+                "--gamut-mapping-mode=clip".to_string(),
+            ]
+        }
     }
-
-    let deband_iters = if mode == VideoShaderMode::Balanced
-        && profile == VideoMasteringProfile::HighFrameRate
-    {
-        1
-    } else {
-        3
-    };
-
-    vec![
-        "--scale=ewa_lanczossharp".to_string(),
-        "--scale-antiring=0.7".to_string(),
-        "--dscale=mitchell".to_string(),
-        "--dscale-antiring=0.7".to_string(),
-        "--cscale=ewa_lanczossharp".to_string(),
-        "--cscale-antiring=0.7".to_string(),
-        "--correct-downscaling=yes".to_string(),
-        "--linear-downscaling=yes".to_string(),
-        "--sigmoid-upscaling=yes".to_string(),
-        "--deband=yes".to_string(),
-        format!("--deband-iterations={deband_iters}"),
-        "--deband-threshold=48".to_string(),
-        "--deband-range=24".to_string(),
-        "--deband-grain=16".to_string(),
-        "--dither-depth=auto".to_string(),
-        "--temporal-dither=yes".to_string(),
-        "--tone-mapping=spline".to_string(),
-        "--hdr-compute-peak=yes".to_string(),
-        "--gamut-mapping-mode=clip".to_string(),
-    ]
 }
 
 #[cfg(test)]
@@ -321,23 +393,28 @@ mod tests {
 
     #[test]
     fn test_shader_modes_and_flags() {
-        assert!(prepare_video_shaders(VideoShaderMode::Off).is_none());
+        assert!(prepare_video_shaders_for(VideoShaderMode::Off, PerformanceMode::Quality).is_none());
 
-        let bal = prepare_video_shaders(VideoShaderMode::Balanced).expect("balanced shaders");
+        let bal = prepare_video_shaders_for(VideoShaderMode::Balanced, PerformanceMode::Quality)
+            .expect("balanced shaders");
         assert!(bal.contains("01_deblock_dering.glsl"));
         assert!(bal.contains("02_chroma_guided.glsl"));
         assert!(!bal.contains("03_superres_4k_rcas.glsl"));
 
-        let ref4k = prepare_video_shaders(VideoShaderMode::Reference4K).expect("ref4k shaders");
+        let ref4k = prepare_video_shaders_for(VideoShaderMode::Reference4K, PerformanceMode::Quality)
+            .expect("ref4k shaders");
         assert!(ref4k.contains("01_deblock_dering.glsl"));
         assert!(ref4k.contains("02_chroma_guided.glsl"));
         assert!(ref4k.contains("03_superres_4k_rcas.glsl"));
 
-        let neural = prepare_video_shaders(VideoShaderMode::NeuralCinema).expect("neural shaders");
+        let neural =
+            prepare_video_shaders_for(VideoShaderMode::NeuralCinema, PerformanceMode::Quality)
+                .expect("neural shaders");
         assert!(neural.contains("01_deblock_dering.glsl"));
         assert!(neural.contains("02_chroma_guided.glsl"));
 
-        let anime = prepare_video_shaders(VideoShaderMode::Anime4K).expect("anime shaders");
+        let anime = prepare_video_shaders_for(VideoShaderMode::Anime4K, PerformanceMode::Quality)
+            .expect("anime shaders");
         assert!(anime.contains("04_anime4k_restore.glsl"));
 
         assert!(SHADER_DEBLOCK_DERING.contains("//!HOOK LUMA"));
@@ -345,11 +422,24 @@ mod tests {
         assert!(SHADER_SUPERRES_4K_RCAS.contains("//!WIDTH HOOKED.w 2 *"));
         assert!(SHADER_ANIME4K_RESTORE.contains("//!HOOK LUMA"));
 
-        let flags =
-            mpv_mastering_flags(VideoShaderMode::Reference4K, VideoMasteringProfile::StandardHd);
+        let flags = mpv_mastering_flags_for(
+            VideoShaderMode::Reference4K,
+            VideoMasteringProfile::StandardHd,
+            PerformanceMode::Quality,
+        );
         assert!(flags.iter().any(|f| f == "--deband=yes"));
         assert!(flags.iter().any(|f| f == "--deband-iterations=3"));
         assert!(flags.iter().any(|f| f == "--tone-mapping=spline"));
         assert!(flags.iter().any(|f| f == "--scale-antiring=0.7"));
+
+        let eco_sh = prepare_video_shaders_for(VideoShaderMode::Reference4K, PerformanceMode::Efficient).unwrap();
+        assert!(eco_sh.contains("00_light_cas.glsl"));
+        assert!(!eco_sh.contains("03_superres_4k_rcas.glsl"));
+        let bal_sh = prepare_video_shaders_for(VideoShaderMode::Reference4K, PerformanceMode::Balanced).unwrap();
+        assert!(bal_sh.contains("01_deblock_dering.glsl"));
+        assert!(!bal_sh.contains("03_superres_4k_rcas.glsl"));
+        let eco_flags = mpv_mastering_flags_for(VideoShaderMode::Reference4K, VideoMasteringProfile::StandardHd, PerformanceMode::Efficient);
+        assert!(eco_flags.iter().any(|f| f == "--scale=spline36"));
+        assert!(eco_flags.iter().any(|f| f == "--deband=no"));
     }
 }

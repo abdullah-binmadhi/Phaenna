@@ -4,10 +4,10 @@
 
 use crate::api::player::LOUDNORM_FILTER;
 use crate::api::sponsorblock::{category_label, SponsorSegment};
-use crate::config::VideoShaderMode;
+use crate::config::{PerformanceMode, VideoShaderMode};
 use crate::db;
 use crate::messages::AppMessage;
-use crate::services::shaders::{prepare_video_shaders, VideoMasteringProfile};
+use crate::services::shaders::{prepare_video_shaders_for, VideoMasteringProfile};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -77,6 +77,18 @@ pub struct LiveMediaTrack {
 impl LiveMediaTrack {
     pub fn display_label(&self) -> String {
         let lang = self.lang.as_deref().unwrap_or("und");
+        let raw_title = self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
+        // Strip verbose YouTube prefix/suffix like "251-drc - audio only (English (US) original)"
+        let clean_title = if let Some(start) = raw_title.find("audio only (") {
+            let inner = &raw_title[start + "audio only (".len()..];
+            inner.trim_end_matches(')').trim()
+        } else {
+            raw_title
+        };
         let role = if self.kind == TrackKind::Audio {
             if self.is_dubbed {
                 " [DUB]"
@@ -88,14 +100,12 @@ impl LiveMediaTrack {
         } else {
             ""
         };
-        let extra = self
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| format!(" - {t}"))
-            .unwrap_or_default();
-        format!("[{}] {}{}{}", self.id, lang, role, extra)
+        let label = if clean_title.is_empty() {
+            lang.to_string()
+        } else {
+            clean_title.replace(" original", "").trim().to_string()
+        };
+        format!("[{}] {}{}", self.id, label, role)
     }
 }
 
@@ -116,6 +126,8 @@ pub enum LiveIpcEvent {
     Contrast(i64),
     Saturation(i64),
     Gamma(i64),
+    CacheBytes(u64),
+    DroppedFrames(i64),
     Tracks {
         audio: Vec<LiveMediaTrack>,
         sub: Vec<LiveMediaTrack>,
@@ -137,7 +149,8 @@ pub enum PlayerCommand {
     SetSubDelay(f64),
     SetAudioDelay(f64),
     SetLoudnorm(bool),
-    SetShaderMode(VideoShaderMode, VideoMasteringProfile),
+    SetShaderMode(VideoShaderMode, VideoMasteringProfile, PerformanceMode),
+    SetPerformanceMode(PerformanceMode, VideoShaderMode, VideoMasteringProfile),
     SetPictureProp { prop: &'static str, value: i64 },
     ResetPicture,
     SetOnTop(bool),
@@ -187,23 +200,69 @@ impl PlayerCommand {
                 let val = if *enabled { LOUDNORM_FILTER } else { "" };
                 vec![json!({"command": ["set_property", "af", val]}).to_string()]
             }
-            Self::SetShaderMode(mode, _profile) => {
+            Self::SetShaderMode(mode, _profile, perf) => {
                 let mut cmds = Vec::new();
-                if let Some(shaders) = prepare_video_shaders(*mode) {
+                if let Some(shaders) = prepare_video_shaders_for(*mode, *perf) {
                     cmds.push(
                         json!({"command": ["change-list", "glsl-shaders", "set", shaders]})
                             .to_string(),
                     );
-                    cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
-                    cmds.push(
-                        json!({"command": ["set_property", "tone-mapping", "spline"]}).to_string(),
-                    );
+                    if *perf != PerformanceMode::Efficient {
+                        cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
+                        cmds.push(
+                            json!({"command": ["set_property", "tone-mapping", "spline"]}).to_string(),
+                        );
+                    }
                 } else {
                     cmds.push(
                         json!({"command": ["change-list", "glsl-shaders", "clr", ""]})
                             .to_string(),
                     );
                     cmds.push(json!({"command": ["set_property", "deband", "no"]}).to_string());
+                }
+                cmds
+            }
+            Self::SetPerformanceMode(perf, shader, _profile) => {
+                let (max_b, back_b) = perf.demuxer_limits();
+                let mut cmds = vec![
+                    json!({"command": ["set_property", "demuxer-max-bytes", max_b]}).to_string(),
+                    json!({"command": ["set_property", "demuxer-max-back-bytes", back_b]}).to_string(),
+                ];
+                match perf {
+                    PerformanceMode::Efficient => {
+                        cmds.push(json!({"command": ["set_property", "scale", "spline36"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "cscale", "bilinear"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "deband", "no"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "temporal-dither", "no"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "vd-lavc-fast", "yes"]}).to_string());
+                    }
+                    PerformanceMode::Balanced => {
+                        cmds.push(json!({"command": ["set_property", "scale", "ewa_lanczos"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "cscale", "ewa_lanczos"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "deband-iterations", 1]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "temporal-dither", "no"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "vd-lavc-fast", "no"]}).to_string());
+                    }
+                    PerformanceMode::Quality => {
+                        cmds.push(json!({"command": ["set_property", "scale", "ewa_lanczossharp"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "cscale", "ewa_lanczossharp"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "deband-iterations", 3]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "temporal-dither", "yes"]}).to_string());
+                        cmds.push(json!({"command": ["set_property", "vd-lavc-fast", "no"]}).to_string());
+                    }
+                }
+                if let Some(shaders) = prepare_video_shaders_for(*shader, *perf) {
+                    cmds.push(
+                        json!({"command": ["change-list", "glsl-shaders", "set", shaders]})
+                            .to_string(),
+                    );
+                } else {
+                    cmds.push(
+                        json!({"command": ["change-list", "glsl-shaders", "clr", ""]})
+                            .to_string(),
+                    );
                 }
                 cmds
             }
@@ -315,8 +374,18 @@ pub fn parse_live_ipc_event(line: &str) -> Option<LiveIpcEvent> {
         "contrast" => Some(LiveIpcEvent::Contrast(data.as_f64()?.round() as i64)),
         "saturation" => Some(LiveIpcEvent::Saturation(data.as_f64()?.round() as i64)),
         "gamma" => Some(LiveIpcEvent::Gamma(data.as_f64()?.round() as i64)),
+        "frame-drop-count" => Some(LiveIpcEvent::DroppedFrames(data.as_i64()?)),
+        "demuxer-cache-state" => {
+            let bytes = data
+                .get("fw-bytes")
+                .or_else(|| data.get("total-bytes"))
+                .and_then(Value::as_u64)?;
+            Some(LiveIpcEvent::CacheBytes(bytes))
+        }
         "track-list" => {
-            let (audio, sub) = parse_track_list(data);
+            let (mut audio, sub) = parse_track_list(data);
+            // Put selected and Original tracks at the top ahead of secondary languages
+            audio.sort_by_key(|t| (!t.selected, !t.is_original, t.is_dubbed, t.id));
             Some(LiveIpcEvent::Tracks { audio, sub })
         }
         _ => None,
@@ -404,6 +473,8 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             (16, "saturation"),
             (17, "gamma"),
             (18, "track-list"),
+            (19, "demuxer-cache-state"),
+            (20, "frame-drop-count"),
         ];
         for (id, prop) in observe_props {
             let msg = format!("{{\"command\":[\"observe_property\",{id},\"{prop}\"]}}\n");
@@ -605,9 +676,22 @@ mod tests {
         let shader_cmds = PlayerCommand::SetShaderMode(
             VideoShaderMode::Off,
             VideoMasteringProfile::StandardHd,
+            PerformanceMode::Balanced,
         )
         .to_mpv_json_commands();
         assert!(shader_cmds[0].contains("\"clr\""));
+
+        let eco_cmds = PlayerCommand::SetPerformanceMode(
+            PerformanceMode::Efficient,
+            VideoShaderMode::Reference4K,
+            VideoMasteringProfile::StandardHd,
+        )
+        .to_mpv_json_commands();
+        assert!(eco_cmds.iter().any(|c| c.contains("\"48MiB\"")));
+        assert!(eco_cmds.iter().any(|c| c.contains("00_light_cas.glsl")));
+
+        let cache_line = r#"{"event":"property-change","id":19,"name":"demuxer-cache-state","data":{"fw-bytes":52428800}}"#;
+        assert!(matches!(parse_live_ipc_event(cache_line), Some(LiveIpcEvent::CacheBytes(52428800))));
 
         assert!(!is_completion_threshold_reached(40.0, 45.0));
         assert!(!is_completion_threshold_reached(80.0, 100.0));

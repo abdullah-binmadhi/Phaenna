@@ -551,6 +551,77 @@ fn default_theme_index() -> usize {
     2 // Phaenna
 }
 
+/// Resource / GPU mastering trade-off preset (`Efficient`, `Balanced`, `Quality`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceMode {
+    Efficient,
+    #[default]
+    Balanced,
+    Quality,
+}
+
+#[allow(dead_code)]
+impl PerformanceMode {
+    pub const ALL: [Self; 3] = [Self::Efficient, Self::Balanced, Self::Quality];
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Efficient => Self::Balanced,
+            Self::Balanced => Self::Quality,
+            Self::Quality => Self::Efficient,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Efficient => "Efficient",
+            Self::Balanced => "Balanced",
+            Self::Quality => "Quality",
+        }
+    }
+
+    pub const fn short_badge(self) -> &'static str {
+        match self {
+            Self::Efficient => "ECO",
+            Self::Balanced => "BAL",
+            Self::Quality => "MAX",
+        }
+    }
+
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::Efficient => "~350MB RAM | 48M buf | Light Luma CAS",
+            Self::Balanced => "~650MB RAM | 160M buf | Deblock + 4:4:4",
+            Self::Quality => "~1.4GB RAM | 512M buf | Full 4K 2x Master",
+        }
+    }
+
+    pub const fn demuxer_limits(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Efficient => ("48MiB", "16MiB"),
+            Self::Balanced => ("160MiB", "48MiB"),
+            Self::Quality => ("512MiB", "128MiB"),
+        }
+    }
+
+    pub const fn demuxer_max_bytes_num(self) -> u64 {
+        match self {
+            Self::Efficient => 48 * 1024 * 1024,
+            Self::Balanced => 160 * 1024 * 1024,
+            Self::Quality => 512 * 1024 * 1024,
+        }
+    }
+
+    pub const fn loads_multistreams(self, config_multi: bool) -> bool {
+        match self {
+            Self::Efficient => false,
+            Self::Balanced | Self::Quality => config_multi,
+        }
+    }
+}
+
+/// Persistent application configuration for Phaenna (`config.toml`).
 /// Root user configuration persisted to `<config_dir>/config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -576,6 +647,8 @@ pub struct Config {
     pub skip_outro: bool,
     #[serde(default)]
     pub shader_mode: VideoShaderMode,
+    #[serde(default)]
+    pub performance_mode: PerformanceMode,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
     #[serde(default = "default_theme_index")]
@@ -612,6 +685,7 @@ impl Default for Config {
             sponsorblock_mode: SponsorBlockMode::default(),
             skip_outro: false,
             shader_mode: VideoShaderMode::default(),
+            performance_mode: PerformanceMode::default(),
             ambilight_enabled: true,
             theme_index: default_theme_index(),
             google_oauth: GoogleOAuthConfig::default(),
@@ -761,6 +835,11 @@ mod tests {
         assert!(sb2.auto_skips_category("sponsor"));
         assert!(!sb2.auto_skips_category("intro"));
         assert!(!SponsorBlockMode::Off.auto_skips_category("sponsor"));
+
+        assert_eq!(PerformanceMode::Balanced.short_badge(), "BAL");
+        assert_eq!(PerformanceMode::Efficient.demuxer_limits(), ("48MiB", "16MiB"));
+        assert!(!PerformanceMode::Efficient.loads_multistreams(true));
+        assert!(PerformanceMode::Quality.loads_multistreams(true));
     }
 
     #[test]

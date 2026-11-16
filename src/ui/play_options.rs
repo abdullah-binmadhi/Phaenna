@@ -3,7 +3,9 @@
 //! Live mpv Audio/Sub Tracks, Loudnorm, Timing Offsets, 4K Shaders (`s`),
 //! Speed, Volume, Picture Tuning, and Safe Outro SponsorBlock settings.
 
-use crate::config::{dub_lang_label, Player, Quality, SponsorBlockMode, VideoShaderMode};
+use crate::config::{
+    dub_lang_label, PerformanceMode, Player, Quality, SponsorBlockMode, VideoShaderMode,
+};
 use crate::state::{
     active_modal_rect, centered_rect, ActiveOverlay, AppState, NowPlayingHit, PlayOptionsHit,
 };
@@ -64,9 +66,15 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
             .map(|v| v.title)
             .unwrap_or_else(|| "Selected Video".to_string())
     };
-    let title_budget = area.width.saturating_sub(36).max(16) as usize;
+    let title_budget = area.width.saturating_sub(54).max(14) as usize;
     let display_title = marquee_window(&video_title, title_budget, state.ticker_step);
     let badge_text = if live { " [LIVE mpv IPC] " } else { " [PRE-LAUNCH] " };
+    let mode_badge = format!(" [MODE: {}] ", state.config.performance_mode.label().to_uppercase());
+    let mode_bg = match state.config.performance_mode {
+        PerformanceMode::Efficient => Color::Rgb(52, 211, 153),
+        PerformanceMode::Balanced => Color::Rgb(56, 189, 248),
+        PerformanceMode::Quality => Color::Rgb(251, 191, 36),
+    };
 
     let outer = Block::default()
         .title(Line::from(vec![
@@ -82,6 +90,13 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
                 Style::default()
                     .fg(Color::Black)
                     .bg(if live { Color::Rgb(52, 211, 153) } else { theme.secondary })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                mode_badge,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(mode_bg)
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -133,6 +148,8 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
             Span::styled("[Up/Down] Select ", Style::default().fg(theme.secondary)),
             Span::styled("· ", Style::default().fg(theme.divider)),
             Span::styled("[d] Dub ON/OFF ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("· ", Style::default().fg(theme.divider)),
+            Span::styled("[m] Mode ", Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD)),
             Span::styled("· ", Style::default().fg(theme.divider)),
             Span::styled("[Space] Pause/Play ", Style::default().fg(theme.text)),
             Span::styled("· ", Style::default().fg(theme.divider)),
@@ -439,11 +456,16 @@ fn render_audio_dub_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
         hits.push((Rect::new(mid, inner.y + r4, inner.x + inner.width - mid, 1), PlayOptionsHit::AudioDelayDelta(50)));
     }
 
+    let total_tracks = state.live_playback.audio_tracks.len();
     lines.push(Line::from(Span::styled(
-        " Live Audio Tracks (mpv):",
+        if total_tracks > 0 {
+            format!(" Live Audio Tracks ({total_tracks}):")
+        } else {
+            " Live Audio Tracks (mpv):".to_string()
+        },
         Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
     )));
-    if state.live_playback.audio_tracks.is_empty() {
+    if total_tracks == 0 {
         lines.push(Line::from(Span::styled(
             if live {
                 "  (single audio stream loaded)"
@@ -453,7 +475,10 @@ fn render_audio_dub_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Style::default().fg(theme.text_dim),
         )));
     } else {
-        for tr in state.live_playback.audio_tracks.clone() {
+        let max_rows = (inner.height as usize).saturating_sub(lines.len());
+        let reserve_more = usize::from(total_tracks > max_rows && max_rows > 1);
+        let visible_cap = max_rows.saturating_sub(reserve_more).max(1);
+        for tr in state.live_playback.audio_tracks.iter().take(visible_cap).cloned() {
             let active = state.live_playback.active_aid == Some(tr.id) || tr.selected;
             let row = lines.len() as u16;
             let st = if active {
@@ -461,11 +486,23 @@ fn render_audio_dub_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
             } else {
                 Style::default().fg(theme.text)
             };
+            let max_lbl = inner.width.saturating_sub(4) as usize;
+            let mut lbl = tr.display_label();
+            if lbl.chars().count() > max_lbl {
+                lbl = format!("{}...", lbl.chars().take(max_lbl.saturating_sub(3)).collect::<String>());
+            }
             lines.push(Line::from(Span::styled(
-                format!(" {} {}", if active { ">" } else { " " }, tr.display_label()),
+                format!(" {} {}", if active { ">" } else { " " }, lbl),
                 st,
             )));
             push_line_hit(hits, inner, row, PlayOptionsHit::SelectAudioTrack(tr.id));
+        }
+        if total_tracks > visible_cap {
+            let hidden = total_tracks - visible_cap;
+            lines.push(Line::from(Span::styled(
+                format!("  +{hidden} other language tracks available"),
+                Style::default().fg(theme.text_dim),
+            )));
         }
     }
     push_panel_hit(hits, area, 1);
@@ -618,11 +655,11 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     let theme = state.base_theme();
     let focused = state.play_modal_section == 4;
     let live = state.has_live_ipc();
-    let blk = section_block(" 5. Speed, Volume & Picture Controls ", focused, theme);
+    let blk = section_block(" 5. Performance Mode, Transport & Picture ", focused, theme);
     let inner = blk.inner(area);
     let hits = &mut state.live_playback.play_hitboxes;
 
-    if inner.width < 20 || inner.height < 5 {
+    if inner.width < 20 || inner.height < 6 {
         frame.render_widget(blk, area);
         return;
     }
@@ -631,15 +668,73 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
+            Constraint::Length(1), // 0: PerformanceMode selector pills
+            Constraint::Length(1), // 1: Mode spec & live RAM cache/drops telemetry
+            Constraint::Length(1), // 2: Speed
+            Constraint::Length(1), // 3: Volume
+            Constraint::Length(1), // 4: Picture
+            Constraint::Min(1),    // 5: Window/Session
         ])
         .split(inner);
 
-    // Row 0: Speed presets
+    // Row 0: Performance Mode Selector [ECO | BALANCED | QUALITY]
+    let mode_rects = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(11),
+            Constraint::Length(12),
+            Constraint::Length(11),
+            Constraint::Length(10),
+            Constraint::Min(0),
+        ])
+        .split(rows[0]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Mode [m]:",
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+        )),
+        mode_rects[0],
+    );
+    for (idx, pm) in PerformanceMode::ALL.iter().enumerate() {
+        let active = *pm == state.config.performance_mode;
+        let bg_col = match pm {
+            PerformanceMode::Efficient => Color::Rgb(52, 211, 153),
+            PerformanceMode::Balanced => Color::Rgb(56, 189, 248),
+            PerformanceMode::Quality => Color::Rgb(251, 191, 36),
+        };
+        let label = format!(" {} ", pm.label());
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                label,
+                if active {
+                    Style::default().fg(Color::Black).bg(bg_col).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text_dim)
+                },
+            )),
+            mode_rects[idx + 1],
+        );
+        hits.push((mode_rects[idx + 1], PlayOptionsHit::SetPerformanceMode(*pm)));
+    }
+
+    // Row 1: Mode Summary + Live Cache/Drops Telemetry
+    let cache_mb = state.live_playback.cache_bytes / (1024 * 1024);
+    let max_mb = state.config.performance_mode.demuxer_max_bytes_num() / (1024 * 1024);
+    let info_line = if live {
+        format!(
+            " {} | Buf: {cache_mb}/{max_mb}MB | Drops: {}",
+            state.config.performance_mode.summary(),
+            state.live_playback.dropped_frames
+        )
+    } else {
+        format!(" {}", state.config.performance_mode.summary())
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(info_line, Style::default().fg(theme.text_dim))),
+        rows[1],
+    );
+
+    // Row 2: Speed presets
     let speeds = [0.75_f64, 1.0, 1.25, 1.5, 2.0];
     let mut spd_cols = vec![Constraint::Length(8)];
     spd_cols.extend(std::iter::repeat_n(Constraint::Length(7), speeds.len()));
@@ -647,7 +742,7 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     let sp_rects = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(spd_cols)
-        .split(rows[0]);
+        .split(rows[2]);
     frame.render_widget(Paragraph::new(Span::styled(" Speed:", Style::default().fg(theme.text_dim))), sp_rects[0]);
     for (idx, spd) in speeds.iter().enumerate() {
         let active = (state.live_playback.speed - *spd).abs() < 0.04;
@@ -666,7 +761,7 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
         hits.push((sp_rects[idx + 1], PlayOptionsHit::SetSpeed(*spd)));
     }
 
-    // Row 1: Volume slider & Mute
+    // Row 3: Volume slider & Mute
     let vol_rects = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -676,7 +771,7 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
             Constraint::Length(5),
             Constraint::Length(9),
         ])
-        .split(rows[1]);
+        .split(rows[3]);
     frame.render_widget(Paragraph::new(Span::styled(" Vol  :", Style::default().fg(theme.text_dim))), vol_rects[0]);
     frame.render_widget(Paragraph::new(Span::styled(" [-] ", Style::default().fg(theme.secondary))), vol_rects[1]);
     frame.render_widget(
@@ -702,7 +797,7 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     hits.push((vol_rects[3], PlayOptionsHit::VolumeDelta(5)));
     hits.push((vol_rects[4], PlayOptionsHit::ToggleMute));
 
-    // Row 2 & 3: Picture Tuner
+    // Row 4: Picture Tuner
     let pic_rects = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -712,7 +807,7 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
             Constraint::Percentage(20),
             Constraint::Percentage(14),
         ])
-        .split(rows[2]);
+        .split(rows[4]);
     let pic_items: [(&str, &str, i64); 4] = [
         ("Bri", "brightness", state.live_playback.brightness),
         ("Con", "contrast", state.live_playback.contrast),
@@ -732,7 +827,7 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     );
     hits.push((pic_rects[4], PlayOptionsHit::ResetPicture));
 
-    // Row 3: Window & Session Buttons
+    // Row 5: Window & Session Buttons
     let win_rects = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -741,7 +836,7 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
             Constraint::Percentage(30),
             Constraint::Percentage(23),
         ])
-        .split(rows[3]);
+        .split(rows[5]);
     frame.render_widget(
         Paragraph::new(Span::styled(
             if state.live_playback.ontop { " [OnTop:ON]" } else { " [OnTop]" },
@@ -830,6 +925,12 @@ pub fn render_now_playing_bar(frame: &mut Frame, area: Rect, state: &mut AppStat
         ("[-]".to_string(), Style::default().fg(theme.secondary).bg(bg), Some(NowPlayingHit::VolumeDelta(-5))),
         (vol_lbl, Style::default().fg(theme.text).bg(bg), Some(NowPlayingHit::ToggleMute)),
         ("[+] ".to_string(), Style::default().fg(theme.secondary).bg(bg), Some(NowPlayingHit::VolumeDelta(5))),
+        (
+            format!("[{}]", state.config.performance_mode.short_badge()),
+            Style::default().fg(Color::Rgb(56, 189, 248)).bg(bg).add_modifier(Modifier::BOLD),
+            Some(NowPlayingHit::CyclePerfMode),
+        ),
+        (" ".to_string(), Style::default().bg(bg), None),
         (shader_lbl, Style::default().fg(theme.primary).bg(bg), Some(NowPlayingHit::CycleShader)),
         (" [Studio(p)]".to_string(), Style::default().fg(theme.accent).bg(bg).add_modifier(Modifier::BOLD), Some(NowPlayingHit::OpenStudio)),
         (" [Stop] ".to_string(), Style::default().fg(Color::Rgb(239, 68, 68)).bg(bg).add_modifier(Modifier::BOLD), Some(NowPlayingHit::StopPlayer)),
@@ -927,6 +1028,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(all_text.contains("[LIVE mpv IPC]"));
+        assert!(all_text.contains("[MODE: BALANCED]"));
+        assert!(all_text.contains("Efficient"));
         assert!(all_text.contains("DUB: ON (EN)"));
         assert!(all_text.contains("[DUB]"));
     }

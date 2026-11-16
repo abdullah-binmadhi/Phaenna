@@ -5,7 +5,7 @@ use crate::api::innertube::VideoComment;
 use crate::api::player::{detect_dependencies, DependencyStatus};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
-use crate::config::{Config, Player, Quality, SponsorBlockMode, VideoShaderMode};
+use crate::config::{Config, PerformanceMode, Player, Quality, SponsorBlockMode, VideoShaderMode};
 use crate::db::cache::VideoItem;
 use crate::db::sync::{
     HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED, SUBSCRIPTIONS, WATCH_LATER,
@@ -550,6 +550,8 @@ impl AppState {
             LiveIpcEvent::Contrast(v) => self.live_playback.contrast = v,
             LiveIpcEvent::Saturation(v) => self.live_playback.saturation = v,
             LiveIpcEvent::Gamma(v) => self.live_playback.gamma = v,
+            LiveIpcEvent::CacheBytes(b) => self.live_playback.cache_bytes = b,
+            LiveIpcEvent::DroppedFrames(d) => self.live_playback.dropped_frames = d,
             LiveIpcEvent::Tracks { audio, sub } => {
                 if let Some(sel) = audio.iter().find(|t| t.selected) {
                     self.live_playback.active_aid = Some(sel.id);
@@ -892,6 +894,7 @@ pub enum PlayOptionsHit {
     SelectSponsorBlock(SponsorBlockMode),
     ToggleSkipOutro,
     SelectShader(VideoShaderMode),
+    SetPerformanceMode(PerformanceMode),
     TogglePause,
     SeekDelta(f64),
     SeekRatio(f64),
@@ -917,6 +920,7 @@ pub enum NowPlayingHit {
     VolumeDelta(i64),
     ToggleMute,
     CycleShader,
+    CyclePerfMode,
     OpenStudio,
     StopPlayer,
 }
@@ -938,6 +942,8 @@ pub struct LivePlaybackControlState {
     pub contrast: i64,
     pub saturation: i64,
     pub gamma: i64,
+    pub cache_bytes: u64,
+    pub dropped_frames: i64,
     pub audio_tracks: Vec<LiveMediaTrack>,
     pub sub_tracks: Vec<LiveMediaTrack>,
     pub cmd_tx: Option<UnboundedSender<PlayerCommand>>,
@@ -963,6 +969,8 @@ impl Default for LivePlaybackControlState {
             contrast: 0,
             saturation: 0,
             gamma: 0,
+            cache_bytes: 0,
+            dropped_frames: 0,
             audio_tracks: Vec::new(),
             sub_tracks: Vec::new(),
             cmd_tx: None,

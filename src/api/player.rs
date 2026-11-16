@@ -1,8 +1,10 @@
 //! Cross-platform binary detector & non-blocking external video player launcher.
 
-use crate::config::{DubPreference, Player, VideoShaderMode};
+use crate::config::{DubPreference, PerformanceMode, Player, VideoShaderMode};
 use crate::error::{AppError, Result};
-use crate::services::shaders::{mpv_mastering_flags, prepare_video_shaders, VideoMasteringProfile};
+use crate::services::shaders::{
+    mpv_mastering_flags_for, prepare_video_shaders_for, VideoMasteringProfile,
+};
 use crate::services::substyler::SubtitleStyleConfig;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -122,6 +124,7 @@ pub struct PlayOptions {
     pub sub_style: SubtitleStyleConfig,
     pub shader_mode: VideoShaderMode,
     pub mastering_profile: VideoMasteringProfile,
+    pub performance_mode: PerformanceMode,
     pub dub_preference: DubPreference,
     pub dub_lang: String,
     pub audio_multistreams: bool,
@@ -136,13 +139,14 @@ pub fn youtube_watch_url(video_id: &str) -> String {
 }
 
 fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
+    let (max_buf, back_buf) = opts.performance_mode.demuxer_limits();
     let mut flags = vec![
         "hwdec=auto-safe".to_string(),
         "vo=gpu-next".to_string(),
         "gpu-api=auto".to_string(),
         "cache=yes".to_string(),
-        "demuxer-max-bytes=512MiB".to_string(),
-        "demuxer-max-back-bytes=128MiB".to_string(),
+        format!("demuxer-max-bytes={max_buf}"),
+        format!("demuxer-max-back-bytes={back_buf}"),
         format!("force-media-title={}", opts.title),
     ];
 
@@ -152,7 +156,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             "ytdl-raw-options-append=format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr"
                 .to_string(),
         );
-        if opts.audio_multistreams {
+        if opts.performance_mode.loads_multistreams(opts.audio_multistreams) {
             flags.push("ytdl-raw-options-append=audio-multistreams=".to_string());
         }
         if let Some(ref cpath) = opts.cookies_path {
@@ -200,11 +204,11 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         }
     }
 
-    if let Some(shaders) = prepare_video_shaders(opts.shader_mode) {
+    if let Some(shaders) = prepare_video_shaders_for(opts.shader_mode, opts.performance_mode) {
         flags.push(format!("glsl-shaders={}", shaders));
-        for flag in mpv_mastering_flags(opts.shader_mode, opts.mastering_profile) {
-            flags.push(flag.trim_start_matches("--").to_string());
-        }
+    }
+    for flag in mpv_mastering_flags_for(opts.shader_mode, opts.mastering_profile, opts.performance_mode) {
+        flags.push(flag.trim_start_matches("--").to_string());
     }
 
     flags
@@ -364,6 +368,7 @@ mod tests {
             sub_style: SubtitleStyleConfig::default(),
             shader_mode: VideoShaderMode::Balanced,
             mastering_profile: VideoMasteringProfile::StandardHd,
+            performance_mode: PerformanceMode::Quality,
             dub_preference: DubPreference::OriginalOnly,
             dub_lang: "en".to_string(),
             audio_multistreams: true,
@@ -380,6 +385,13 @@ mod tests {
         assert!(args.iter().any(|a| a == "--alang=und,orig,en"));
         assert!(args.iter().any(|a| a.starts_with("--af=lavfi=")));
         assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
+
+        let mut eco_opts = opts.clone();
+        eco_opts.performance_mode = PerformanceMode::Efficient;
+        let eco_args = build_mpv_args(&eco_opts);
+        assert!(eco_args.iter().any(|a| a == "--demuxer-max-bytes=48MiB"));
+        assert!(!eco_args.iter().any(|a| a.contains("audio-multistreams")));
+        assert!(eco_args.iter().any(|a| a == "--scale=spline36"));
     }
 
     #[test]
@@ -399,6 +411,7 @@ mod tests {
             sub_style: SubtitleStyleConfig::default(),
             shader_mode: VideoShaderMode::Reference4K,
             mastering_profile: VideoMasteringProfile::StandardHd,
+            performance_mode: PerformanceMode::Quality,
             dub_preference: DubPreference::PreferDubbed,
             dub_lang: "ar".to_string(),
             audio_multistreams: true,

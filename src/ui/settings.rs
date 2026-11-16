@@ -17,6 +17,7 @@ pub enum HubActionId {
     PlayerBackend,
     SponsorBlockMode,
     VideoShaders,
+    PerformanceMode,
     InstallNeuralShaders,
     SubtitlesEnabled,
     SubtitlePreset,
@@ -76,6 +77,14 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             keywords: "shader glsl sharpen rcas upscale 4k deblock chroma quality video",
             badge: format!("[ {} ▾ ]", cfg.shader_mode.label()),
             description: "Cycle Reference 4K Studio (bilateral deblock + 4:4:4 chroma + 2x RCAS), Neural Cinema, or Anime4K.",
+        },
+        HubItem {
+            id: HubActionId::PerformanceMode,
+            category: "VIDEO & SUBTITLE MASTERING",
+            label: "Playback Performance Mode (RAM / GPU)",
+            keywords: "performance efficient balanced quality eco ram memory cache battery",
+            badge: format!("[ {} · {} ▾ ]", cfg.performance_mode.label(), cfg.performance_mode.short_badge()),
+            description: "Switch Efficient (~350MB RAM), Balanced (~650MB RAM), or Quality (~1.4GB RAM 4K Master).",
         },
         HubItem {
             id: HubActionId::InstallNeuralShaders,

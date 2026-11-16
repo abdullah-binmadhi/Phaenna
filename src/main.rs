@@ -26,7 +26,7 @@ use crate::api::ytdlp::{
     fetch_channel_videos, fetch_feed_range, fetch_feed_range_stream, fetch_video_details,
     search_youtube,
 };
-use crate::config::{next_dub_lang, Config, Player, Quality, VideoShaderMode};
+use crate::config::{next_dub_lang, Config, PerformanceMode, Player, Quality, VideoShaderMode};
 use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
     batch_upsert_feed, enrich_video_stats, get_all_cached_videos, get_feed_videos, get_thumb_blob,
@@ -2023,7 +2023,7 @@ async fn start_nonblocking_playback(
     let ytdl_format = quality.ytdl_format_with_dub(
         state.config.dub_preference,
         &state.config.dub_lang,
-        state.config.audio_multistreams,
+        state.config.performance_mode.loads_multistreams(state.config.audio_multistreams),
     );
     let opts = PlayOptions {
         video_id: video.id.clone(),
@@ -2044,6 +2044,7 @@ async fn start_nonblocking_playback(
         sub_style: state.config.subtitle_style.clone(),
         shader_mode: state.config.shader_mode,
         mastering_profile: VideoMasteringProfile::from_metadata(video.duration, &video.title),
+        performance_mode: state.config.performance_mode,
         dub_preference: state.config.dub_preference,
         dub_lang: state.config.dub_lang.clone(),
         audio_multistreams: state.config.audio_multistreams,
@@ -2540,8 +2541,12 @@ async fn execute_hub_action(
             let _ = state.config.save();
         }
         HubActionId::VideoShaders => {
-            state.config.shader_mode = state.config.shader_mode.next();
-            let _ = state.config.save();
+            let next = state.config.shader_mode.next();
+            apply_shader_mode(state, next);
+        }
+        HubActionId::PerformanceMode => {
+            let next = state.config.performance_mode.next();
+            apply_performance_mode(state, next);
         }
         HubActionId::InstallNeuralShaders => {
             state.show_toast("Downloading FSRCNNX 4K neural CNN shader pack...");
@@ -2691,10 +2696,33 @@ fn apply_shader_mode(state: &mut AppState, mode: VideoShaderMode) {
             .active_selected_video()
             .map(|v| VideoMasteringProfile::from_metadata(v.duration, &v.title))
             .unwrap_or(VideoMasteringProfile::StandardHd);
-        state.send_player_cmd(PlayerCommand::SetShaderMode(mode, prof));
+        state.send_player_cmd(PlayerCommand::SetShaderMode(
+            mode,
+            prof,
+            state.config.performance_mode,
+        ));
         state.show_toast(format!("Live 4K Shader: {}", mode.short_label()));
     } else {
         state.show_toast(format!("4K Shader: {}", mode.short_label()));
+    }
+}
+
+fn apply_performance_mode(state: &mut AppState, mode: PerformanceMode) {
+    state.config.performance_mode = mode;
+    let _ = state.config.save();
+    if state.has_live_ipc() {
+        let prof = state
+            .active_selected_video()
+            .map(|v| VideoMasteringProfile::from_metadata(v.duration, &v.title))
+            .unwrap_or(VideoMasteringProfile::StandardHd);
+        state.send_player_cmd(PlayerCommand::SetPerformanceMode(
+            mode,
+            state.config.shader_mode,
+            prof,
+        ));
+        state.show_toast(format!("Live Mode: {} ({})", mode.label(), mode.summary()));
+    } else {
+        state.show_toast(format!("Performance Mode: {} ({})", mode.label(), mode.summary()));
     }
 }
 
@@ -2798,6 +2826,9 @@ async fn apply_play_options_hit(
         }
         PlayOptionsHit::SelectShader(mode) => {
             apply_shader_mode(state, mode);
+        }
+        PlayOptionsHit::SetPerformanceMode(mode) => {
+            apply_performance_mode(state, mode);
         }
         PlayOptionsHit::TogglePause => {
             state.live_playback.paused = !state.live_playback.paused;
@@ -2923,6 +2954,10 @@ async fn apply_now_playing_hit(
         NowPlayingHit::CycleShader => {
             let next = state.config.shader_mode.next();
             apply_shader_mode(state, next);
+        }
+        NowPlayingHit::CyclePerfMode => {
+            let next = state.config.performance_mode.next();
+            apply_performance_mode(state, next);
         }
         NowPlayingHit::OpenStudio => {
             state.overlay = ActiveOverlay::PlayOptions;
@@ -3918,6 +3953,10 @@ async fn handle_overlay_key(
             KeyCode::Char('s') => {
                 let next = state.config.shader_mode.next();
                 apply_shader_mode(state, next);
+            }
+            KeyCode::Char('m') => {
+                let next = state.config.performance_mode.next();
+                apply_performance_mode(state, next);
             }
             KeyCode::Char(' ') => {
                 if state.has_live_ipc() {
