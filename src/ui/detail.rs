@@ -820,7 +820,7 @@ fn render_comments_panel(
     let title = if state.detail_comment_composing {
         format!(" Comments ({total}) [WRITING · Enter Post · Esc Cancel] ")
     } else if focused {
-        format!(" Comments ({total}) [Focused · j/k · m Write] ")
+        format!(" Comments ({total}) [Focused · j/k · Enter/r Replies · m Write] ")
     } else {
         format!(" Comments ({total}) [Tab / m Write] ")
     };
@@ -985,10 +985,12 @@ fn render_comments_panel(
                 Style::default().fg(pal.accent).bg(header_bg),
             ));
         }
-        if c.reply_count > 0 {
+        if c.reply_count > 0 || !c.replies.is_empty() || c.replies_continuation.is_some() {
+            let shown_cnt = c.reply_count.max(c.replies.len() as u32);
+            let toggle = if c.replies_expanded { "[-]" } else { "[+]" };
             hdr_spans.push(Span::styled(
-                format!(" · {} replies", c.reply_count),
-                Style::default().fg(pal.text_dim).bg(header_bg),
+                format!(" · {shown_cnt} replies {toggle}"),
+                Style::default().fg(pal.secondary).bg(header_bg),
             ));
         }
         if c.is_self {
@@ -1022,6 +1024,73 @@ fn render_comments_panel(
             ]));
         }
 
+        if c.replies_expanded {
+            let reply_w = body_w.saturating_sub(4).max(12);
+            if c.replies_loading && c.replies.is_empty() {
+                all_lines.push(Line::from(vec![
+                    Span::styled("   |- ", Style::default().fg(pal.accent)),
+                    Span::styled(
+                        "Loading reply thread...",
+                        Style::default().fg(pal.text_dim),
+                    ),
+                ]));
+            } else if c.replies.is_empty() {
+                all_lines.push(Line::from(vec![
+                    Span::styled("   |- ", Style::default().fg(pal.divider)),
+                    Span::styled(
+                        "No replies returned for this thread.",
+                        Style::default().fg(pal.text_dim),
+                    ),
+                ]));
+            } else {
+                for r in &c.replies {
+                    let mut r_hdr = vec![
+                        Span::styled("   |- ", Style::default().fg(pal.accent)),
+                        Span::styled(
+                            r.author.clone(),
+                            Style::default()
+                                .fg(if r.is_self { Color::Cyan } else { pal.secondary })
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    if !r.published_text.is_empty() {
+                        r_hdr.push(Span::styled(
+                            format!(" · {}", r.published_text),
+                            Style::default().fg(pal.text_dim),
+                        ));
+                    }
+                    if !r.like_count_text.is_empty() && r.like_count_text != "0" {
+                        r_hdr.push(Span::styled(
+                            format!(" · {} likes", r.like_count_text),
+                            Style::default().fg(pal.accent),
+                        ));
+                    }
+                    all_lines.push(Line::from(r_hdr));
+
+                    for rw in wrap_words(&r.text, reply_w) {
+                        all_lines.push(Line::from(vec![
+                            Span::styled("   |  ", Style::default().fg(pal.divider)),
+                            Span::styled(rw, Style::default().fg(Color::Rgb(195, 204, 218))),
+                        ]));
+                    }
+                }
+                if c.replies_loading {
+                    all_lines.push(Line::from(vec![
+                        Span::styled("   |- ", Style::default().fg(pal.accent)),
+                        Span::styled("Loading more replies...", Style::default().fg(pal.text_dim)),
+                    ]));
+                } else if c.replies_continuation.is_some() {
+                    all_lines.push(Line::from(vec![
+                        Span::styled("   |- ", Style::default().fg(pal.accent)),
+                        Span::styled(
+                            "Press [n] to load more replies",
+                            Style::default().fg(pal.text_dim),
+                        ),
+                    ]));
+                }
+            }
+        }
+
         all_lines.push(Line::from(Span::styled(
             "  ".to_string() + &"─".repeat(body_w.min(44)),
             Style::default().fg(pal.divider),
@@ -1046,7 +1115,7 @@ fn render_comments_panel(
 fn render_footer_legend(frame: &mut Frame, area: Rect, state: &AppState, pal: &ThemePalette) {
     let enter_hint = match state.detail_focus_pane {
         1 => "[Enter] Play Chapter",
-        2 => "[m/Enter] Write Comment",
+        2 => "[Enter/r] Replies · [m] Comment",
         _ => "[Enter/Space] Play Video",
     };
     frame.render_widget(
@@ -1116,6 +1185,16 @@ mod tests {
             reply_count: 1,
             is_pinned: true,
             is_self: false,
+            replies_expanded: true,
+            replies: vec![VideoComment {
+                id: "rep1".to_string(),
+                author: "@reply_author".to_string(),
+                published_text: "20m ago".to_string(),
+                text: "Here is a nested reply in the thread.".to_string(),
+                like_count_text: "5".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
         }];
 
         for (w, h) in [(140u16, 40u16), (96, 30)] {
@@ -1128,6 +1207,7 @@ mod tests {
             assert!(text.contains("Chapters (4)"), "Expected 4 parsed chapters in left column");
             assert!(text.contains("Comments (1)"), "Expected Comments panel");
             assert!(text.contains("@viewer_one"), "Expected author inside Comments panel");
+            assert!(text.contains("@reply_author"), "Expected nested reply author inside expanded thread");
             assert!(!text.contains("concatenationissues"), "Words must never concatenate");
             assert!(text.contains("27.5K views"), "Expected view count in detail telemetry");
         }

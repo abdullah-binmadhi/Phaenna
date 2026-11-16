@@ -750,6 +750,14 @@ pub struct VideoComment {
     pub reply_count: u32,
     pub is_pinned: bool,
     pub is_self: bool,
+    #[serde(default)]
+    pub replies_continuation: Option<String>,
+    #[serde(default)]
+    pub replies: Vec<VideoComment>,
+    #[serde(default)]
+    pub replies_expanded: bool,
+    #[serde(default)]
+    pub replies_loading: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -880,49 +888,132 @@ fn parse_reply_count_val(val: Option<&serde_json::Value>) -> u32 {
     }
 }
 
+fn extract_reply_continuation_from_replies_node(replies_node: &serde_json::Value) -> Option<String> {
+    let crr = replies_node.get("commentRepliesRenderer").unwrap_or(replies_node);
+    if let Some(contents) = crr.get("contents").and_then(|v| v.as_array()) {
+        for item in contents {
+            if let Some(tok) = item
+                .pointer("/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+                .or_else(|| {
+                    item.pointer("/continuationItemRenderer/button/buttonRenderer/command/continuationCommand/token")
+                })
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    if let Some(tok) = crr
+        .pointer("/viewReplies/buttonRenderer/command/continuationCommand/token")
+        .or_else(|| crr.pointer("/subThreads/0/continuationItemRenderer/continuationEndpoint/continuationCommand/token"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(tok.to_string());
+    }
+    first_string_by_key(crr, "token").map(str::to_string)
+}
+
+fn parse_comment_renderer_node(cr: &serde_json::Value) -> Option<VideoComment> {
+    let id = cr.get("commentId").and_then(|x| x.as_str())?;
+    if id.is_empty() {
+        return None;
+    }
+    let author = extract_yt_text(cr.get("authorText")).unwrap_or_else(|| "Viewer".to_string());
+    let published_text = extract_yt_text(cr.get("publishedTimeText")).unwrap_or_default();
+    let text = extract_yt_text(cr.get("contentText"))
+        .map(|s| clean_comment_body(&s))
+        .unwrap_or_default();
+    if text.is_empty() {
+        return None;
+    }
+    let like_count_text = extract_yt_text(cr.get("voteCount")).unwrap_or_else(|| "0".to_string());
+    let reply_count = parse_reply_count_val(cr.get("replyCount"));
+    let is_pinned = cr.get("pinnedCommentBadge").is_some();
+    Some(VideoComment {
+        id: id.to_string(),
+        author,
+        published_text,
+        text,
+        like_count_text,
+        reply_count,
+        is_pinned,
+        is_self: false,
+        ..Default::default()
+    })
+}
+
+#[derive(Default)]
+struct CommentParseCtx {
+    out: Vec<VideoComment>,
+    seen: HashSet<String>,
+    continuation: Option<String>,
+    create_params: Option<String>,
+    reply_tokens: std::collections::HashMap<String, String>,
+    inline_replies: std::collections::HashMap<String, Vec<VideoComment>>,
+}
+
 fn collect_comments_nodes(
     v: &serde_json::Value,
-    out: &mut Vec<VideoComment>,
-    seen: &mut HashSet<String>,
-    continuation: &mut Option<String>,
-    create_params: &mut Option<String>,
+    ctx: &mut CommentParseCtx,
+    inside_replies_branch: bool,
 ) {
     match v {
         serde_json::Value::Object(map) => {
-            if create_params.is_none() {
+            if ctx.create_params.is_none() {
                 if let Some(p) = map.get("createCommentParams").and_then(|x| x.as_str()) {
                     if !p.is_empty() {
-                        *create_params = Some(p.to_string());
+                        ctx.create_params = Some(p.to_string());
                     }
                 }
             }
 
-            if let Some(cr) = map.get("commentRenderer") {
-                if let Some(id) = cr.get("commentId").and_then(|x| x.as_str()) {
-                    if !id.is_empty() && seen.insert(id.to_string()) {
-                        let author = extract_yt_text(cr.get("authorText"))
-                            .unwrap_or_else(|| "Viewer".to_string());
-                        let published_text =
-                            extract_yt_text(cr.get("publishedTimeText")).unwrap_or_default();
-                        let text = extract_yt_text(cr.get("contentText"))
-                            .map(|s| clean_comment_body(&s))
-                            .unwrap_or_default();
-                        let like_count_text = extract_yt_text(cr.get("voteCount"))
-                            .unwrap_or_else(|| "0".to_string());
-                        let reply_count = parse_reply_count_val(cr.get("replyCount"));
-                        let is_pinned = cr.get("pinnedCommentBadge").is_some();
-                        if !text.is_empty() {
-                            out.push(VideoComment {
-                                id: id.to_string(),
-                                author,
-                                published_text,
-                                text,
-                                like_count_text,
-                                reply_count,
-                                is_pinned,
-                                is_self: false,
-                            });
+            if let Some(ctr) = map.get("commentThreadRenderer") {
+                let parent_id = ctr
+                    .pointer("/comment/commentRenderer/commentId")
+                    .or_else(|| ctr.pointer("/comment/commentViewModel/commentId"))
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+
+                if let (Some(pid), Some(replies_node)) = (parent_id.as_ref(), ctr.get("replies")) {
+                    if let Some(tok) = extract_reply_continuation_from_replies_node(replies_node) {
+                        ctx.reply_tokens.insert(pid.clone(), tok);
+                    }
+                    if let Some(contents) = replies_node
+                        .get("commentRepliesRenderer")
+                        .and_then(|c| c.get("contents"))
+                        .and_then(|c| c.as_array())
+                    {
+                        let mut extracted = Vec::new();
+                        for item in contents {
+                            if let Some(cr) = item.get("commentRenderer") {
+                                if let Some(rc) = parse_comment_renderer_node(cr) {
+                                    ctx.seen.insert(rc.id.clone());
+                                    extracted.push(rc);
+                                }
+                            }
                         }
+                        if !extracted.is_empty() {
+                            ctx.inline_replies.insert(pid.clone(), extracted);
+                        }
+                    }
+                }
+
+                if let Some(comment_node) = ctr.get("comment") {
+                    collect_comments_nodes(comment_node, ctx, false);
+                }
+                return;
+            }
+
+            if let Some(cr) = map.get("commentRenderer") {
+                if let Some(mut cmt) = parse_comment_renderer_node(cr) {
+                    if ctx.seen.insert(cmt.id.clone()) {
+                        cmt.replies_continuation = ctx.reply_tokens.remove(&cmt.id);
+                        if let Some(reps) = ctx.inline_replies.remove(&cmt.id) {
+                            cmt.replies = reps;
+                        }
+                        ctx.out.push(cmt);
                     }
                 }
             }
@@ -933,7 +1024,7 @@ fn collect_comments_nodes(
                     .and_then(|p| p.get("commentId"))
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
-                if !id.is_empty() && seen.insert(id.to_string()) {
+                if !id.is_empty() && ctx.seen.insert(id.to_string()) {
                     let author = cep
                         .get("author")
                         .and_then(|a| a.get("displayName"))
@@ -964,7 +1055,9 @@ fn collect_comments_nodes(
                         cep.get("toolbar").and_then(|t| t.get("replyCount")),
                     );
                     if !text.is_empty() {
-                        out.push(VideoComment {
+                        let replies_continuation = ctx.reply_tokens.remove(id);
+                        let replies = ctx.inline_replies.remove(id).unwrap_or_default();
+                        ctx.out.push(VideoComment {
                             id: id.to_string(),
                             author,
                             published_text,
@@ -973,12 +1066,15 @@ fn collect_comments_nodes(
                             reply_count,
                             is_pinned: false,
                             is_self: false,
+                            replies_continuation,
+                            replies,
+                            ..Default::default()
                         });
                     }
                 }
             }
 
-            if continuation.is_none() {
+            if !inside_replies_branch && ctx.continuation.is_none() {
                 if let Some(ci) = map.get("continuationItemRenderer") {
                     if let Some(tok) = ci
                         .get("continuationEndpoint")
@@ -986,18 +1082,20 @@ fn collect_comments_nodes(
                         .and_then(|c| c.get("token"))
                         .and_then(|t| t.as_str())
                     {
-                        *continuation = Some(tok.to_string());
+                        ctx.continuation = Some(tok.to_string());
                     }
                 }
             }
 
-            for val in map.values() {
-                collect_comments_nodes(val, out, seen, continuation, create_params);
+            for (k, val) in map {
+                let child_in_replies =
+                    inside_replies_branch || k == "replies" || k == "commentRepliesRenderer";
+                collect_comments_nodes(val, ctx, child_in_replies);
             }
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                collect_comments_nodes(item, out, seen, continuation, create_params);
+                collect_comments_nodes(item, ctx, inside_replies_branch);
             }
         }
         _ => {}
@@ -1005,30 +1103,15 @@ fn collect_comments_nodes(
 }
 
 pub fn parse_innertube_comments_json(root: &serde_json::Value) -> CommentsPage {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut continuation = None;
-    let mut create_comment_params = None;
+    let mut ctx = CommentParseCtx::default();
     if let Some(endpoints) = root.get("onResponseReceivedEndpoints") {
-        collect_comments_nodes(
-            endpoints,
-            &mut out,
-            &mut seen,
-            &mut continuation,
-            &mut create_comment_params,
-        );
+        collect_comments_nodes(endpoints, &mut ctx, false);
     }
-    collect_comments_nodes(
-        root,
-        &mut out,
-        &mut seen,
-        &mut continuation,
-        &mut create_comment_params,
-    );
+    collect_comments_nodes(root, &mut ctx, false);
     CommentsPage {
-        comments: out,
-        continuation,
-        create_comment_params,
+        comments: ctx.out,
+        continuation: ctx.continuation,
+        create_comment_params: ctx.create_params,
     }
 }
 
@@ -1106,6 +1189,41 @@ pub async fn fetch_video_comments(
     }
 
     Ok(page)
+}
+
+/// Fetch replies for a parent comment thread using its InnerTube continuation token.
+pub async fn fetch_comment_replies(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    continuation_token: &str,
+) -> Result<CommentsPage> {
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "continuation": continuation_token
+    });
+    let req = client
+        .post("https://www.youtube.com/youtubei/v1/next?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload);
+    let resp = apply_innertube_web_headers(req, session).send().await?;
+    if !resp.status().is_success() {
+        return Err(AppError::Http(format!(
+            "InnerTube comment replies HTTP {}",
+            resp.status()
+        )));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Parse(format!("Invalid /next replies JSON: {e}")))?;
+    Ok(parse_innertube_comments_json(&json))
 }
 
 /// Post a comment to YouTube via InnerTube `/comment/create_comment`.
@@ -1533,6 +1651,42 @@ mod tests {
                                     "replyCount": 4,
                                     "pinnedCommentBadge": { "pinnedCommentBadgeRenderer": {} }
                                 }
+                            },
+                            "replies": {
+                                "commentRepliesRenderer": {
+                                    "contents": [{
+                                        "continuationItemRenderer": {
+                                            "continuationEndpoint": {
+                                                "continuationCommand": { "token": "reply_tok_classic_1" }
+                                            }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }, {
+                        "commentThreadRenderer": {
+                            "comment": {
+                                "commentViewModel": {
+                                    "commentId": "cmt_entity_2"
+                                }
+                            },
+                            "replies": {
+                                "commentRepliesRenderer": {
+                                    "contents": [{
+                                        "continuationItemRenderer": {
+                                            "continuationEndpoint": {
+                                                "continuationCommand": { "token": "reply_tok_entity_2" }
+                                            }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }, {
+                        "continuationItemRenderer": {
+                            "continuationEndpoint": {
+                                "continuationCommand": { "token": "top_level_next_page" }
                             }
                         }
                     }]
@@ -1562,12 +1716,21 @@ mod tests {
 
         let parsed = parse_innertube_comments_json(&sample);
         assert_eq!(parsed.comments.len(), 2);
+        assert_eq!(parsed.continuation.as_deref(), Some("top_level_next_page"));
         assert_eq!(parsed.comments[0].author, "@audiofan");
         assert!(parsed.comments[0].is_pinned);
         assert_eq!(parsed.comments[0].text, "Great breakdown of the driver layout at 2:47!");
+        assert_eq!(
+            parsed.comments[0].replies_continuation.as_deref(),
+            Some("reply_tok_classic_1")
+        );
         assert_eq!(parsed.comments[1].author, "@rust_listener");
         assert_eq!(parsed.comments[1].like_count_text, "29");
         assert_eq!(parsed.comments[1].reply_count, 2);
+        assert_eq!(
+            parsed.comments[1].replies_continuation.as_deref(),
+            Some("reply_tok_entity_2")
+        );
     }
 
     #[test]

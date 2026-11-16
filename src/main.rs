@@ -11,8 +11,9 @@ mod ui;
 
 use crate::api::dislike::fetch_dislikes;
 use crate::api::innertube::{
-    browse_id_for_feed_key, fetch_channel_rss, fetch_innertube_shelf, fetch_video_comments,
-    innertube_edit_watch_later, post_video_comment, report_youtube_watch_progress, VideoComment,
+    browse_id_for_feed_key, fetch_channel_rss, fetch_comment_replies, fetch_innertube_shelf,
+    fetch_video_comments, innertube_edit_watch_later, post_video_comment,
+    report_youtube_watch_progress, VideoComment,
 };
 use crate::api::player::{
     detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
@@ -948,6 +949,33 @@ async fn handle_app_message(
                 state.detail_comments = merged;
             }
         }
+        AppMessage::CommentRepliesLoaded {
+            video_id,
+            parent_comment_id,
+            replies,
+            continuation,
+        } => {
+            if state
+                .detail_video
+                .as_ref()
+                .map(|v| v.id == video_id)
+                .unwrap_or(false)
+            {
+                if let Some(parent) = state
+                    .detail_comments
+                    .iter_mut()
+                    .find(|c| c.id == parent_comment_id)
+                {
+                    parent.replies_loading = false;
+                    parent.replies_continuation = continuation;
+                    for r in replies {
+                        if !parent.replies.iter().any(|existing| existing.id == r.id) {
+                            parent.replies.push(r);
+                        }
+                    }
+                }
+            }
+        }
         AppMessage::CommentPosted {
             video_id,
             comment,
@@ -1235,6 +1263,90 @@ async fn handle_app_message(
             state.show_toast(msg);
         }
         _ => {}
+    }
+}
+
+fn spawn_fetch_comment_replies(
+    video_id: String,
+    parent_comment_id: String,
+    token: String,
+    session: Option<crate::services::auth::GoogleAccountSession>,
+    tx: mpsc::Sender<AppMessage>,
+    client: reqwest::Client,
+) {
+    tokio::spawn(async move {
+        match fetch_comment_replies(&client, session.as_ref(), &token).await {
+            Ok(page) => {
+                let _ = tx
+                    .send(AppMessage::CommentRepliesLoaded {
+                        video_id,
+                        parent_comment_id,
+                        replies: page.comments,
+                        continuation: page.continuation,
+                    })
+                    .await;
+            }
+            Err(_) => {
+                let _ = tx
+                    .send(AppMessage::CommentRepliesLoaded {
+                        video_id,
+                        parent_comment_id,
+                        replies: Vec::new(),
+                        continuation: None,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+fn toggle_selected_comment_replies(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let Some(video_id) = state.detail_video.as_ref().map(|v| v.id.clone()) else {
+        return;
+    };
+    let idx = state.detail_comment_cursor;
+    let sess = state.auth_vault.active_account().cloned();
+    let Some(c) = state.detail_comments.get_mut(idx) else {
+        return;
+    };
+    if c.replies_expanded {
+        c.replies_expanded = false;
+        return;
+    }
+    c.replies_expanded = true;
+    if c.replies.is_empty() && !c.replies_loading {
+        if let Some(tok) = c.replies_continuation.take() {
+            c.replies_loading = true;
+            let pid = c.id.clone();
+            spawn_fetch_comment_replies(video_id, pid, tok, sess, tx.clone(), client.clone());
+        }
+    }
+}
+
+fn load_more_selected_comment_replies(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let Some(video_id) = state.detail_video.as_ref().map(|v| v.id.clone()) else {
+        return;
+    };
+    let idx = state.detail_comment_cursor;
+    let sess = state.auth_vault.active_account().cloned();
+    let Some(c) = state.detail_comments.get_mut(idx) else {
+        return;
+    };
+    if !c.replies_loading {
+        if let Some(tok) = c.replies_continuation.take() {
+            c.replies_expanded = true;
+            c.replies_loading = true;
+            let pid = c.id.clone();
+            spawn_fetch_comment_replies(video_id, pid, tok, sess, tx.clone(), client.clone());
+        }
     }
 }
 
@@ -2041,6 +2153,7 @@ async fn handle_key_event(
                                     reply_count: 0,
                                     is_pinned: false,
                                     is_self: true,
+                                    ..Default::default()
                                 };
                                 state.detail_comments.insert(0, local_cmt);
                                 state.detail_comment_cursor = 0;
@@ -2154,9 +2267,35 @@ async fn handle_key_event(
                         }
                     }
                 }
+                KeyCode::Char('r') | KeyCode::Char('l') | KeyCode::Right
+                    if state.detail_focus_pane == 2 =>
+                {
+                    toggle_selected_comment_replies(state, tx, client);
+                }
+                KeyCode::Char('h') | KeyCode::Left if state.detail_focus_pane == 2 => {
+                    if let Some(c) = state.detail_comments.get_mut(state.detail_comment_cursor) {
+                        c.replies_expanded = false;
+                    }
+                }
+                KeyCode::Char('n') if state.detail_focus_pane == 2 => {
+                    load_more_selected_comment_replies(state, tx, client);
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if state.detail_focus_pane == 2 && code == KeyCode::Enter {
-                        state.detail_comment_composing = true;
+                        let has_replies = state
+                            .detail_comments
+                            .get(state.detail_comment_cursor)
+                            .map(|c| {
+                                c.reply_count > 0
+                                    || !c.replies.is_empty()
+                                    || c.replies_continuation.is_some()
+                            })
+                            .unwrap_or(false);
+                        if has_replies {
+                            toggle_selected_comment_replies(state, tx, client);
+                        } else {
+                            state.detail_comment_composing = true;
+                        }
                     } else if let Some(v) = state.detail_video.clone() {
                         let start_ch = if state.detail_focus_pane == 1 {
                             v.effective_chapters()

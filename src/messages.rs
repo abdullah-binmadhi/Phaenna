@@ -61,6 +61,12 @@ pub enum AppMessage {
         comments: Vec<VideoComment>,
         create_params: Option<String>,
     },
+    CommentRepliesLoaded {
+        video_id: String,
+        parent_comment_id: String,
+        replies: Vec<VideoComment>,
+        continuation: Option<String>,
+    },
     CommentPosted {
         video_id: String,
         comment: VideoComment,

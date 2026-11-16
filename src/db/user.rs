@@ -1024,6 +1024,7 @@ pub async fn get_user_video_comments(
             reply_count: 0,
             is_pinned: false,
             is_self: true,
+            ..Default::default()
         })
         .collect())
 }
