@@ -12,9 +12,9 @@ mod ui;
 use crate::api::dislike::fetch_dislikes;
 use crate::api::innertube::{
     browse_id_for_feed_key, fetch_channel_rss, fetch_channel_shorts, fetch_comment_replies,
-    fetch_innertube_shelf, fetch_suggested_shorts, fetch_video_card_enrichment,
-    fetch_video_comments, innertube_edit_watch_later, post_video_comment,
-    report_youtube_watch_progress, VideoComment,
+    fetch_innertube_shelf, fetch_search_suggestions, fetch_suggested_shorts,
+    fetch_video_card_enrichment, fetch_video_comments, innertube_edit_watch_later,
+    post_video_comment, report_youtube_watch_progress, search_innertube, VideoComment,
 };
 use crate::api::player::{
     detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
@@ -26,7 +26,9 @@ use crate::api::ytdlp::{
     fetch_channel_videos, fetch_feed_range, fetch_feed_range_stream, fetch_video_details,
     search_youtube,
 };
-use crate::config::{next_dub_lang, Config, PerformanceMode, Player, Quality, VideoShaderMode};
+use crate::config::{
+    next_dub_lang, Config, MotionMode, PerformanceMode, Player, Quality, VideoShaderMode,
+};
 use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
     batch_upsert_feed, enrich_video_stats, get_all_cached_videos, get_feed_videos, get_thumb_blob,
@@ -66,7 +68,8 @@ use crate::services::updater::{
 };
 use crate::state::{
     ActiveOverlay, AppState, Category, ContentFilter, DetailViewMode, DownloadJobState,
-    NowPlayingHit, PlayOptionsHit, Screen, ShortsSource, SortOrder,
+    NowPlayingHit, PlayOptionsHit, Screen, SearchHit, SearchScope, SearchSortOrder,
+    SearchTypeFilter, ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::help::confirm_quit_button_rects;
@@ -260,15 +263,34 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Main Event Loop ───────────────────────────────────────────────────────
     let mut needs_redraw = true;
+    let mut last_suggest_gen: u64 = 0;
     loop {
-        // Handle 350ms debounced remote search trigger
+        // Handle 120ms autocomplete suggestions & 350ms InnerTube remote search
         if state.search_pending_remote {
             if let Some(ts) = state.search_last_typed {
+                let q = state.search_query.trim().to_string();
+                if !q.is_empty()
+                    && ts.elapsed() >= Duration::from_millis(120)
+                    && last_suggest_gen != state.search_generation
+                {
+                    last_suggest_gen = state.search_generation;
+                    spawn_search_suggestions(&client, q.clone(), state.search_generation, &tx);
+                }
                 if ts.elapsed() >= Duration::from_millis(350) {
                     state.search_pending_remote = false;
-                    let q = state.search_query.trim().to_string();
-                    if !q.is_empty() {
-                        spawn_remote_search(&state.config, q, state.search_generation, &tx);
+                    if !q.is_empty()
+                        && matches!(state.search_scope, SearchScope::All | SearchScope::LiveYt)
+                    {
+                        state.push_search_history(&q);
+                        spawn_remote_search(
+                            &client,
+                            state.auth_vault.active_account().cloned(),
+                            &state.config,
+                            q,
+                            state.search_params_token(),
+                            state.search_generation,
+                            &tx,
+                        );
                         state.is_searching_remote = true;
                         needs_redraw = true;
                     }
@@ -328,7 +350,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        if event::poll(Duration::from_millis(40))? {
+        let is_animating = state.toast.is_some()
+            || state.has_live_ipc()
+            || !state.loading_feeds.is_empty()
+            || !state.loading_thumbs.is_empty()
+            || state.is_searching_remote
+            || state.is_loading_channel
+            || state.search_pending_remote;
+        let poll_ms = if is_animating { 8 } else { 45 };
+        if event::poll(Duration::from_millis(poll_ms))? {
             let prev_focus = (
                 state.screen,
                 state.active_category,
@@ -1027,23 +1057,158 @@ fn spawn_thumb_loader(
 }
 
 fn spawn_remote_search(
+    client: &reqwest::Client,
+    session: Option<crate::services::auth::GoogleAccountSession>,
     cfg: &Config,
     query: String,
+    params: Option<String>,
     generation: u64,
     tx: &mpsc::Sender<AppMessage>,
 ) {
     let cookies = cfg.cookies_path().ok();
     let tx_clone = tx.clone();
+    let client_clone = client.clone();
     tokio::spawn(async move {
-        let items = search_youtube(cookies.as_deref(), &query, 18).await;
+        let mut continuation = None;
+        let items = match search_innertube(
+            &client_clone,
+            session.as_ref(),
+            &query,
+            params.as_deref(),
+            None,
+        )
+        .await
+        {
+            Ok(page) if !page.videos.is_empty() => {
+                continuation = page.continuation;
+                page.videos
+            }
+            _ => search_youtube(cookies.as_deref(), &query, 18).await,
+        };
         let _ = tx_clone
             .send(AppMessage::SearchResults {
                 generation,
                 query,
                 items,
+                continuation,
             })
             .await;
     });
+}
+
+fn spawn_more_search_results(
+    client: &reqwest::Client,
+    session: Option<crate::services::auth::GoogleAccountSession>,
+    query: String,
+    params: Option<String>,
+    continuation: String,
+    generation: u64,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let tx_clone = tx.clone();
+    let client_clone = client.clone();
+    tokio::spawn(async move {
+        let page = search_innertube(
+            &client_clone,
+            session.as_ref(),
+            &query,
+            params.as_deref(),
+            Some(&continuation),
+        )
+        .await
+        .unwrap_or_default();
+        let _ = tx_clone
+            .send(AppMessage::MoreSearchResults {
+                generation,
+                items: page.videos,
+                continuation: page.continuation,
+            })
+            .await;
+    });
+}
+
+fn spawn_search_suggestions(
+    client: &reqwest::Client,
+    query: String,
+    generation: u64,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let tx_clone = tx.clone();
+    let client_clone = client.clone();
+    tokio::spawn(async move {
+        let suggestions = fetch_search_suggestions(&client_clone, &query).await;
+        let _ = tx_clone
+            .send(AppMessage::SearchSuggestionsReady {
+                generation,
+                suggestions,
+            })
+            .await;
+    });
+}
+
+fn open_channel_for_video(
+    v: &VideoItem,
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let ch_name = v.display_uploader().to_string();
+    let ch_id = v.channel_id.clone();
+    state.channel_title = ch_name.clone();
+    state.channel_id = ch_id.clone();
+    state.channel_videos.clear();
+    state.channel_cursor = 0;
+    state.is_loading_channel = true;
+    state.screen = Screen::Channel;
+
+    let target = ch_id.unwrap_or_else(|| format!("@{}", ch_name.replace(' ', "")));
+    let cookies = state.config.cookies_path().ok();
+    let tx_ch = tx.clone();
+    let c_ch = client.clone();
+    tokio::spawn(async move {
+        let mut vids = if target.starts_with("UC") {
+            fetch_channel_rss(&c_ch, &target).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if vids.is_empty() {
+            vids = fetch_channel_videos(cookies.as_deref(), &target, 20).await;
+        }
+        let _ = tx_ch
+            .send(AppMessage::ChannelVideosLoaded {
+                channel_key: target,
+                items: vids,
+            })
+            .await;
+    });
+}
+
+fn extract_youtube_video_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if !(trimmed.contains("youtube.com") || trimmed.contains("youtu.be")) {
+        return None;
+    }
+    if let Some(pos) = trimmed.find("v=") {
+        let cand: String = trimmed[pos + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if cand.len() == 11 {
+            return Some(cand);
+        }
+    }
+    for prefix in ["youtu.be/", "/shorts/", "/live/", "/embed/"] {
+        if let Some(pos) = trimmed.find(prefix) {
+            let cand: String = trimmed[pos + prefix.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if cand.len() == 11 {
+                return Some(cand);
+            }
+        }
+    }
+    None
 }
 
 async fn handle_app_message(
@@ -1281,11 +1446,41 @@ async fn handle_app_message(
             generation,
             query: _,
             items,
+            continuation,
         } => {
             if generation == state.search_generation {
                 state.is_searching_remote = false;
                 state.search_results = items;
+                state.search_continuation = continuation;
                 state.search_cursor = 0;
+            }
+        }
+        AppMessage::MoreSearchResults {
+            generation,
+            items,
+            continuation,
+        } => {
+            if generation == state.search_generation {
+                state.is_searching_remote = false;
+                state.search_continuation = continuation;
+                let mut seen: std::collections::HashSet<String> = state
+                    .search_results
+                    .iter()
+                    .map(|v| v.clean_id().to_string())
+                    .collect();
+                for item in items {
+                    if seen.insert(item.clean_id().to_string()) {
+                        state.search_results.push(item);
+                    }
+                }
+            }
+        }
+        AppMessage::SearchSuggestionsReady {
+            generation,
+            suggestions,
+        } => {
+            if generation == state.search_generation {
+                state.search_suggestions = suggestions;
             }
         }
         AppMessage::ChannelVideosLoaded { channel_key: _, items } => {
@@ -2045,6 +2240,7 @@ async fn start_nonblocking_playback(
         shader_mode: state.config.shader_mode,
         mastering_profile: VideoMasteringProfile::from_metadata(video.duration, &video.title),
         performance_mode: state.config.performance_mode,
+        motion_mode: state.config.motion_mode,
         dub_preference: state.config.dub_preference,
         dub_lang: state.config.dub_lang.clone(),
         audio_multistreams: state.config.audio_multistreams,
@@ -2726,6 +2922,17 @@ fn apply_performance_mode(state: &mut AppState, mode: PerformanceMode) {
     }
 }
 
+fn apply_motion_mode(state: &mut AppState, mode: MotionMode) {
+    state.config.motion_mode = mode;
+    let _ = state.config.save();
+    if state.has_live_ipc() {
+        state.send_player_cmd(PlayerCommand::SetMotionMode(mode));
+        state.show_toast(format!("Live Motion: {}", mode.label()));
+    } else {
+        state.show_toast(format!("Motion Mode: {}", mode.label()));
+    }
+}
+
 async fn apply_play_options_hit(
     hit: PlayOptionsHit,
     click_col: u16,
@@ -2829,6 +3036,22 @@ async fn apply_play_options_hit(
         }
         PlayOptionsHit::SetPerformanceMode(mode) => {
             apply_performance_mode(state, mode);
+        }
+        PlayOptionsHit::CycleMotion => {
+            let next = state.config.motion_mode.next();
+            apply_motion_mode(state, next);
+        }
+        PlayOptionsHit::ScrollAudioTracks(delta) => {
+            let total = state.live_playback.audio_tracks.len();
+            if total > 0 {
+                let next = if delta > 0 {
+                    let cur = state.live_playback.audio_track_scroll + (delta as usize);
+                    if cur + 1 >= total { 0 } else { cur }
+                } else {
+                    state.live_playback.audio_track_scroll.saturating_sub((-delta) as usize)
+                };
+                state.live_playback.audio_track_scroll = next;
+            }
         }
         PlayOptionsHit::TogglePause => {
             state.live_playback.paused = !state.live_playback.paused;
@@ -2959,12 +3182,211 @@ async fn apply_now_playing_hit(
             let next = state.config.performance_mode.next();
             apply_performance_mode(state, next);
         }
+        NowPlayingHit::CycleMotion => {
+            let next = state.config.motion_mode.next();
+            apply_motion_mode(state, next);
+        }
         NowPlayingHit::OpenStudio => {
             state.overlay = ActiveOverlay::PlayOptions;
         }
         NowPlayingHit::StopPlayer => {
             state.send_player_cmd(PlayerCommand::Stop);
             state.show_toast("Stopped playback");
+        }
+    }
+}
+
+async fn open_search_overlay(state: &mut AppState, pool: &SqlitePool) {
+    state.overlay = ActiveOverlay::Search;
+    state.search_query.clear();
+    state.search_results.clear();
+    state.search_suggestions.clear();
+    state.search_continuation = None;
+    state.search_local_results = get_all_cached_videos(pool, 16).await.unwrap_or_default();
+    state.search_cursor = 0;
+}
+
+async fn trigger_search_update(
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+    remote_now: bool,
+) {
+    state.search_generation += 1;
+    state.search_continuation = None;
+    state.search_local_results = search_cached_videos(pool, &state.search_query)
+        .await
+        .unwrap_or_default();
+    state.search_cursor = 0;
+
+    let q = state.search_query.trim().to_string();
+    if q.is_empty() {
+        state.search_results.clear();
+        state.search_suggestions.clear();
+        state.search_pending_remote = false;
+        state.is_searching_remote = false;
+        return;
+    }
+
+    if remote_now {
+        state.search_pending_remote = false;
+        spawn_search_suggestions(client, q.clone(), state.search_generation, tx);
+        if matches!(state.search_scope, SearchScope::All | SearchScope::LiveYt) {
+            state.push_search_history(&q);
+            state.is_searching_remote = true;
+            spawn_remote_search(
+                client,
+                state.auth_vault.active_account().cloned(),
+                &state.config,
+                q,
+                state.search_params_token(),
+                state.search_generation,
+                tx,
+            );
+        } else {
+            state.is_searching_remote = false;
+        }
+    } else {
+        state.search_last_typed = Some(Instant::now());
+        state.search_pending_remote = true;
+    }
+}
+
+async fn apply_search_hit(
+    hit: SearchHit,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    match hit {
+        SearchHit::ApplySuggestion(s) => {
+            state.search_query = s;
+            trigger_search_update(state, pool, tx, client, true).await;
+        }
+        SearchHit::SetScope(sc) => {
+            if state.search_scope != sc {
+                state.search_scope = sc;
+                state.search_cursor = 0;
+                if matches!(sc, SearchScope::All | SearchScope::LiveYt)
+                    && !state.search_query.trim().is_empty()
+                    && state.search_results.is_empty()
+                {
+                    trigger_search_update(state, pool, tx, client, true).await;
+                }
+            }
+        }
+        SearchHit::SetType(tf) => {
+            if state.search_type_filter != tf {
+                let server_changed =
+                    matches!(state.search_type_filter, SearchTypeFilter::Videos)
+                        || matches!(tf, SearchTypeFilter::Videos);
+                state.search_type_filter = tf;
+                state.search_cursor = 0;
+                if server_changed && !state.search_query.trim().is_empty() {
+                    trigger_search_update(state, pool, tx, client, true).await;
+                }
+            }
+        }
+        SearchHit::SetDate(df) => {
+            if state.search_date_filter != df {
+                state.search_date_filter = df;
+                state.search_cursor = 0;
+                if !state.search_query.trim().is_empty() {
+                    trigger_search_update(state, pool, tx, client, true).await;
+                }
+            }
+        }
+        SearchHit::SetDuration(df) => {
+            if state.search_duration_filter != df {
+                state.search_duration_filter = df;
+                state.search_cursor = 0;
+                if !state.search_query.trim().is_empty() {
+                    trigger_search_update(state, pool, tx, client, true).await;
+                }
+            }
+        }
+        SearchHit::SetSort(so) => {
+            if state.search_sort_order != so {
+                let server_changed =
+                    matches!(so, SearchSortOrder::Newest | SearchSortOrder::Views)
+                        || matches!(
+                            state.search_sort_order,
+                            SearchSortOrder::Newest | SearchSortOrder::Views
+                        );
+                state.search_sort_order = so;
+                state.search_cursor = 0;
+                if server_changed && !state.search_query.trim().is_empty() {
+                    trigger_search_update(state, pool, tx, client, true).await;
+                }
+            }
+        }
+        SearchHit::ToggleHideWatched => {
+            state.search_hide_watched = !state.search_hide_watched;
+            state.search_cursor = 0;
+        }
+        SearchHit::SelectRow(idx) => {
+            let total = state.combined_search_items().len();
+            if idx < total {
+                let now = Instant::now();
+                let is_double = state
+                    .search_last_click
+                    .map(|(prev_idx, ts)| {
+                        prev_idx == idx && now.duration_since(ts) <= Duration::from_millis(450)
+                    })
+                    .unwrap_or(false);
+                state.search_cursor = idx;
+                state.search_last_click = Some((idx, now));
+                if is_double {
+                    if let Some(v) = state.combined_search_items().get(idx).cloned() {
+                        open_detail_for_video(v, state, pool, tx, client);
+                    }
+                }
+            }
+        }
+        SearchHit::ActionPlay => {
+            if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                state.overlay = ActiveOverlay::None;
+                start_nonblocking_playback(&v, None, state, pool, tx, client).await;
+            }
+        }
+        SearchHit::ActionDetail => {
+            if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                open_detail_for_video(v, state, pool, tx, client);
+            }
+        }
+        SearchHit::ActionPinCw => {
+            if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                pin_video_to_continue_watching(&v, state, pool).await;
+            }
+        }
+        SearchHit::ActionWatchLater => {
+            if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                toggle_watch_later(&v, state, pool, client).await;
+            }
+        }
+        SearchHit::ActionChannel => {
+            if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                state.overlay = ActiveOverlay::None;
+                open_channel_for_video(&v, state, tx, client);
+            }
+        }
+        SearchHit::LoadMore => {
+            if let Some(cont) = state.search_continuation.clone() {
+                if !state.is_searching_remote {
+                    state.is_searching_remote = true;
+                    spawn_more_search_results(
+                        client,
+                        state.auth_vault.active_account().cloned(),
+                        state.search_query.trim().to_string(),
+                        state.search_params_token(),
+                        cont,
+                        state.search_generation,
+                        tx,
+                    );
+                }
+            }
         }
     }
 }
@@ -3011,15 +3433,15 @@ async fn handle_mouse_event(
             return false;
         }
         if state.overlay == ActiveOverlay::PlayOptions {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let in_rect = |r: ratatui::layout::Rect| -> bool {
-                    r.width > 0
-                        && r.height > 0
-                        && mouse.column >= r.x
-                        && mouse.column < r.x + r.width
-                        && mouse.row >= r.y
-                        && mouse.row < r.y + r.height
-                };
                 if let Some((rect, hit)) = state
                     .live_playback
                     .play_hitboxes
@@ -3039,8 +3461,104 @@ async fn handle_mouse_event(
                 }
             }
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                if let Some((rect, PlayOptionsHit::PictureDelta(prop, _))) = state
+                    .live_playback
+                    .play_hitboxes
+                    .iter()
+                    .find(|(r, h)| {
+                        in_rect(*r) && matches!(h, PlayOptionsHit::PictureDelta(_, _))
+                    })
+                    .cloned()
+                {
+                    apply_play_options_hit(
+                        PlayOptionsHit::PictureDelta(prop, -5),
+                        mouse.column,
+                        rect,
+                        state,
+                        pool,
+                        tx,
+                        client,
+                    )
+                    .await;
+                    return true;
+                }
                 state.overlay = ActiveOverlay::None;
                 return true;
+            }
+            if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                let over_audio_panel = state.live_playback.play_hitboxes.iter().any(|(r, h)| {
+                    in_rect(*r) && matches!(h, PlayOptionsHit::FocusSection(1))
+                });
+                if over_audio_panel {
+                    let delta = if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                        1
+                    } else {
+                        -1
+                    };
+                    apply_play_options_hit(
+                        PlayOptionsHit::ScrollAudioTracks(delta),
+                        mouse.column,
+                        ratatui::layout::Rect::default(),
+                        state,
+                        pool,
+                        tx,
+                        client,
+                    )
+                    .await;
+                    return true;
+                }
+            }
+            return false;
+        }
+        if state.overlay == ActiveOverlay::Search {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some((_, hit)) = state
+                    .search_hitboxes
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| in_rect(*r))
+                    .cloned()
+                {
+                    apply_search_hit(hit, state, pool, tx, client).await;
+                    return true;
+                }
+                if let Some(modal) =
+                    crate::state::active_modal_rect(frame_area, ActiveOverlay::Search)
+                {
+                    if !in_rect(modal) {
+                        state.overlay = ActiveOverlay::None;
+                        return true;
+                    }
+                }
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.overlay = ActiveOverlay::None;
+                return true;
+            }
+            if matches!(mouse.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+                let total = state.combined_search_items().len();
+                if total > 0 {
+                    if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                        state.search_cursor = (state.search_cursor + 1).min(total - 1);
+                        if state.search_cursor + 3 >= total
+                            && state.search_continuation.is_some()
+                            && !state.is_searching_remote
+                        {
+                            apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
+                        }
+                    } else {
+                        state.search_cursor = state.search_cursor.saturating_sub(1);
+                    }
+                    return true;
+                }
             }
             return false;
         }
@@ -3193,7 +3711,7 @@ async fn handle_mouse_event(
             }
             if let Some(act) = footer_action_at(footer_area, mouse.column, mouse.row) {
                 match act {
-                    HomeFooterAction::Search => state.overlay = ActiveOverlay::Search,
+                    HomeFooterAction::Search => open_search_overlay(state, pool).await,
                     HomeFooterAction::Calendar => {
                         state.sync_calendar_tz(pool).await;
                         state.overlay = ActiveOverlay::Calendar;
@@ -3447,36 +3965,8 @@ async fn handle_key_event(
                     }
                 }
                 KeyCode::Char('c') => {
-                    if let Some(ref v) = state.detail_video {
-                        let ch_name = v.display_uploader().to_string();
-                        let ch_id = v.channel_id.clone();
-                        state.channel_title = ch_name.clone();
-                        state.channel_id = ch_id.clone();
-                        state.channel_videos.clear();
-                        state.channel_cursor = 0;
-                        state.is_loading_channel = true;
-                        state.screen = Screen::Channel;
-
-                        let target = ch_id.unwrap_or_else(|| format!("@{}", ch_name.replace(' ', "")));
-                        let cookies = state.config.cookies_path().ok();
-                        let tx_ch = tx.clone();
-                        let c_ch = client.clone();
-                        tokio::spawn(async move {
-                            let mut vids = if target.starts_with("UC") {
-                                fetch_channel_rss(&c_ch, &target).await.unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            };
-                            if vids.is_empty() {
-                                vids = fetch_channel_videos(cookies.as_deref(), &target, 20).await;
-                            }
-                            let _ = tx_ch
-                                .send(AppMessage::ChannelVideosLoaded {
-                                    channel_key: target,
-                                    items: vids,
-                                })
-                                .await;
-                        });
+                    if let Some(v) = state.detail_video.clone() {
+                        open_channel_for_video(&v, state, tx, client);
                     }
                 }
                 KeyCode::Char('p') => state.overlay = ActiveOverlay::PlayOptions,
@@ -3556,11 +4046,7 @@ async fn handle_key_event(
         KeyCode::Char('q') => open_confirm_quit(state),
         KeyCode::Char('?') => state.overlay = ActiveOverlay::Help,
         KeyCode::Char('/') => {
-            state.overlay = ActiveOverlay::Search;
-            state.search_query.clear();
-            state.search_results.clear();
-            state.search_local_results = get_all_cached_videos(pool, 16).await.unwrap_or_default();
-            state.search_cursor = 0;
+            open_search_overlay(state, pool).await;
         }
         KeyCode::Char('s') | KeyCode::Char(',') => {
             state.settings_query.clear();
@@ -3958,6 +4444,10 @@ async fn handle_overlay_key(
                 let next = state.config.performance_mode.next();
                 apply_performance_mode(state, next);
             }
+            KeyCode::Char('t') => {
+                let next = state.config.motion_mode.next();
+                apply_motion_mode(state, next);
+            }
             KeyCode::Char(' ') => {
                 if state.has_live_ipc() {
                     state.live_playback.paused = !state.live_playback.paused;
@@ -4011,64 +4501,111 @@ async fn handle_overlay_key(
         },
         ActiveOverlay::Search => match code {
             KeyCode::Esc => state.overlay = ActiveOverlay::None,
+            KeyCode::Tab => {
+                let candidate = state
+                    .search_suggestions
+                    .first()
+                    .or_else(|| state.search_history.first())
+                    .cloned();
+                if let Some(s) = candidate {
+                    apply_search_hit(SearchHit::ApplySuggestion(s), state, pool, tx, client).await;
+                }
+            }
             KeyCode::Up => state.search_cursor = state.search_cursor.saturating_sub(1),
             KeyCode::Down => {
                 let total = state.combined_search_items().len();
                 if total > 0 {
                     state.search_cursor = (state.search_cursor + 1).min(total - 1);
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
-                    open_detail_for_video(v, state, pool, tx, client);
-                } else {
-                    let q = state.search_query.trim().to_string();
-                    if !q.is_empty() {
-                        state.search_generation += 1;
-                        state.search_pending_remote = false;
-                        state.is_searching_remote = true;
-                        spawn_remote_search(&state.config, q, state.search_generation, tx);
+                    if state.search_cursor + 3 >= total
+                        && state.search_continuation.is_some()
+                        && !state.is_searching_remote
+                    {
+                        apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
                     }
                 }
             }
-            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
-                    pin_video_to_continue_watching(&v, state, pool).await;
+            KeyCode::PageUp => {
+                state.search_cursor = state.search_cursor.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                let total = state.combined_search_items().len();
+                if total > 0 {
+                    state.search_cursor = (state.search_cursor + 5).min(total - 1);
+                    if state.search_cursor + 3 >= total
+                        && state.search_continuation.is_some()
+                        && !state.is_searching_remote
+                    {
+                        apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
+                    }
                 }
+            }
+            KeyCode::Enter => {
+                let q = state.search_query.trim().to_string();
+                if let Some(vid) = extract_youtube_video_id(&q) {
+                    let stub = VideoItem {
+                        id: vid.clone(),
+                        title: format!("YouTube Video ({vid})"),
+                        webpage_url: Some(format!("https://www.youtube.com/watch?v={vid}")),
+                        ..VideoItem::default()
+                    };
+                    open_detail_for_video(stub, state, pool, tx, client);
+                } else if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                    if !q.is_empty() {
+                        state.push_search_history(&q);
+                    }
+                    open_detail_for_video(v, state, pool, tx, client);
+                } else if !q.is_empty() {
+                    trigger_search_update(state, pool, tx, client, true).await;
+                }
+            }
+            KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let next = state.search_type_filter.next();
+                apply_search_hit(SearchHit::SetType(next), state, pool, tx, client).await;
+            }
+            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let next = state.search_date_filter.next();
+                apply_search_hit(SearchHit::SetDate(next), state, pool, tx, client).await;
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let next = state.search_duration_filter.next();
+                apply_search_hit(SearchHit::SetDuration(next), state, pool, tx, client).await;
+            }
+            KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let next = state.search_sort_order.next();
+                apply_search_hit(SearchHit::SetSort(next), state, pool, tx, client).await;
+            }
+            KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+                apply_search_hit(SearchHit::ToggleHideWatched, state, pool, tx, client).await;
+            }
+            KeyCode::Char('g') if modifiers.contains(KeyModifiers::CONTROL) => {
+                let next = state.search_scope.next();
+                apply_search_hit(SearchHit::SetScope(next), state, pool, tx, client).await;
+            }
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
+            }
+            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                apply_search_hit(SearchHit::ActionPinCw, state, pool, tx, client).await;
+            }
+            KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
+                apply_search_hit(SearchHit::ActionWatchLater, state, pool, tx, client).await;
+            }
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                apply_search_hit(SearchHit::ActionChannel, state, pool, tx, client).await;
             }
             KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
-                    state.overlay = ActiveOverlay::None;
-                    start_nonblocking_playback(&v, None, state, pool, tx, client).await;
-                }
+                apply_search_hit(SearchHit::ActionPlay, state, pool, tx, client).await;
             }
             KeyCode::Char('p') if state.search_query.is_empty() => {
-                if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
-                    state.overlay = ActiveOverlay::None;
-                    start_nonblocking_playback(&v, None, state, pool, tx, client).await;
-                }
+                apply_search_hit(SearchHit::ActionPlay, state, pool, tx, client).await;
             }
             KeyCode::Backspace => {
                 state.search_query.pop();
-                state.search_generation += 1;
-                state.search_local_results =
-                    search_cached_videos(pool, &state.search_query)
-                        .await
-                        .unwrap_or_default();
-                state.search_last_typed = Some(Instant::now());
-                state.search_pending_remote = !state.search_query.trim().is_empty();
-                state.search_cursor = 0;
+                trigger_search_update(state, pool, tx, client, false).await;
             }
             KeyCode::Char(c) => {
                 state.search_query.push(c);
-                state.search_generation += 1;
-                state.search_local_results =
-                    search_cached_videos(pool, &state.search_query)
-                        .await
-                        .unwrap_or_default();
-                state.search_last_typed = Some(Instant::now());
-                state.search_pending_remote = true;
-                state.search_cursor = 0;
+                trigger_search_update(state, pool, tx, client, false).await;
             }
             _ => {}
         },

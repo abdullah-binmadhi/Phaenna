@@ -1,6 +1,6 @@
 //! Cross-platform binary detector & non-blocking external video player launcher.
 
-use crate::config::{DubPreference, PerformanceMode, Player, VideoShaderMode};
+use crate::config::{Config, DubPreference, MotionMode, PerformanceMode, Player, VideoShaderMode};
 use crate::error::{AppError, Result};
 use crate::services::shaders::{
     mpv_mastering_flags_for, prepare_video_shaders_for, VideoMasteringProfile,
@@ -125,6 +125,7 @@ pub struct PlayOptions {
     pub shader_mode: VideoShaderMode,
     pub mastering_profile: VideoMasteringProfile,
     pub performance_mode: PerformanceMode,
+    pub motion_mode: MotionMode,
     pub dub_preference: DubPreference,
     pub dub_lang: String,
     pub audio_multistreams: bool,
@@ -132,6 +133,166 @@ pub struct PlayOptions {
 }
 
 pub const LOUDNORM_FILTER: &str = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]";
+
+const YOUTUBE_INPUT_CONF: &str = r#"# Phaenna YouTube-Parity Player Keybindings (works windowed & fullscreen)
+k cycle pause
+SPACE cycle pause
+j seek -10
+l seek 10
+LEFT seek -5
+RIGHT seek 5
+UP add volume 5
+DOWN add volume -5
+m cycle mute
+f cycle fullscreen
+ESC set fullscreen no
+c cycle sub-visibility
+< add speed -0.25
+> add speed 0.25
+. frame-step
+, frame-back-step
+[ add chapter -1
+] add chapter 1
+0 seek 0 absolute-percent
+1 seek 10 absolute-percent
+2 seek 20 absolute-percent
+3 seek 30 absolute-percent
+4 seek 40 absolute-percent
+5 seek 50 absolute-percent
+6 seek 60 absolute-percent
+7 seek 70 absolute-percent
+8 seek 80 absolute-percent
+9 seek 90 absolute-percent
+HOME seek 0 absolute
+END seek 99 absolute-percent
+d cycle aid
+"#;
+
+const PHAENNA_LOADER_LUA: &str = r#"-- Phaenna Animated ASS Loading Bar Overlay (replaces startup black screen until first frame)
+local ov = mp.create_osd_overlay("ass-events")
+ov.res_x = 1280
+ov.res_y = 720
+
+local title = mp.get_opt("phaenna_title") or "Preparing Stream"
+local meta = mp.get_opt("phaenna_meta") or "PHAENNA STUDIO"
+if #title > 62 then title = string.sub(title, 1, 59) .. "..." end
+title = title:gsub("[{}]", "")
+meta = meta:gsub("[{}]", "")
+
+local phase = 0.0
+local cache_pct = nil
+local is_loading = true
+local timer = nil
+
+local function render_loader()
+    if not is_loading then
+        ov:remove()
+        return
+    end
+    phase = (phase + 0.045) % 1.0
+    local bar_x0 = 280
+    local bar_w = 720
+    local bar_y0 = 404
+    local bar_y1 = 418
+
+    local status = "Connecting & Buffering HD Stream..."
+    local fill_x0 = bar_x0
+    local fill_w = 180
+    if cache_pct and cache_pct > 0 and cache_pct < 100 then
+        status = string.format("Buffering Stream (%d%%)...", math.floor(cache_pct))
+        fill_w = math.max(24, math.floor(bar_w * (cache_pct / 100.0)))
+    else
+        local sweep = math.floor(phase * (bar_w - 160))
+        fill_x0 = bar_x0 + sweep
+        fill_w = 160
+    end
+    local fill_x1 = math.min(bar_x0 + bar_w, fill_x0 + fill_w)
+
+    local ass = string.format(
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H181412&\\1a&H14&\\p1}m 220 265 l 1060 265 l 1060 455 l 220 455{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&H8A5CF6&\\p1}m 220 265 l 1060 265 l 1060 455 l 220 455{\\p0}\n" ..
+        "{\\an5\\pos(640,305)\\bord0\\shad0\\fs20\\b1\\1c&H99D334&}%s\n" ..
+        "{\\an5\\pos(640,344)\\bord0\\shad0\\fs26\\b1\\1c&HFFFFFF&}%s\n" ..
+        "{\\an5\\pos(640,378)\\bord0\\shad0\\fs17\\1c&HB0B8C8&}%s\n" ..
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H2E2824&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HF65C8B&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}",
+        meta, title, status,
+        bar_x0, bar_y0, bar_x0 + bar_w, bar_y0, bar_x0 + bar_w, bar_y1, bar_x0, bar_y1,
+        fill_x0, bar_y0, fill_x1, bar_y0, fill_x1, bar_y1, fill_x0, bar_y1
+    )
+    ov.data = ass
+    ov:update()
+end
+
+local function start_anim()
+    if not timer then
+        timer = mp.add_periodic_timer(0.06, render_loader)
+    end
+    render_loader()
+end
+
+local function stop_anim()
+    is_loading = false
+    if timer then
+        timer:kill()
+        timer = nil
+    end
+    ov:remove()
+end
+
+mp.register_event("playback-restart", function()
+    local pfc = mp.get_property_bool("paused-for-cache", false)
+    if not pfc then stop_anim() end
+end)
+
+mp.observe_property("paused-for-cache", "bool", function(_, val)
+    if val then
+        is_loading = true
+        start_anim()
+    else
+        local t = mp.get_property_number("time-pos", 0)
+        if t and t > 0.02 then stop_anim() end
+    end
+end)
+
+mp.observe_property("time-pos", "number", function(_, val)
+    if val and val > 0.04 and not mp.get_property_bool("paused-for-cache", false) then
+        stop_anim()
+    end
+end)
+
+mp.observe_property("cache-buffering-state", "number", function(_, val)
+    cache_pct = val
+end)
+
+start_anim()
+"#;
+
+fn player_support_dir() -> PathBuf {
+    Config::cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("phaenna"))
+        .join("player")
+}
+
+/// Write YouTube-parity keybindings config (`input.conf`) and return its path.
+pub fn prepare_youtube_input_conf() -> Option<PathBuf> {
+    let dir = player_support_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("phaenna_yt_input.conf");
+    std::fs::write(&path, YOUTUBE_INPUT_CONF).ok().map(|_| path)
+}
+
+/// Write animated `mpv` Lua ASS loading overlay script and return its path.
+pub fn prepare_loading_overlay_script() -> Option<PathBuf> {
+    let dir = player_support_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("phaenna_loader.lua");
+    std::fs::write(&path, PHAENNA_LOADER_LUA).ok().map(|_| path)
+}
+
+fn sanitize_script_opt(s: &str) -> String {
+    s.replace([',', '\n', '\r', '='], " ").trim().to_string()
+}
 
 pub fn youtube_watch_url(video_id: &str) -> String {
     let clean_id = video_id.trim_start_matches("RD");
@@ -149,6 +310,40 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         format!("demuxer-max-back-bytes={back_buf}"),
         format!("force-media-title={}", opts.title),
     ];
+
+    if let Some(conf_path) = prepare_youtube_input_conf() {
+        flags.push(format!("input-conf={}", conf_path.to_string_lossy()));
+    }
+    if let Some(lua_path) = prepare_loading_overlay_script() {
+        flags.push(format!("script={}", lua_path.to_string_lossy()));
+        let safe_title = sanitize_script_opt(&opts.title);
+        let safe_meta = format!(
+            "PHAENNA {} | {}",
+            opts.performance_mode.short_badge(),
+            opts.motion_mode.short_badge()
+        );
+        flags.push(format!(
+            "script-opts=phaenna_title={safe_title},phaenna_meta={safe_meta}"
+        ));
+    }
+
+    match opts.motion_mode {
+        MotionMode::Off => {
+            flags.push("interpolation=no".to_string());
+        }
+        MotionMode::Cadence => {
+            flags.push("video-sync=display-resample".to_string());
+            flags.push("interpolation=yes".to_string());
+            flags.push("tscale=oversample".to_string());
+        }
+        MotionMode::Smooth120Hz => {
+            flags.push("video-sync=display-resample".to_string());
+            flags.push("interpolation=yes".to_string());
+            flags.push("tscale=catmull_rom".to_string());
+            flags.push("interpolation-threshold=0.01".to_string());
+            flags.push("override-display-fps=120".to_string());
+        }
+    }
 
     if opts.local_file.is_none() {
         flags.push(format!("ytdl-format={}", opts.quality_format));
@@ -248,6 +443,36 @@ pub fn build_iina_args(opts: &PlayOptions) -> Vec<String> {
     args
 }
 
+/// Build arguments for `vlc` applying YouTube-parity keybindings in windowed & fullscreen mode.
+pub fn build_vlc_args(opts: &PlayOptions) -> Vec<String> {
+    let target = opts
+        .local_file
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
+    vec![
+        format!("--video-title={}", opts.title),
+        "--short-jump-size=10".to_string(),
+        "--extrashort-jump-size=5".to_string(),
+        "--key-play-pause=k".to_string(),
+        "--key-jump-short=j".to_string(),
+        "--key-jump+short=l".to_string(),
+        "--key-jump-extrashort=Left".to_string(),
+        "--key-jump+extrashort=Right".to_string(),
+        "--key-vol-up=Up".to_string(),
+        "--key-vol-down=Down".to_string(),
+        "--key-vol-mute=m".to_string(),
+        "--key-toggle-fullscreen=f".to_string(),
+        "--key-leave-fullscreen=Esc".to_string(),
+        "--key-subtitle-toggle=c".to_string(),
+        "--key-audio-track=d".to_string(),
+        "--key-rate-slower-fine=<".to_string(),
+        "--key-rate-faster-fine=>".to_string(),
+        "--key-frame-next=.".to_string(),
+        target,
+    ]
+}
+
 /// Launch playback asynchronously in the background without blocking the TUI event loop!
 pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
     let target = opts
@@ -303,8 +528,9 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
             let bin = find_binary("vlc").ok_or_else(|| {
                 AppError::Player("VLC not found on PATH or /Applications".to_string())
             })?;
+            let args = build_vlc_args(opts);
             let child = Command::new(bin)
-                .arg(&target)
+                .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -369,6 +595,7 @@ mod tests {
             shader_mode: VideoShaderMode::Balanced,
             mastering_profile: VideoMasteringProfile::StandardHd,
             performance_mode: PerformanceMode::Quality,
+            motion_mode: MotionMode::Smooth120Hz,
             dub_preference: DubPreference::OriginalOnly,
             dub_lang: "en".to_string(),
             audio_multistreams: true,
@@ -384,7 +611,15 @@ mod tests {
         assert!(args.iter().any(|a| a == "--ytdl-raw-options-append=audio-multistreams="));
         assert!(args.iter().any(|a| a == "--alang=und,orig,en"));
         assert!(args.iter().any(|a| a.starts_with("--af=lavfi=")));
+        assert!(args.iter().any(|a| a == "--video-sync=display-resample"));
+        assert!(args.iter().any(|a| a == "--override-display-fps=120"));
+        assert!(args.iter().any(|a| a.starts_with("--input-conf=")));
+        assert!(args.iter().any(|a| a.starts_with("--script=")));
         assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
+
+        let vlc_args = build_vlc_args(&opts);
+        assert!(vlc_args.iter().any(|a| a == "--key-play-pause=k"));
+        assert!(vlc_args.iter().any(|a| a == "--key-toggle-fullscreen=f"));
 
         let mut eco_opts = opts.clone();
         eco_opts.performance_mode = PerformanceMode::Efficient;
@@ -412,6 +647,7 @@ mod tests {
             shader_mode: VideoShaderMode::Reference4K,
             mastering_profile: VideoMasteringProfile::StandardHd,
             performance_mode: PerformanceMode::Quality,
+            motion_mode: MotionMode::Cadence,
             dub_preference: DubPreference::PreferDubbed,
             dub_lang: "ar".to_string(),
             audio_multistreams: true,

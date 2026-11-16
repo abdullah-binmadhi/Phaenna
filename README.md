@@ -11,7 +11,7 @@
 > *Phaenna (FFXIV) — radiant light & craftsmanship.*  
 > Source: `https://github.com/abdullah-binmadhi/Phaenna`
 
-**Phaenna** is a cinema-grade terminal YouTube client built in Rust with **Ratatui**, pairing an instant `<15ms` SQLite WAL engine and GPU-accelerated terminal graphics (`Kitty`, `WezTerm`, `iTerm2`, `Sixel`, or universal half-block) with a custom **Reference 4K Studio GLSL mastering pipeline** for `mpv` and `IINA`.
+**Phaenna** is cinema-grade YouTube, reimagined for your terminal. Built in native Rust, it pairs an effortless, sub-second browsing experience and edge-to-edge thumbnails with a custom **4K Studio Mastering** engine, **120Hz ProMotion** fluidity, intelligent performance modes, and a live playback cockpit for `mpv`, `IINA`, and `VLC`.
 
 ---
 
@@ -51,32 +51,48 @@
 
 ## Highlights & Capabilities
 
-### Reference 4K Studio Mastering Pipeline (`mpv` & `IINA`)
-Solves YouTube bitrate starvation, `4:2:0` chroma bleeding, and compression macroblocking inside a unified GPU shader chain (`src/services/shaders.rs` + `src/api/player.rs`):
-- **High-Bitrate Stream Priority**: `Quality::Best` prioritizes `av01` > `vp9.2`/`vp9` > `4K/8K` with `format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr` and a `512MiB` (`128MiB` back-buffer) demuxer cache.
-- **Stage 1 — `01_deblock_dering.glsl` (`LUMA`)**: Edge-preserving bilateral DCT macroblock & mosquito-noise filter that dissolves compression blocking in flat gradients without softening fine detail.
-- **Stage 2 — `02_chroma_guided.glsl` (`CHROMA` + `LUMA`)**: Luma-guided `4:2:0 -> 4:4:4` chroma upsampler eliminating red/cyan edge fringing on text and high-contrast shots.
-- **Stage 3 — `03_superres_4k_rcas.glsl` (`LUMA 2x`)**: Directional structure-tensor edge reconstruction paired with AMD FidelityFX RCAS and a strict 3x3 `[min, max]` anti-ringing clamp.
-- **Selectable Studio Profiles (`VideoShaderMode`)**: Cycle between `Reference4K` (default), `NeuralCinema` (unlocks downloadable `FSRCNNX_x2_16-0-4-1.glsl` CNN weights directly inside Settings Hub `[s]`), `Anime4K` (`04_anime4k_restore.glsl` contour restoration), `Balanced`, and `Off`, backed by `ewa_lanczossharp` scaling (`0.7` antiring), 3-pass 16-bit debanding with fine film grain, temporal dithering, and `spline` HDR tone mapping.
-- **Full macOS `IINA` Parity**: `build_iina_args` translates the entire shader stack, format sorting, debanders, cookies, subtitles, and resume offset into `--mpv-*` arguments for `iina-cli`.
+### Cinema-Grade Video Mastery. Now Adapted to You.
+Web browsers compress, wash out, and muddy the videos you love. Phaenna restores clarity, crispness, and rich color straight on your GPU — while giving you total control over power and memory:
+- **Reference 4K Studio Pipeline (`mpv` & `IINA`)**: Cleans up blocky streaming artifacts, sharpens soft edges, and restores true-to-life color detail automatically — with selectable looks including **Reference 4K**, **Neural Cinema**, **Anime4K**, **Balanced**, and **Off**.
+- **Performance Modes That Adapt Live (`m`)**:
+  - **Efficient (~350MB RAM)**: Featherweight memory and battery footprint that still delivers a cleaner, crisper picture than browser playback.
+  - **Balanced (~650MB RAM)**: The everyday sweet spot with richer color cleanup and responsive buffering.
+  - **Quality (~1.4GB RAM)**: Maximum multi-pass 4K studio mastering with zero compromises — switchable live mid-video inside Playback Studio (`p`).
+- **120Hz ProMotion Fluidity (`t`)**: Built for modern high-refresh displays with an adaptive 120Hz interface and selectable motion profiles — **Off** (native cadence), **Cadence** (judder-free 120Hz lock), and **Smooth 120Hz** motion interpolation.
+- **No More Black Startup Screens**: An animated Phaenna loading card greets you the moment you press Play — showing the title, active quality tier, and buffer progress cleanly until the very first frame appears.
+
+### Playback Studio & Original Audio Control (`p`)
+Take complete command of your viewing experience without ever leaving the video:
+- **Original Voice or Dubbed, One Key Away (`d`)**: Never get stuck listening to an unwanted auto-dubbed voice track. Lock in the creator's original language by default, or flip between Original and Dubbed tracks live on the fly.
+- **Full 5-Zone Live Cockpit**: Hot-swap audio tracks and captions, normalize sudden volume spikes, fine-tune brightness/contrast/saturation/gamma, step speeds (`0.5x`–`2.5x`), scrub chapters, and cycle 4K shaders or Performance Modes — all updated live via keyboard or mouse.
+- **Complete Endings Protected**: Smart outro safety keeps SponsorBlock from prematurely skipping the final seconds of a video, so stories and credits finish cleanly.
+
+### Universal YouTube Keybindings — Windowed or Fullscreen
+Keep every shortcut in your muscle memory across **`mpv`**, **`IINA`**, and **`VLC`**, even in full-screen theater mode:
+- `k` / `Space` Play & Pause · `j` / `l` Jump `-10s` / `+10s` · `Left` / `Right` Step `-5s` / `+5s`
+- `Up` / `Down` Volume · `m` Mute · `f` Toggle Fullscreen · `Esc` Exit Fullscreen
+- `c` Captions · `d` Switch Audio/Dub Track · `<` / `>` Playback Speed · `,` / `.` Frame Step
+- `0`–`9` Jump to `0%`–`90%` · `[` / `]` Previous & Next Chapter *(mpv / IINA)*
+
+### Search Studio (`/`) That Thinks With You
+Finding the exact video is instant, accurate, and interactive from the first keystroke:
+- **Live Autocomplete & Recent Chips**: YouTube query suggestions appear in real time — tap `Tab` to complete or click any chip directly.
+- **Precision Filter & Sort Bar**: Narrow by **Scope** (`All`, `Live YT`, `Subscribed`, `Cached`), **Type** (`Videos`, `Shorts`), **Upload Date** (`Today`, `Week`, `Month`, `Year`), **Duration** (`<4m`, `4–20m`, `>20m`), **Hide Watched**, and **Sort** (`Relevance`, `Newest`, `Most Viewed`, `Duration`).
+- **Instant Results & Quick Actions**: Paste any YouTube link directly, paginate endlessly, scroll with mouse or keyboard, double-click for Details, or trigger **Play**, **+Queue**, **Watch Later**, and **Channel** in one click.
 
 ### Visual Interface & Edge-to-Edge Media
-- **Zero-Gap 100%-Width 16:9 Thumbnails**: Trims both legacy `4:3` black letterboxes and solid side pillars, then pre-scales every frame to exact cell pixel geometry (`width * font_w`, `height * font_h`) via `CatmullRom` / `Lanczos3` so thumbnails fill every card and inspector edge-to-edge.
-- **YouTube-Style Metadata & Ticker Marquee**: Cards display compact view counts, release age (`2h ago`, `3d ago`), `[NEW]` indicators on recent uploads, `[LIVE]` status, and horizontal stock-tape marquee scrolling on the focused title so long titles never stay truncated.
-- **58% / 42% Split-Pane Preview Inspectors**: Upload Radar (`c`), Channel Catalog (`c` from Detail), and Instant Search (`/`) feature live right-hand `16:9` thumbnail previews, metadata telemetry, synopsis excerpts, and instant `[Space]` / `[a]` playback & queueing.
-- **Bento Detail Command Deck (`Enter` / `i`)**: Aspect-locked `16:9` stage, ReturnYouTubeDislike sentiment gauge, proportional SponsorBlock segment bar, active 4K mastering readout, wrapped description with extracted links/tags, and interactive `Tab`-switchable **Chapters** & **Up Next** drawer.
-- **Dynamic HSV Ambilight**: Extracts saturated dominant hues from focused video art to tint active panes cleanly across 6 selectable themes (`T`).
+- **Zero-Gap 100%-Width 16:9 Thumbnails**: Trims black bars and side pillars so every card and inspector renders crisp, edge-to-edge artwork.
+- **YouTube-Style Metadata & Focus Marquee**: Cards highlight view counts, release age, `[NEW]` badges, `[LIVE]` status, and smoothly scroll long titles on focus.
+- **Split-Pane Inspectors & Bento Detail Deck (`Enter` / `i`)**: Upload Radar (`c`), Channel Catalog, and Detail pair rich 16:9 artwork with sentiment meters, interactive SponsorBlock timelines, wrapped descriptions, **Chapters**, and **Up Next**.
+- **Dynamic Ambilight**: Subtly tints active frames using the dominant palette of the video you're exploring across 6 themes (`T`).
 
-### Infinite Scroll, Queueing, Identity & Intelligence
-- **Infinite Scroll & Continue Watching Queue Deck**: Automatically paginates feeds as you scroll (`PgDn` / `^d` / `n`), paired with a persistent `[1] Continue Watching` watch-later & resume deck (`[a]`/`[+]` pin from any view, `[x]`/`[d]` remove, `[X]` clear finished, `[K]`/`[J]` reorder, `[v]` toggle Deck/Grid view).
-- **In-App Google Identity Hub (`L`)**: Supports Kitty/WezTerm Split SSO, Chrome app-window login, QR OAuth Device Code, or in-TUI email & 2FA verification stored with `0600` vault permissions.
-- **Intelligence & Companion Suite**:
-  - `[A]` **Phaenna Wrapped Analytics**: 24-hour Braille circadian distribution, runtime histogram, 26-week thermal watch heatmap, SponsorBlock time saved, and Top Channels.
-  - `[t]` **Discovery Crucible**: 6-step taste constellation wizard + Live Vibe Tuner.
-  - `[m]` / `phaenna remote`: Mobile LAN WebSocket remote with terminal QR code.
-  - `[C]` **AirPlay 2 & DLNA Smart TV Cast** via SSDP discovery.
-  - `[D]` **Offline Vault Downloader** -> `~/Movies/Phaenna/{Channel}/{Title}.mp4` with chapter embedding.
-  - `[s]` / `,` **Fuzzy Command Hub** (`SkimMatcherV2`), `[!]` **System Doctor**, and `[U]` **Self-Updater**.
+### Queueing, Identity & Companion Suite
+- **Infinite Scroll & Continue Watching Deck**: Seamlessly browse deeper feeds and pin favorites (`a` / `+`) to your persistent Continue Watching deck.
+- **Effortless Google Sign-In (`L`)**: Split-window SSO, Chrome sign-in, QR Device Code, or in-app verification kept safely on your machine.
+- **More Crafted Experiences**:
+  - `[A]` **Phaenna Wrapped Analytics**: Visual watch habits, circadian rhythm, 26-week thermal heatmap, and SponsorBlock time saved.
+  - `[t]` **Discovery Crucible**: Interactive taste tuner tailored to your mood.
+  - `[m]` **Mobile LAN Remote** via instant QR code, `[C]` **AirPlay 2 & Smart TV Cast**, `[D]` **Offline Vault**, `[s]` **Fuzzy Command Hub**, `[!]` **System Doctor**, and `[U]` **Updater**.
 
 ---
 
@@ -167,11 +183,11 @@ foreach ($id in @("wez.wezterm","Microsoft.WindowsTerminal","shinchiro.mpv","Vid
 | | `x` / `d` | Remove selected item from Continue Watching |
 | | `K` / `J` | Reorder queued item up / down |
 | | `X` / `v` | Clear finished items / toggle Deck vs. Grid layout |
-| **Playback & Mastering** | `Space` | Play immediately in active player (`mpv` / `IINA` / `VLC`) |
-| | `p` | Play Options (`[s]` cycles Reference 4K / Neural Cinema / Anime4K / Balanced / Off) |
+| **Playback & Mastering** | `Space` | Play immediately in active player (`mpv` / `IINA` / `VLC`) with YouTube keybindings |
+| | `p` | Playback Studio (`d` Dubbed/Original, `m` Performance Mode, `t` 120Hz Motion, `s` 4K Shaders) |
 | | `Enter` / `i` | Open Bento Detail Command Deck (`Tab` switches Chapters / Up Next, `c` drills into Channel) |
 | | `w` / `D` | Toggle Watch Later / Download to Offline Vault |
-| **Discovery & Hubs** | `/` | Split-pane Instant SQLite + Live YouTube Search (`Ctrl+p` Play, `Ctrl+a` +Continue Watching) |
+| **Discovery & Hubs** | `/` | Search Studio (Live Suggestions `Tab`, `Ctrl+t/d/u/s/w/g` Filters & Sort, `Ctrl+p` Play, `Ctrl+a` Queue) |
 | | `c` | 7-Day Upload Radar with live `16:9` preview (`h`/`l` Day, `[`/`]` Week, `Space` Play, `a` +CW, `w` WL) |
 | | `f` / `r` | Filter (`All` / `Longform` / `Shorts`) & Sort / Force refresh feeds |
 | | `A` / `t` | Phaenna Wrapped Analytics / Discovery Crucible (`Tailored`) |

@@ -4,6 +4,7 @@
 use crate::db::cache::{Thumbnail, VideoItem};
 use crate::error::{AppError, Result};
 use crate::services::auth::{compute_sapisidhash, now_unix_secs, GoogleAccountSession, PHAENNA_USER_AGENT};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, USER_AGENT};
 use std::collections::HashSet;
 
@@ -1602,6 +1603,124 @@ pub async fn fetch_suggested_shorts(
     Ok(page)
 }
 
+/// Encode YouTube InnerTube `search` protobuf `params` token for server-side Sort / Upload Date / Duration.
+/// `sort_code`: 0=Relevance, 1=Rating, 2=Newest, 3=Views
+/// `date_code`: 0=Any, 2=Today, 3=Week, 4=Month, 5=Year
+/// `dur_code`: 0=Any, 1=<4m, 3=4-20m, 2=>20m
+pub fn encode_search_params(
+    sort_code: u8,
+    date_code: u8,
+    dur_code: u8,
+    videos_only: bool,
+) -> Option<String> {
+    if sort_code == 0 && date_code == 0 && dur_code == 0 && !videos_only {
+        return None;
+    }
+    let mut sub = Vec::new();
+    if date_code > 0 {
+        sub.push(1 << 3); // field 1, wire type 0 (varint)
+        sub.push(date_code);
+    }
+    if videos_only || date_code > 0 || dur_code > 0 {
+        sub.push(2 << 3); // field 2, wire type 0 (varint)
+        sub.push(1); // type = Video
+    }
+    if dur_code > 0 {
+        sub.push(3 << 3); // field 3, wire type 0 (varint)
+        sub.push(dur_code);
+    }
+
+    let mut msg = Vec::new();
+    if sort_code > 0 {
+        msg.push(1 << 3); // field 1, wire type 0 (varint)
+        msg.push(sort_code);
+    }
+    if !sub.is_empty() {
+        msg.push((2 << 3) | 2); // field 2, length-delimited
+        msg.push(sub.len() as u8);
+        msg.extend_from_slice(&sub);
+    }
+    Some(URL_SAFE_NO_PAD.encode(msg))
+}
+
+/// Fast HTTP InnerTube `/youtubei/v1/search` with server-side filters and continuation pagination (~150-350ms).
+pub async fn search_innertube(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    query: &str,
+    params: Option<&str>,
+    continuation: Option<&str>,
+) -> Result<InnerTubeShelfPage> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() && continuation.is_none() {
+        return Ok(InnerTubeShelfPage::default());
+    }
+    let mut payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        }
+    });
+    if let Some(cont) = continuation.filter(|c| !c.is_empty()) {
+        payload["continuation"] = serde_json::Value::String(cont.to_string());
+    } else {
+        payload["query"] = serde_json::Value::String(trimmed.to_string());
+        if let Some(sp) = params.filter(|p| !p.is_empty()) {
+            payload["params"] = serde_json::Value::String(sp.to_string());
+        }
+    }
+
+    let req = client
+        .post("https://www.youtube.com/youtubei/v1/search?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload);
+    let resp = apply_innertube_web_headers(req, session).send().await?;
+    if !resp.status().is_success() {
+        return Err(AppError::Http(format!("InnerTube search HTTP {}", resp.status())));
+    }
+    let root: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Parse(format!("Invalid search JSON: {e}")))?;
+    Ok(parse_innertube_browse_json(&root))
+}
+
+/// Fetch YouTube live search autocomplete suggestions cleanly (`<120ms`).
+pub async fn fetch_search_suggestions(client: &reqwest::Client, query: &str) -> Vec<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let Ok(resp) = client
+        .get("https://suggestqueries.google.com/complete/search")
+        .query(&[("client", "firefox"), ("ds", "yt"), ("q", trimmed)])
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(arr) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    arr.get(1)
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|x| x.as_str().map(str::trim))
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(trimmed))
+                .take(6)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Fetch missing `(uploader, view_count, published_text, timestamp)` for any video via InnerTube `/next`.
 pub async fn fetch_video_card_enrichment(
     client: &reqwest::Client,
@@ -2353,5 +2472,8 @@ mod tests {
         assert_eq!(v1.duration_string.as_deref(), Some("SHORT"));
 
         assert!(parse_english_short_date_to_unix("Nov 15, 2026").is_some());
+        assert!(encode_search_params(0, 0, 0, false).is_none());
+        let sp = encode_search_params(2, 3, 1, true).unwrap();
+        assert!(!sp.is_empty());
     }
 }

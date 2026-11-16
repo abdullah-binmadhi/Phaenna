@@ -621,6 +621,43 @@ impl PerformanceMode {
     }
 }
 
+/// 120Hz display refresh cadence & GPU motion interpolation profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionMode {
+    Off,
+    #[default]
+    Cadence,
+    Smooth120Hz,
+}
+
+#[allow(dead_code)]
+impl MotionMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Cadence,
+            Self::Cadence => Self::Smooth120Hz,
+            Self::Smooth120Hz => Self::Off,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off (Native FPS)",
+            Self::Cadence => "Cadence (120Hz Match)",
+            Self::Smooth120Hz => "Smooth 120Hz",
+        }
+    }
+
+    pub const fn short_badge(self) -> &'static str {
+        match self {
+            Self::Off => "NAT",
+            Self::Cadence => "120C",
+            Self::Smooth120Hz => "120S",
+        }
+    }
+}
+
 /// Persistent application configuration for Phaenna (`config.toml`).
 /// Root user configuration persisted to `<config_dir>/config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -649,6 +686,8 @@ pub struct Config {
     pub shader_mode: VideoShaderMode,
     #[serde(default)]
     pub performance_mode: PerformanceMode,
+    #[serde(default)]
+    pub motion_mode: MotionMode,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
     #[serde(default = "default_theme_index")]
@@ -686,6 +725,7 @@ impl Default for Config {
             skip_outro: false,
             shader_mode: VideoShaderMode::default(),
             performance_mode: PerformanceMode::default(),
+            motion_mode: MotionMode::default(),
             ambilight_enabled: true,
             theme_index: default_theme_index(),
             google_oauth: GoogleOAuthConfig::default(),
@@ -840,6 +880,8 @@ mod tests {
         assert_eq!(PerformanceMode::Efficient.demuxer_limits(), ("48MiB", "16MiB"));
         assert!(!PerformanceMode::Efficient.loads_multistreams(true));
         assert!(PerformanceMode::Quality.loads_multistreams(true));
+        assert_eq!(MotionMode::Off.next(), MotionMode::Cadence);
+        assert_eq!(MotionMode::Cadence.next(), MotionMode::Smooth120Hz);
     }
 
     #[test]

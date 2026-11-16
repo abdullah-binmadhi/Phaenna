@@ -4,7 +4,7 @@
 
 use crate::api::player::LOUDNORM_FILTER;
 use crate::api::sponsorblock::{category_label, SponsorSegment};
-use crate::config::{PerformanceMode, VideoShaderMode};
+use crate::config::{MotionMode, PerformanceMode, VideoShaderMode};
 use crate::db;
 use crate::messages::AppMessage;
 use crate::services::shaders::{prepare_video_shaders_for, VideoMasteringProfile};
@@ -151,6 +151,7 @@ pub enum PlayerCommand {
     SetLoudnorm(bool),
     SetShaderMode(VideoShaderMode, VideoMasteringProfile, PerformanceMode),
     SetPerformanceMode(PerformanceMode, VideoShaderMode, VideoMasteringProfile),
+    SetMotionMode(MotionMode),
     SetPictureProp { prop: &'static str, value: i64 },
     ResetPicture,
     SetOnTop(bool),
@@ -266,6 +267,25 @@ impl PlayerCommand {
                 }
                 cmds
             }
+            Self::SetMotionMode(motion) => match motion {
+                MotionMode::Off => vec![
+                    json!({"command": ["set_property", "interpolation", "no"]}).to_string(),
+                    json!({"command": ["set_property", "video-sync", "audio"]}).to_string(),
+                ],
+                MotionMode::Cadence => vec![
+                    json!({"command": ["set_property", "video-sync", "display-resample"]})
+                        .to_string(),
+                    json!({"command": ["set_property", "interpolation", "yes"]}).to_string(),
+                    json!({"command": ["set_property", "tscale", "oversample"]}).to_string(),
+                ],
+                MotionMode::Smooth120Hz => vec![
+                    json!({"command": ["set_property", "video-sync", "display-resample"]})
+                        .to_string(),
+                    json!({"command": ["set_property", "interpolation", "yes"]}).to_string(),
+                    json!({"command": ["set_property", "tscale", "catmull_rom"]}).to_string(),
+                    json!({"command": ["set_property", "override-display-fps", 120]}).to_string(),
+                ],
+            },
             Self::SetPictureProp { prop, value } => {
                 vec![json!({"command": ["set_property", prop, (*value).clamp(-100, 100)]}).to_string()]
             }
@@ -485,6 +505,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
         let mut last_pos = 0.0f64;
         let mut last_dur = 0.0f64;
         let mut last_save = std::time::Instant::now();
+        let mut last_ui_tick = std::time::Instant::now();
         let mut skipped_uuids: HashSet<String> = HashSet::new();
         let mut marked_watched = false;
 
@@ -565,6 +586,18 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                         .await;
                                 }
 
+                                if last_ui_tick.elapsed() >= Duration::from_millis(900) {
+                                    last_ui_tick = std::time::Instant::now();
+                                    let _ = config
+                                        .tx
+                                        .send(AppMessage::PlaybackProgressUpdated {
+                                            video_id: config.video_id.clone(),
+                                            pos: last_pos,
+                                            duration: last_dur,
+                                        })
+                                        .await;
+                                }
+
                                 if last_save.elapsed() >= Duration::from_secs(4) && last_pos > 1.0 {
                                     last_save = std::time::Instant::now();
                                     let _ = db::user::save_playback_progress(
@@ -575,14 +608,6 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                         now_unix(),
                                     )
                                     .await;
-                                    let _ = config
-                                        .tx
-                                        .send(AppMessage::PlaybackProgressUpdated {
-                                            video_id: config.video_id.clone(),
-                                            pos: last_pos,
-                                            duration: last_dur,
-                                        })
-                                        .await;
                                 }
                             }
                             _ => {}

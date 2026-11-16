@@ -41,6 +41,16 @@ pub enum AppMessage {
         generation: u64,
         query: String,
         items: Vec<VideoItem>,
+        continuation: Option<String>,
+    },
+    MoreSearchResults {
+        generation: u64,
+        items: Vec<VideoItem>,
+        continuation: Option<String>,
+    },
+    SearchSuggestionsReady {
+        generation: u64,
+        suggestions: Vec<String>,
     },
     ChannelVideosLoaded {
         channel_key: String,

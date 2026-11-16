@@ -4,7 +4,8 @@
 //! Speed, Volume, Picture Tuning, and Safe Outro SponsorBlock settings.
 
 use crate::config::{
-    dub_lang_label, PerformanceMode, Player, Quality, SponsorBlockMode, VideoShaderMode,
+    dub_lang_label, MotionMode, PerformanceMode, Player, Quality, SponsorBlockMode,
+    VideoShaderMode,
 };
 use crate::state::{
     active_modal_rect, centered_rect, ActiveOverlay, AppState, NowPlayingHit, PlayOptionsHit,
@@ -478,7 +479,16 @@ fn render_audio_dub_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let max_rows = (inner.height as usize).saturating_sub(lines.len());
         let reserve_more = usize::from(total_tracks > max_rows && max_rows > 1);
         let visible_cap = max_rows.saturating_sub(reserve_more).max(1);
-        for tr in state.live_playback.audio_tracks.iter().take(visible_cap).cloned() {
+        let max_scroll = total_tracks.saturating_sub(visible_cap);
+        let scroll = state.live_playback.audio_track_scroll.min(max_scroll);
+        for tr in state
+            .live_playback
+            .audio_tracks
+            .iter()
+            .skip(scroll)
+            .take(visible_cap)
+            .cloned()
+        {
             let active = state.live_playback.active_aid == Some(tr.id) || tr.selected;
             let row = lines.len() as u16;
             let st = if active {
@@ -498,11 +508,14 @@ fn render_audio_dub_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
             push_line_hit(hits, inner, row, PlayOptionsHit::SelectAudioTrack(tr.id));
         }
         if total_tracks > visible_cap {
-            let hidden = total_tracks - visible_cap;
+            let row = lines.len() as u16;
+            let hidden_above = scroll;
+            let hidden_below = total_tracks.saturating_sub(scroll + visible_cap);
             lines.push(Line::from(Span::styled(
-                format!("  +{hidden} other language tracks available"),
+                format!("  +{hidden_above} above / +{hidden_below} below [Scroll/Click]"),
                 Style::default().fg(theme.text_dim),
             )));
+            push_line_hit(hits, inner, row, PlayOptionsHit::ScrollAudioTracks(1));
         }
     }
     push_panel_hit(hits, area, 1);
@@ -645,6 +658,20 @@ fn render_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Span::styled(m.detail_summary(), Style::default().fg(theme.text_dim)),
         ]));
         push_line_hit(hits, inner, row, PlayOptionsHit::SelectShader(m));
+    }
+    if (lines.len() as u16) < inner.height
+        && state.config.performance_mode != PerformanceMode::Quality
+        && state.config.shader_mode != VideoShaderMode::Off
+    {
+        let budget_note = match state.config.performance_mode {
+            PerformanceMode::Efficient => "  [ECO] Active budget: Light Luma CAS pass",
+            PerformanceMode::Balanced => "  [BAL] Active budget: 3-pass Balanced mastering",
+            PerformanceMode::Quality => "",
+        };
+        lines.push(Line::from(Span::styled(
+            budget_note,
+            Style::default().fg(theme.secondary),
+        )));
     }
     push_panel_hit(hits, area, 3);
 
@@ -827,14 +854,15 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     );
     hits.push((pic_rects[4], PlayOptionsHit::ResetPicture));
 
-    // Row 5: Window & Session Buttons
+    // Row 5: Window, 120Hz Motion & Session Buttons
     let win_rects = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(22),
-            Constraint::Percentage(30),
-            Constraint::Percentage(23),
+            Constraint::Percentage(20),
+            Constraint::Percentage(17),
+            Constraint::Percentage(21),
+            Constraint::Percentage(26),
+            Constraint::Percentage(16),
         ])
         .split(rows[5]);
     frame.render_widget(
@@ -851,24 +879,37 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
         )),
         win_rects[1],
     );
+    let motion_color = match state.config.motion_mode {
+        MotionMode::Off => theme.text_dim,
+        MotionMode::Cadence => theme.secondary,
+        MotionMode::Smooth120Hz => Color::Rgb(56, 189, 248),
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("[t:{}]", state.config.motion_mode.short_badge()),
+            Style::default().fg(motion_color).add_modifier(Modifier::BOLD),
+        )),
+        win_rects[2],
+    );
     frame.render_widget(
         Paragraph::new(Span::styled(
             if live { "[Relaunch]" } else { "[Launch Video]" },
             Style::default().fg(Color::Rgb(52, 211, 153)).add_modifier(Modifier::BOLD),
         )),
-        win_rects[2],
+        win_rects[3],
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
             "[Stop]",
             Style::default().fg(Color::Rgb(239, 68, 68)).add_modifier(Modifier::BOLD),
         )),
-        win_rects[3],
+        win_rects[4],
     );
     hits.push((win_rects[0], PlayOptionsHit::ToggleOnTop));
     hits.push((win_rects[1], PlayOptionsHit::ToggleLoop));
-    hits.push((win_rects[2], PlayOptionsHit::LaunchOrRelaunch));
-    hits.push((win_rects[3], PlayOptionsHit::StopPlayer));
+    hits.push((win_rects[2], PlayOptionsHit::CycleMotion));
+    hits.push((win_rects[3], PlayOptionsHit::LaunchOrRelaunch));
+    hits.push((win_rects[4], PlayOptionsHit::StopPlayer));
     push_panel_hit(hits, area, 4);
 }
 
@@ -929,6 +970,12 @@ pub fn render_now_playing_bar(frame: &mut Frame, area: Rect, state: &mut AppStat
             format!("[{}]", state.config.performance_mode.short_badge()),
             Style::default().fg(Color::Rgb(56, 189, 248)).bg(bg).add_modifier(Modifier::BOLD),
             Some(NowPlayingHit::CyclePerfMode),
+        ),
+        (" ".to_string(), Style::default().bg(bg), None),
+        (
+            format!("[{}]", state.config.motion_mode.short_badge()),
+            Style::default().fg(theme.secondary).bg(bg).add_modifier(Modifier::BOLD),
+            Some(NowPlayingHit::CycleMotion),
         ),
         (" ".to_string(), Style::default().bg(bg), None),
         (shader_lbl, Style::default().fg(theme.primary).bg(bg), Some(NowPlayingHit::CycleShader)),

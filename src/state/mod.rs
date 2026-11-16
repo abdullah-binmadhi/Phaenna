@@ -5,7 +5,9 @@ use crate::api::innertube::VideoComment;
 use crate::api::player::{detect_dependencies, DependencyStatus};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
-use crate::config::{Config, PerformanceMode, Player, Quality, SponsorBlockMode, VideoShaderMode};
+use crate::config::{
+    Config, PerformanceMode, Player, Quality, SponsorBlockMode, VideoShaderMode,
+};
 use crate::db::cache::VideoItem;
 use crate::db::sync::{
     HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED, SUBSCRIPTIONS, WATCH_LATER,
@@ -246,10 +248,22 @@ pub struct AppState {
     pub channel_cursor: usize,
     pub is_loading_channel: bool,
 
-    // Search + 350ms debounce
+    // Search Studio + 120ms/350ms debounce + smart filters
     pub search_query: String,
     pub search_results: Vec<VideoItem>,
     pub search_local_results: Vec<VideoItem>,
+    pub search_suggestions: Vec<String>,
+    pub search_history: Vec<String>,
+    pub search_continuation: Option<String>,
+    pub search_scope: SearchScope,
+    pub search_type_filter: SearchTypeFilter,
+    pub search_date_filter: SearchDateFilter,
+    pub search_duration_filter: SearchDurationFilter,
+    pub search_sort_order: SearchSortOrder,
+    pub search_hide_watched: bool,
+    pub search_hitboxes: Vec<(Rect, SearchHit)>,
+    pub search_results_rect: Rect,
+    pub search_last_click: Option<(usize, Instant)>,
     pub search_cursor: usize,
     pub search_generation: u64,
     pub search_last_typed: Option<Instant>,
@@ -403,6 +417,18 @@ impl AppState {
             search_query: String::new(),
             search_results: Vec::new(),
             search_local_results: Vec::new(),
+            search_suggestions: Vec::new(),
+            search_history: Vec::new(),
+            search_continuation: None,
+            search_scope: SearchScope::All,
+            search_type_filter: SearchTypeFilter::All,
+            search_date_filter: SearchDateFilter::Any,
+            search_duration_filter: SearchDurationFilter::Any,
+            search_sort_order: SearchSortOrder::Relevance,
+            search_hide_watched: false,
+            search_hitboxes: Vec::new(),
+            search_results_rect: Rect::default(),
+            search_last_click: None,
             search_cursor: 0,
             search_generation: 0,
             search_last_typed: None,
@@ -799,19 +825,172 @@ impl AppState {
     }
 
     pub fn combined_search_items(&self) -> Vec<VideoItem> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let q_trimmed = self.search_query.trim().to_lowercase();
+        let q_clean = q_trimmed
+            .strip_prefix("ch:")
+            .unwrap_or(&q_trimmed)
+            .trim_start_matches('@')
+            .to_string();
+        let tokens: Vec<&str> = q_clean.split_whitespace().collect();
+
+        let sub_items: Vec<&VideoItem> = self
+            .categories
+            .iter()
+            .find(|(c, _)| *c == Category::Subscriptions)
+            .map(|(_, list)| list.iter().collect())
+            .unwrap_or_default();
+        let sub_uploaders: HashSet<String> = sub_items
+            .iter()
+            .map(|v| v.display_uploader().to_lowercase())
+            .collect();
+
+        let mut pool: Vec<VideoItem> = Vec::new();
         let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for v in &self.search_results {
-            if seen.insert(v.id.clone()) {
-                out.push(v.clone());
+        let mut push_dedupe = |v: &VideoItem| {
+            let cid = v.clean_id().to_string();
+            if seen.insert(cid) {
+                pool.push(v.clone());
+            }
+        };
+
+        match self.search_scope {
+            SearchScope::All => {
+                for v in &self.search_results {
+                    push_dedupe(v);
+                }
+                for v in &self.search_local_results {
+                    push_dedupe(v);
+                }
+            }
+            SearchScope::LiveYt => {
+                for v in &self.search_results {
+                    push_dedupe(v);
+                }
+            }
+            SearchScope::Subscribed => {
+                for v in sub_items.into_iter().chain(self.shorts_subscribed.iter()) {
+                    if q_clean.is_empty() || video_matches_tokens(v, &tokens) {
+                        push_dedupe(v);
+                    }
+                }
+            }
+            SearchScope::Cached => {
+                for v in &self.search_local_results {
+                    push_dedupe(v);
+                }
             }
         }
-        for v in &self.search_local_results {
-            if seen.insert(v.id.clone()) {
-                out.push(v.clone());
+
+        // Apply Search filters
+        let min_ts = self.search_date_filter.min_timestamp(now);
+        pool.retain(|v| {
+            if self.search_hide_watched && self.is_video_watched(&v.id) {
+                return false;
+            }
+            match self.search_type_filter {
+                SearchTypeFilter::All => {}
+                SearchTypeFilter::Videos => {
+                    if v.is_shorts() {
+                        return false;
+                    }
+                }
+                SearchTypeFilter::Shorts => {
+                    if !v.is_shorts() {
+                        return false;
+                    }
+                }
+            }
+            if !self.search_duration_filter.matches(v.duration) {
+                return false;
+            }
+            if let Some(cutoff) = min_ts {
+                if let Some(ts) = v.timestamp {
+                    if ts < cutoff {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+
+        // Score & sort
+        let mut scored: Vec<(i64, VideoItem)> = pool
+            .into_iter()
+            .map(|v| {
+                let s = search_relevance_score(&v, &q_clean, &tokens, &sub_uploaders, now);
+                (s, v)
+            })
+            .collect();
+
+        match self.search_sort_order {
+            SearchSortOrder::Relevance => {
+                scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+            }
+            SearchSortOrder::Newest => {
+                scored.sort_by(|a, b| {
+                    b.1.timestamp
+                        .unwrap_or(0)
+                        .cmp(&a.1.timestamp.unwrap_or(0))
+                        .then_with(|| b.0.cmp(&a.0))
+                });
+            }
+            SearchSortOrder::Views => {
+                scored.sort_by(|a, b| {
+                    b.1.view_count
+                        .unwrap_or(0)
+                        .cmp(&a.1.view_count.unwrap_or(0))
+                        .then_with(|| b.0.cmp(&a.0))
+                });
+            }
+            SearchSortOrder::Duration => {
+                scored.sort_by(|a, b| {
+                    b.1.duration
+                        .unwrap_or(0)
+                        .cmp(&a.1.duration.unwrap_or(0))
+                        .then_with(|| b.0.cmp(&a.0))
+                });
             }
         }
-        out
+
+        scored.into_iter().map(|(_, v)| v).collect()
+    }
+
+    pub fn push_search_history(&mut self, query: &str) {
+        let q = query.trim().to_string();
+        if q.len() < 2 {
+            return;
+        }
+        self.search_history.retain(|h| !h.eq_ignore_ascii_case(&q));
+        self.search_history.insert(0, q);
+        self.search_history.truncate(8);
+    }
+
+    pub fn search_params_token(&self) -> Option<String> {
+        let sort_code = match self.search_sort_order {
+            SearchSortOrder::Relevance => 0,
+            SearchSortOrder::Newest => 2,
+            SearchSortOrder::Views => 3,
+            SearchSortOrder::Duration => 0,
+        };
+        let date_code = match self.search_date_filter {
+            SearchDateFilter::Any => 0,
+            SearchDateFilter::Today => 2,
+            SearchDateFilter::Week => 3,
+            SearchDateFilter::Month => 4,
+            SearchDateFilter::Year => 5,
+        };
+        let dur_code = match self.search_duration_filter {
+            SearchDurationFilter::Any => 0,
+            SearchDurationFilter::Short => 1,
+            SearchDurationFilter::Medium => 3,
+            SearchDurationFilter::Long => 2,
+        };
+        let videos_only = self.search_type_filter == SearchTypeFilter::Videos;
+        crate::api::innertube::encode_search_params(sort_code, date_code, dur_code, videos_only)
     }
 
     pub fn all_known_videos(&self) -> Vec<VideoItem> {
@@ -876,6 +1055,248 @@ impl AppState {
     }
 }
 
+fn video_matches_tokens(v: &VideoItem, tokens: &[&str]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    let title_l = v.title.to_lowercase();
+    let up_l = v.display_uploader().to_lowercase();
+    tokens
+        .iter()
+        .all(|t| title_l.contains(t) || up_l.contains(t))
+}
+
+fn search_relevance_score(
+    v: &VideoItem,
+    q_clean: &str,
+    tokens: &[&str],
+    sub_uploaders: &HashSet<String>,
+    now_unix: i64,
+) -> i64 {
+    if q_clean.is_empty() {
+        let rec = v.timestamp.unwrap_or(0) / 86_400;
+        let views = v.view_count.unwrap_or(0).min(10_000_000) as i64 / 50_000;
+        return rec + views;
+    }
+    let title_l = v.title.to_lowercase();
+    let up_l = v.display_uploader().to_lowercase();
+    let mut score = 0i64;
+    if title_l.contains(q_clean) {
+        score += 60;
+        if title_l.starts_with(q_clean) {
+            score += 15;
+        }
+    }
+    if up_l == q_clean {
+        score += 55;
+    } else if up_l.contains(q_clean) {
+        score += 35;
+    }
+    let matched_tokens = tokens
+        .iter()
+        .filter(|t| title_l.contains(**t) || up_l.contains(**t))
+        .count();
+    score += (matched_tokens as i64) * 14;
+    if !tokens.is_empty() && matched_tokens == tokens.len() {
+        score += 22;
+    }
+    if sub_uploaders.contains(&up_l) {
+        score += 12;
+    }
+    if let Some(ts) = v.timestamp {
+        if now_unix.saturating_sub(ts) <= 7 * 86_400 {
+            score += 8;
+        }
+    }
+    if let Some(vw) = v.view_count {
+        if vw > 0 {
+            score += ((vw as f64).log10() * 2.0) as i64;
+        }
+    }
+    if v.is_shorts() {
+        score -= 4;
+    }
+    score
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    All,
+    LiveYt,
+    Subscribed,
+    Cached,
+}
+
+impl SearchScope {
+    pub const ALL: [Self; 4] = [Self::All, Self::LiveYt, Self::Subscribed, Self::Cached];
+    pub const fn next(self) -> Self {
+        match self {
+            Self::All => Self::LiveYt,
+            Self::LiveYt => Self::Subscribed,
+            Self::Subscribed => Self::Cached,
+            Self::Cached => Self::All,
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::LiveYt => "Live YT",
+            Self::Subscribed => "Subscribed",
+            Self::Cached => "Cached",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTypeFilter {
+    All,
+    Videos,
+    Shorts,
+}
+
+impl SearchTypeFilter {
+    pub const ALL: [Self; 3] = [Self::All, Self::Videos, Self::Shorts];
+    pub const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Videos,
+            Self::Videos => Self::Shorts,
+            Self::Shorts => Self::All,
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Videos => "Videos",
+            Self::Shorts => "Shorts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDateFilter {
+    Any,
+    Today,
+    Week,
+    Month,
+    Year,
+}
+
+impl SearchDateFilter {
+    pub const ALL: [Self; 5] = [Self::Any, Self::Today, Self::Week, Self::Month, Self::Year];
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Any => Self::Today,
+            Self::Today => Self::Week,
+            Self::Week => Self::Month,
+            Self::Month => Self::Year,
+            Self::Year => Self::Any,
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any",
+            Self::Today => "Today",
+            Self::Week => "Week",
+            Self::Month => "Month",
+            Self::Year => "Year",
+        }
+    }
+    pub fn min_timestamp(self, now: i64) -> Option<i64> {
+        match self {
+            Self::Any => None,
+            Self::Today => Some(now - 86_400),
+            Self::Week => Some(now - 7 * 86_400),
+            Self::Month => Some(now - 30 * 86_400),
+            Self::Year => Some(now - 365 * 86_400),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDurationFilter {
+    Any,
+    Short,
+    Medium,
+    Long,
+}
+
+impl SearchDurationFilter {
+    pub const ALL: [Self; 4] = [Self::Any, Self::Short, Self::Medium, Self::Long];
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Any => Self::Short,
+            Self::Short => Self::Medium,
+            Self::Medium => Self::Long,
+            Self::Long => Self::Any,
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any",
+            Self::Short => "<4m",
+            Self::Medium => "4-20m",
+            Self::Long => ">20m",
+        }
+    }
+    pub fn matches(self, duration: Option<u64>) -> bool {
+        let Some(d) = duration else {
+            return self == Self::Any;
+        };
+        match self {
+            Self::Any => true,
+            Self::Short => d < 240,
+            Self::Medium => (240..=1200).contains(&d),
+            Self::Long => d > 1200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchSortOrder {
+    Relevance,
+    Newest,
+    Views,
+    Duration,
+}
+
+impl SearchSortOrder {
+    pub const ALL: [Self; 4] = [Self::Relevance, Self::Newest, Self::Views, Self::Duration];
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Relevance => Self::Newest,
+            Self::Newest => Self::Views,
+            Self::Views => Self::Duration,
+            Self::Duration => Self::Relevance,
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Relevance => "Relevance",
+            Self::Newest => "Newest",
+            Self::Views => "Views",
+            Self::Duration => "Duration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchHit {
+    ApplySuggestion(String),
+    SetScope(SearchScope),
+    SetType(SearchTypeFilter),
+    SetDate(SearchDateFilter),
+    SetDuration(SearchDurationFilter),
+    SetSort(SearchSortOrder),
+    ToggleHideWatched,
+    SelectRow(usize),
+    ActionPlay,
+    ActionDetail,
+    ActionPinCw,
+    ActionWatchLater,
+    ActionChannel,
+    LoadMore,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayOptionsHit {
     FocusSection(usize),
@@ -895,6 +1316,8 @@ pub enum PlayOptionsHit {
     ToggleSkipOutro,
     SelectShader(VideoShaderMode),
     SetPerformanceMode(PerformanceMode),
+    CycleMotion,
+    ScrollAudioTracks(i8),
     TogglePause,
     SeekDelta(f64),
     SeekRatio(f64),
@@ -921,6 +1344,7 @@ pub enum NowPlayingHit {
     ToggleMute,
     CycleShader,
     CyclePerfMode,
+    CycleMotion,
     OpenStudio,
     StopPlayer,
 }
@@ -945,6 +1369,7 @@ pub struct LivePlaybackControlState {
     pub cache_bytes: u64,
     pub dropped_frames: i64,
     pub audio_tracks: Vec<LiveMediaTrack>,
+    pub audio_track_scroll: usize,
     pub sub_tracks: Vec<LiveMediaTrack>,
     pub cmd_tx: Option<UnboundedSender<PlayerCommand>>,
     pub play_hitboxes: Vec<(Rect, PlayOptionsHit)>,
@@ -972,6 +1397,7 @@ impl Default for LivePlaybackControlState {
             cache_bytes: 0,
             dropped_frames: 0,
             audio_tracks: Vec::new(),
+            audio_track_scroll: 0,
             sub_tracks: Vec::new(),
             cmd_tx: None,
             play_hitboxes: Vec::new(),
@@ -1004,7 +1430,7 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rect> {
     let (px, py) = match overlay {
         ActiveOverlay::None => return None,
-        ActiveOverlay::Search => (76, 78),
+        ActiveOverlay::Search => (90, 86),
         ActiveOverlay::Login => (84, 78),
         ActiveOverlay::Filter => (64, 66),
         ActiveOverlay::PlayOptions => (92, 80),
