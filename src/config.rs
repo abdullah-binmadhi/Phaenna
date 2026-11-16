@@ -123,52 +123,39 @@ impl Quality {
         let lang = if lang.is_empty() { "en" } else { lang.as_str() };
 
         let primary_audio = match dub {
-            DubPreference::OriginalOnly => "bestaudio[format_note!*=dubbed]".to_string(),
-            DubPreference::PreferDubbed => {
-                format!("bestaudio[format_note*=dubbed][language^={lang}]")
+            DubPreference::OriginalOnly => {
+                "(bestaudio[format_note*=original][format_note!*=dubbed][format_note!*=DRC]/bestaudio[format_note*=original][format_note!*=dubbed]/bestaudio[language_preference>=0][format_note!*=dubbed][format_note!*=DRC]/bestaudio[language_preference>=0][format_note!*=dubbed]/bestaudio[format_note!*=dubbed][format_note!*=DRC]/bestaudio[format_note!*=dubbed]/bestaudio)"
+                    .to_string()
             }
+            DubPreference::PreferDubbed => format!(
+                "(bestaudio[format_note*=dubbed][language^={lang}]/bestaudio[language^={lang}][format_note!*=original]/bestaudio[format_note*=dubbed]/bestaudio[language^={lang}])"
+            ),
         };
         let alt_audio = match dub {
-            DubPreference::OriginalOnly => {
-                format!("bestaudio[format_note*=dubbed][language^={lang}]")
+            DubPreference::OriginalOnly => format!(
+                "(bestaudio[language^={lang}][format_note!*=original]/bestaudio[format_note*=dubbed][language^={lang}]/bestaudio[format_note*=dubbed])"
+            ),
+            DubPreference::PreferDubbed => {
+                "(bestaudio[format_note*=original][format_note!*=dubbed]/bestaudio[language_preference>=0][format_note!*=dubbed]/bestaudio[format_note!*=dubbed])"
+                    .to_string()
             }
-            DubPreference::PreferDubbed => "bestaudio[format_note!*=dubbed]".to_string(),
         };
 
         if self == Quality::AudioOnly {
             return match dub {
-                DubPreference::OriginalOnly => {
-                    "bestaudio[format_note!*=dubbed]/bestaudio/best".to_string()
-                }
-                DubPreference::PreferDubbed => format!(
-                    "bestaudio[format_note*=dubbed][language^={lang}]/bestaudio[format_note*=dubbed]/bestaudio[language^={lang}]/bestaudio/best"
-                ),
+                DubPreference::OriginalOnly => format!("{primary_audio}/best"),
+                DubPreference::PreferDubbed => format!("{primary_audio}/bestaudio/best"),
             };
         }
 
-        let mut branches: Vec<String> = Vec::new();
         let vs = self.video_selectors();
+        let video_chain = format!("({})", vs.join("/"));
+        let mut branches: Vec<String> = Vec::new();
         if multistreams {
-            if let Some(first_v) = vs.first() {
-                branches.push(format!("{first_v}+{primary_audio}+{alt_audio}"));
-            }
-            let primary_v = vs.last().copied().unwrap_or("bestvideo");
-            if Some(&primary_v) != vs.first() {
-                branches.push(format!("{primary_v}+{primary_audio}+{alt_audio}"));
-            }
+            branches.push(format!("{video_chain}+{primary_audio}+{alt_audio}"));
         }
-        for v in vs {
-            branches.push(format!("{v}+{primary_audio}"));
-        }
-        if dub == DubPreference::PreferDubbed {
-            if let Some(first_v) = vs.first() {
-                branches.push(format!("{first_v}+bestaudio[format_note*=dubbed]"));
-                branches.push(format!("{first_v}+bestaudio[language^={lang}]"));
-            }
-        }
-        for v in vs {
-            branches.push(format!("{v}+bestaudio"));
-        }
+        branches.push(format!("{video_chain}+{primary_audio}"));
+        branches.push(format!("{video_chain}+bestaudio"));
         branches.push("best".to_string());
         branches.join("/")
     }
@@ -850,6 +837,8 @@ mod tests {
         assert_eq!(Quality::AudioOnly.ytdl_format(), "bestaudio/best");
         assert_eq!(Quality::P2160.short_badge(), "4K60");
         let orig = Quality::Best.ytdl_format_with_dub(DubPreference::OriginalOnly, "en", true);
+        assert!(orig.contains("format_note*=original"));
+        assert!(orig.contains("language_preference>=0"));
         assert!(orig.contains("format_note!*=dubbed"));
         let dubbed = Quality::Best.ytdl_format_with_dub(DubPreference::PreferDubbed, "ar", true);
         assert!(dubbed.contains("format_note*=dubbed"));

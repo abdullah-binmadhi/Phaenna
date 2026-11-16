@@ -1705,6 +1705,23 @@ async fn handle_app_message(
             if session_id == state.active_session_id {
                 let ev_copy = event.clone();
                 state.apply_live_ipc_event(event);
+                if matches!(ev_copy, LiveIpcEvent::Tracks { .. })
+                    && state.config.dub_preference == crate::config::DubPreference::OriginalOnly
+                {
+                    let selected_is_dubbed = state
+                        .live_playback
+                        .audio_tracks
+                        .iter()
+                        .any(|t| t.selected && t.is_dubbed);
+                    if selected_is_dubbed {
+                        if let Some(orig_aid) = state.find_audio_track_for_dub(false) {
+                            if state.live_playback.active_aid != Some(orig_aid) {
+                                state.live_playback.active_aid = Some(orig_aid);
+                                state.send_player_cmd(PlayerCommand::SetAudioTrack(orig_aid));
+                            }
+                        }
+                    }
+                }
                 if let Some(ref handle) = state.remote_handle {
                     let mut rst = handle.state.write().await;
                     match ev_copy {

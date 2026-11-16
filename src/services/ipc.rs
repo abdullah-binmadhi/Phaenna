@@ -310,16 +310,19 @@ pub fn parse_track_list(val: &Value) -> (Vec<LiveMediaTrack>, Vec<LiveMediaTrack
     let Some(arr) = val.as_array() else {
         return (Vec::new(), Vec::new());
     };
-    let mut audio = Vec::new();
+    struct RawAudio {
+        id: i64,
+        lang: Option<String>,
+        title: Option<String>,
+        selected: bool,
+        explicit_dub: bool,
+        explicit_orig: bool,
+    }
+    let mut raw_audio = Vec::new();
     let mut sub = Vec::new();
     for item in arr {
         let Some(kind_s) = item.get("type").and_then(Value::as_str) else {
             continue;
-        };
-        let kind = match kind_s {
-            "audio" => TrackKind::Audio,
-            "sub" => TrackKind::Sub,
-            _ => continue,
         };
         let Some(id) = item.get("id").and_then(Value::as_i64) else {
             continue;
@@ -328,27 +331,55 @@ pub fn parse_track_list(val: &Value) -> (Vec<LiveMediaTrack>, Vec<LiveMediaTrack
         let title = item.get("title").and_then(Value::as_str).map(ToOwned::to_owned);
         let selected = item.get("selected").and_then(Value::as_bool).unwrap_or(false);
         let title_low = title.as_deref().unwrap_or("").to_lowercase();
-        let is_dubbed = title_low.contains("dub") || title_low.contains("auto-dub");
-        let is_original = kind == TrackKind::Audio
-            && !is_dubbed
-            && (title_low.contains("original")
-                || item.get("default").and_then(Value::as_bool).unwrap_or(false)
-                || audio.is_empty());
 
-        let track = LiveMediaTrack {
-            id,
-            kind,
-            lang,
-            title,
-            is_dubbed,
-            is_original,
-            selected,
-        };
-        match kind {
-            TrackKind::Audio => audio.push(track),
-            TrackKind::Sub => sub.push(track),
+        match kind_s {
+            "audio" => {
+                let explicit_dub = title_low.contains("dub") || title_low.contains("auto-dub");
+                let explicit_orig = !explicit_dub
+                    && (title_low.contains("original")
+                        || item.get("default").and_then(Value::as_bool).unwrap_or(false));
+                raw_audio.push(RawAudio {
+                    id,
+                    lang,
+                    title,
+                    selected,
+                    explicit_dub,
+                    explicit_orig,
+                });
+            }
+            "sub" => {
+                sub.push(LiveMediaTrack {
+                    id,
+                    kind: TrackKind::Sub,
+                    lang,
+                    title,
+                    is_dubbed: false,
+                    is_original: false,
+                    selected,
+                });
+            }
+            _ => {}
         }
     }
+
+    let any_explicit_orig = raw_audio.iter().any(|t| t.explicit_orig);
+    let audio = raw_audio
+        .into_iter()
+        .enumerate()
+        .map(|(idx, t)| {
+            let is_original = t.explicit_orig || (!any_explicit_orig && !t.explicit_dub && idx == 0);
+            let is_dubbed = t.explicit_dub || (any_explicit_orig && !is_original);
+            LiveMediaTrack {
+                id: t.id,
+                kind: TrackKind::Audio,
+                lang: t.lang,
+                title: t.title,
+                is_dubbed,
+                is_original,
+                selected: t.selected,
+            }
+        })
+        .collect();
     (audio, sub)
 }
 
@@ -686,14 +717,18 @@ mod tests {
 
         let track_json = serde_json::json!([
             {"id": 1, "type": "video", "selected": true},
-            {"id": 1, "type": "audio", "lang": "en", "title": "English original", "selected": true, "default": true},
-            {"id": 2, "type": "audio", "lang": "ar", "title": "Arabic - dubbed-auto", "selected": false},
-            {"id": 3, "type": "sub", "lang": "en", "title": "English CC", "selected": true}
+            {"id": 1, "type": "audio", "lang": "it", "title": "Italian, medium", "selected": false},
+            {"id": 2, "type": "audio", "lang": "en-US", "title": "English (US) original (default), medium", "selected": true, "default": true},
+            {"id": 3, "type": "audio", "lang": "ar", "title": "Arabic - dubbed-auto", "selected": false},
+            {"id": 4, "type": "sub", "lang": "en", "title": "English CC", "selected": true}
         ]);
         let (aud, subs) = parse_track_list(&track_json);
-        assert_eq!(aud.len(), 2);
-        assert!(aud[0].is_original);
-        assert!(aud[1].is_dubbed);
+        assert_eq!(aud.len(), 3);
+        assert!(aud[0].is_dubbed);
+        assert!(!aud[0].is_original);
+        assert!(aud[1].is_original);
+        assert!(!aud[1].is_dubbed);
+        assert!(aud[2].is_dubbed);
         assert_eq!(subs.len(), 1);
 
         let cmds = PlayerCommand::SetAudioTrack(2).to_mpv_json_commands();

@@ -347,10 +347,13 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
 
     if opts.local_file.is_none() {
         flags.push(format!("ytdl-format={}", opts.quality_format));
-        flags.push(
-            "ytdl-raw-options-append=format-sort=res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr"
-                .to_string(),
-        );
+        let sort_spec = match opts.dub_preference {
+            // Keep `lang` ahead of `abr` so YouTube's `language_preference=10` (Original)
+            // never loses to slightly higher-bitrate AI-dubbed audio tracks.
+            DubPreference::OriginalOnly => "lang,res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr",
+            DubPreference::PreferDubbed => "res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr",
+        };
+        flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
         if opts.performance_mode.loads_multistreams(opts.audio_multistreams) {
             flags.push("ytdl-raw-options-append=audio-multistreams=".to_string());
         }
@@ -366,7 +369,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     }
 
     let alang = match opts.dub_preference {
-        DubPreference::OriginalOnly => "und,orig,en".to_string(),
+        DubPreference::OriginalOnly => "und,orig".to_string(),
         DubPreference::PreferDubbed => {
             if opts.dub_lang.trim().is_empty() {
                 "en".to_string()
@@ -607,9 +610,9 @@ mod tests {
         assert!(args.iter().any(|a| a == "--start=42.5"));
         assert!(args.iter().any(|a| a.starts_with("--glsl-shaders=")));
         assert!(args.iter().any(|a| a == "--demuxer-max-bytes=512MiB"));
-        assert!(args.iter().any(|a| a.contains("format-sort=res:2160")));
+        assert!(args.iter().any(|a| a.contains("format-sort=lang,res:2160")));
         assert!(args.iter().any(|a| a == "--ytdl-raw-options-append=audio-multistreams="));
-        assert!(args.iter().any(|a| a == "--alang=und,orig,en"));
+        assert!(args.iter().any(|a| a == "--alang=und,orig"));
         assert!(args.iter().any(|a| a.starts_with("--af=lavfi=")));
         assert!(args.iter().any(|a| a == "--video-sync=display-resample"));
         assert!(args.iter().any(|a| a == "--override-display-fps=120"));
