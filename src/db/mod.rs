@@ -73,6 +73,17 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .await?;
     ensure_column_exists(pool, "videos", "published_text", "TEXT").await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_video_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT NOT NULL,
+            author TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

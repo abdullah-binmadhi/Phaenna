@@ -1,6 +1,7 @@
 //! Central Application State — single source of truth for screens, overlays, cache & playback.
 
 use crate::api::dislike::DislikeInfo;
+use crate::api::innertube::VideoComment;
 use crate::api::player::{detect_dependencies, DependencyStatus};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
@@ -178,7 +179,7 @@ pub struct AppState {
     pub detail_video: Option<VideoItem>,
     pub detail_history: Vec<VideoItem>,
     pub detail_view_mode: DetailViewMode,
-    pub detail_focus_pane: usize, // 0: Synopsis, 1: Chapters, 2: Up Next / Channel More
+    pub detail_focus_pane: usize, // 0: Synopsis, 1: Chapters, 2: Comments
     pub detail_chapter_cursor: usize,
     pub detail_related_cursor: usize,
     pub detail_scroll: u16,
@@ -186,6 +187,12 @@ pub struct AppState {
     pub detail_selected_sub_idx: usize,
     pub detail_sponsor_segments: Vec<SponsorSegment>,
     pub detail_dislikes: Option<DislikeInfo>,
+    pub detail_comments: Vec<VideoComment>,
+    pub detail_comment_cursor: usize,
+    pub detail_comments_loading: bool,
+    pub detail_create_comment_params: Option<String>,
+    pub detail_comment_composing: bool,
+    pub detail_comment_input: String,
 
     pub channel_title: String,
     pub channel_id: Option<String>,
@@ -321,6 +328,12 @@ impl AppState {
             detail_selected_sub_idx: 0,
             detail_sponsor_segments: Vec::new(),
             detail_dislikes: None,
+            detail_comments: Vec::new(),
+            detail_comment_cursor: 0,
+            detail_comments_loading: false,
+            detail_create_comment_params: None,
+            detail_comment_composing: false,
+            detail_comment_input: String::new(),
 
             channel_title: String::new(),
             channel_id: None,
@@ -452,10 +465,15 @@ impl AppState {
 
         let mut filtered: Vec<VideoItem> = raw_list
             .iter()
-            .filter(|v| match self.content_filter {
-                ContentFilter::All => true,
-                ContentFilter::Longform => v.duration.map(|d| d >= 300).unwrap_or(true),
-                ContentFilter::Shorts => v.duration.map(|d| d <= 60).unwrap_or(false),
+            .filter(|v| {
+                if cat == Category::Recommended && self.is_video_watched(&v.id) {
+                    return false;
+                }
+                match self.content_filter {
+                    ContentFilter::All => true,
+                    ContentFilter::Longform => v.duration.map(|d| d >= 300).unwrap_or(true),
+                    ContentFilter::Shorts => v.duration.map(|d| d <= 60).unwrap_or(false),
+                }
             })
             .cloned()
             .collect();
@@ -472,6 +490,45 @@ impl AppState {
             }),
         }
         filtered
+    }
+
+    pub fn is_video_watched(&self, video_id: &str) -> bool {
+        let clean = video_id.trim_start_matches("RD");
+        self.watched_ids.contains(video_id) || self.watched_ids.contains(clean)
+    }
+
+    pub fn prune_watched_from_recommended(&mut self) {
+        let watched = self.watched_ids.clone();
+        if let Some(idx) = self
+            .categories
+            .iter()
+            .position(|(c, _)| *c == Category::Recommended)
+        {
+            self.categories[idx]
+                .1
+                .retain(|v| !watched.contains(&v.id) && !watched.contains(v.clean_id()));
+            let new_len = self.categories[idx].1.len();
+            if self.category_cursors[idx] >= new_len {
+                self.category_cursors[idx] = new_len.saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn mark_video_watched(&mut self, video: &VideoItem) {
+        let clean = video.clean_id().to_string();
+        self.watched_ids.insert(video.id.clone());
+        self.watched_ids.insert(clean.clone());
+
+        if let Some((_, hist)) = self
+            .categories
+            .iter_mut()
+            .find(|(c, _)| *c == Category::History)
+        {
+            hist.retain(|v| v.clean_id() != clean);
+            hist.insert(0, video.clone());
+        }
+
+        self.prune_watched_from_recommended();
     }
 
     pub fn is_in_continue_watching(&self, video_id: &str) -> bool {
@@ -498,7 +555,8 @@ impl AppState {
         self.ticker_last_step_at = now;
     }
 
-    /// Related items shown in the Detail right-bottom drawer: `[QUEUE]` Up Next + `[CH]` same-channel uploads.
+    /// Related items helper (retained for tests / up-next resolution).
+    #[allow(dead_code)]
     pub fn detail_related_entries(&self) -> Vec<(&'static str, VideoItem)> {
         let Some(ref cur) = self.detail_video else {
             return Vec::new();
@@ -692,5 +750,47 @@ mod tests {
         let m = active_modal_rect(Rect::new(0, 0, 120, 40), ActiveOverlay::Settings);
         assert!(occluded_by_modal(Rect::new(40, 15, 24, 10), m));
         assert!(!occluded_by_modal(Rect::new(0, 0, 5, 2), m));
+    }
+
+    #[test]
+    fn test_mark_video_watched_removes_from_recommended_and_adds_to_history() {
+        let mut st = AppState::new(Config::default());
+        let v1 = VideoItem {
+            id: "home_v1".into(),
+            title: "First Video".into(),
+            ..Default::default()
+        };
+        let v2 = VideoItem {
+            id: "home_v2".into(),
+            title: "Second Video".into(),
+            ..Default::default()
+        };
+        if let Some((_, rec)) = st
+            .categories
+            .iter_mut()
+            .find(|(c, _)| *c == Category::Recommended)
+        {
+            *rec = vec![v1.clone(), v2.clone()];
+        }
+        st.active_category = st
+            .categories
+            .iter()
+            .position(|(c, _)| *c == Category::Recommended)
+            .unwrap();
+
+        st.mark_video_watched(&v1);
+
+        let rec_filtered = st.current_filtered_videos();
+        assert_eq!(rec_filtered.len(), 1);
+        assert_eq!(rec_filtered[0].id, "home_v2");
+
+        let hist_items = &st
+            .categories
+            .iter()
+            .find(|(c, _)| *c == Category::History)
+            .unwrap()
+            .1;
+        assert_eq!(hist_items.len(), 1);
+        assert_eq!(hist_items[0].id, "home_v1");
     }
 }

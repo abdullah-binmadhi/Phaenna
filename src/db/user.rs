@@ -1,7 +1,7 @@
 //! User library state: watch history, resume positions, Watch Later with provenance,
 //! SponsorBlock segment cache, offline vault records, and YouTube Wrapped analytics.
 
-use crate::db::cache::{execute_upsert_video, VideoItem};
+use crate::db::cache::{execute_upsert_video, row_to_video, VideoItem};
 use crate::error::Result;
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
@@ -193,6 +193,93 @@ pub async fn get_watched_ids(pool: &SqlitePool) -> Result<HashSet<String>> {
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+pub async fn get_local_watch_history_videos(
+    pool: &SqlitePool,
+    limit: usize,
+) -> Result<Vec<VideoItem>> {
+    let rows = sqlx::query(
+        "SELECT v.* FROM watch_history wh
+         JOIN videos v ON wh.video_id = v.id
+         ORDER BY wh.watched_at DESC
+         LIMIT ?",
+    )
+    .bind(limit.max(1) as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_video).collect())
+}
+
+pub async fn sync_youtube_watched_items(
+    pool: &SqlitePool,
+    items: &[VideoItem],
+    progress_pcts: &[(String, u8)],
+    mark_all_items_watched: bool,
+    now: i64,
+) -> Result<()> {
+    if !mark_all_items_watched && progress_pcts.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+
+    if mark_all_items_watched {
+        for (idx, v) in items.iter().enumerate() {
+            execute_upsert_video(&mut *tx, v, now).await?;
+            let ts = now.saturating_sub(idx as i64);
+            sqlx::query(
+                "INSERT INTO watch_history (video_id, watched_at) VALUES (?, ?)
+                 ON CONFLICT(video_id) DO NOTHING",
+            )
+            .bind(v.clean_id())
+            .bind(ts)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    for (vid_id, pct) in progress_pcts {
+        if *pct == 0 {
+            continue;
+        }
+        let clean = vid_id.trim_start_matches("RD");
+        let matched = items
+            .iter()
+            .find(|v| v.clean_id() == clean || v.id == *vid_id);
+        if let Some(v) = matched {
+            if !mark_all_items_watched {
+                execute_upsert_video(&mut *tx, v, now).await?;
+            }
+        }
+        sqlx::query(
+            "INSERT INTO watch_history (video_id, watched_at) VALUES (?, ?)
+             ON CONFLICT(video_id) DO NOTHING",
+        )
+        .bind(clean)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(dur) = matched.and_then(|v| v.duration).filter(|&d| d > 0) {
+            let pos = (dur as f64) * ((*pct as f64).min(100.0) / 100.0);
+            sqlx::query(
+                "INSERT INTO playback_progress (video_id, position_secs, duration_secs, updated_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(video_id) DO NOTHING",
+            )
+            .bind(clean)
+            .bind(pos)
+            .bind(dur as f64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -894,6 +981,53 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     Ok(out)
 }
 
+pub async fn save_user_video_comment(
+    pool: &SqlitePool,
+    video_id: &str,
+    author: &str,
+    content: &str,
+    created_at: i64,
+) -> Result<()> {
+    let clean = video_id.trim_start_matches("RD");
+    sqlx::query(
+        "INSERT INTO user_video_comments (video_id, author, content, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(clean)
+    .bind(author)
+    .bind(content.trim())
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_user_video_comments(
+    pool: &SqlitePool,
+    video_id: &str,
+) -> Result<Vec<crate::api::innertube::VideoComment>> {
+    let clean = video_id.trim_start_matches("RD");
+    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT id, author, content, created_at FROM user_video_comments WHERE video_id = ? ORDER BY created_at DESC, id DESC",
+    )
+    .bind(clean)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, author, text, _ts)| crate::api::innertube::VideoComment {
+            id: format!("local_{}", id),
+            author,
+            published_text: "Just now (Saved)".to_string(),
+            text,
+            like_count_text: "1".to_string(),
+            reply_count: 0,
+            is_pinned: false,
+            is_self: true,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,5 +1131,66 @@ mod tests {
         let after_rm = get_continue_watching(&pool).await.unwrap();
         assert_eq!(after_rm.len(), 1);
         assert_eq!(after_rm[0].id, "queuevid002");
+    }
+
+    #[tokio::test]
+    async fn test_local_and_youtube_watch_history_sync() {
+        let pool = init(":memory:").await.unwrap();
+        let now = 1_700_000_000i64;
+        let v_local = VideoItem {
+            id: "loc001".into(),
+            title: "Locally Watched Talk".into(),
+            uploader: Some("SysLab".into()),
+            duration: Some(1200),
+            ..Default::default()
+        };
+        let v_yt = VideoItem {
+            id: "yt002".into(),
+            title: "Watched On YouTube".into(),
+            uploader: Some("RustConf".into()),
+            duration: Some(1000),
+            ..Default::default()
+        };
+        let v_rec = VideoItem {
+            id: "rec003".into(),
+            title: "Partially Watched In Recs".into(),
+            uploader: Some("AudioLab".into()),
+            duration: Some(200),
+            ..Default::default()
+        };
+
+        touch_watch_history(&pool, Some(&v_local), &v_local.id, now + 100)
+            .await
+            .unwrap();
+        let local_hist = get_local_watch_history_videos(&pool, 20).await.unwrap();
+        assert_eq!(local_hist.len(), 1);
+        assert_eq!(local_hist[0].id, "loc001");
+
+        // Sync FEhistory items + Home overlay watched progress into SQLite
+        sync_youtube_watched_items(&pool, std::slice::from_ref(&v_yt), &[], true, now + 50)
+            .await
+            .unwrap();
+        sync_youtube_watched_items(
+            &pool,
+            std::slice::from_ref(&v_rec),
+            &[("rec003".to_string(), 75)],
+            false,
+            now + 60,
+        )
+        .await
+        .unwrap();
+
+        let watched = get_watched_ids(&pool).await.unwrap();
+        assert!(watched.contains("loc001"));
+        assert!(watched.contains("yt002"));
+        assert!(watched.contains("rec003"));
+
+        let prog = get_playback_progress(&pool, "rec003").await.unwrap().unwrap();
+        assert!((prog.0 - 150.0).abs() < 0.01);
+        assert!((prog.1 - 200.0).abs() < 0.01);
+
+        let full_hist = get_local_watch_history_videos(&pool, 20).await.unwrap();
+        assert_eq!(full_hist[0].id, "loc001");
+        assert!(full_hist.iter().any(|v| v.id == "yt002"));
     }
 }

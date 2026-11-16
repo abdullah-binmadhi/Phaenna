@@ -155,6 +155,7 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
                     "--ytdl-raw-options-append=cookies={}",
                     cpath.to_string_lossy()
                 ));
+                args.push("--ytdl-raw-options-append=mark-watched=".to_string());
             }
         }
     }
@@ -219,6 +220,7 @@ pub fn build_iina_args(opts: &PlayOptions) -> Vec<String> {
                     "--mpv-ytdl-raw-options-append=cookies={}",
                     cpath.to_string_lossy()
                 ));
+                args.push("--mpv-ytdl-raw-options-append=mark-watched=".to_string());
             }
         }
     }

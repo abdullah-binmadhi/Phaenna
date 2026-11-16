@@ -403,7 +403,7 @@ pub async fn batch_upsert_feed(
     Ok(())
 }
 
-fn row_to_video(row: &sqlx::sqlite::SqliteRow) -> VideoItem {
+pub(crate) fn row_to_video(row: &sqlx::sqlite::SqliteRow) -> VideoItem {
     let id: String = row.try_get("id").unwrap_or_default();
     let channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
     let channel_name: String = row.try_get("channel_name").unwrap_or_else(|_| "Unknown".into());

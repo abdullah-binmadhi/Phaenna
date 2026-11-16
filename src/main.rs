@@ -11,7 +11,8 @@ mod ui;
 
 use crate::api::dislike::fetch_dislikes;
 use crate::api::innertube::{
-    browse_id_for_feed_key, fetch_channel_rss, fetch_innertube_shelf, innertube_edit_watch_later,
+    browse_id_for_feed_key, fetch_channel_rss, fetch_innertube_shelf, fetch_video_comments,
+    innertube_edit_watch_later, post_video_comment, report_youtube_watch_progress, VideoComment,
 };
 use crate::api::player::{
     detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
@@ -33,9 +34,11 @@ use crate::db::sync::{is_stale, mark_synced, HISTORY, RECOMMENDED, SUBSCRIPTIONS
 use crate::db::user::{
     add_to_watch_later, clear_finished_continue_watching, compute_user_analytics,
     get_all_progress_map, get_continue_watching, get_continue_watching_meta_map,
-    get_offline_videos, get_sponsorblock_segments, get_watch_later_sources, get_watched_ids,
+    get_local_watch_history_videos, get_offline_videos, get_sponsorblock_segments,
+    get_user_video_comments, get_watch_later_sources, get_watched_ids,
     move_continue_watching_item, pin_to_continue_watching, remove_continue_watching,
-    remove_from_watch_later, save_sponsorblock_segments, touch_watch_history, WatchLaterSource,
+    remove_from_watch_later, save_sponsorblock_segments, save_user_video_comment,
+    sync_youtube_watched_items, touch_watch_history, WatchLaterSource,
 };
 use crate::messages::AppMessage;
 use crate::services::auth::{
@@ -392,6 +395,37 @@ async fn hydrate_state_from_db(state: &mut AppState, pool: &SqlitePool) {
             *items = cached;
         }
     }
+
+    if let Ok(local_hist) = get_local_watch_history_videos(pool, 200).await {
+        if let Some((_, hist_list)) = state
+            .categories
+            .iter_mut()
+            .find(|(c, _)| *c == Category::History)
+        {
+            let mut merged = Vec::new();
+            let mut seen = HashSet::new();
+            for v in local_hist.into_iter().chain(std::mem::take(hist_list)) {
+                let cid = v.clean_id().to_string();
+                state.watched_ids.insert(v.id.clone());
+                state.watched_ids.insert(cid.clone());
+                if seen.insert(cid) {
+                    merged.push(v);
+                }
+            }
+            *hist_list = merged;
+        }
+    } else if let Some((_, hist_list)) = state
+        .categories
+        .iter()
+        .find(|(c, _)| *c == Category::History)
+    {
+        for v in hist_list {
+            state.watched_ids.insert(v.id.clone());
+            state.watched_ids.insert(v.clean_id().to_string());
+        }
+    }
+
+    state.prune_watched_from_recommended();
 }
 
 fn trigger_swr_feed_refreshes(
@@ -431,7 +465,11 @@ fn trigger_swr_feed_refreshes(
         let url_s = url.to_string();
 
         tokio::spawn(async move {
-            let stale = force || empty || is_stale(&p_clone, &key_s, ttl, now_unix()).await.unwrap_or(true);
+            let force_history = key_s == HISTORY && session_clone.is_some();
+            let stale = force
+                || empty
+                || force_history
+                || is_stale(&p_clone, &key_s, ttl, now_unix()).await.unwrap_or(true);
             if !stale {
                 let _ = tx_clone
                     .send(AppMessage::FeedLoaded {
@@ -446,46 +484,127 @@ fn trigger_swr_feed_refreshes(
 
             let mut fetched = Vec::new();
             let mut next_continuation: Option<String> = None;
+            let mut all_watched_progress: Vec<(String, u8)> = Vec::new();
+            let watched_set = if key_s == RECOMMENDED {
+                get_watched_ids(&p_clone).await.unwrap_or_default()
+            } else {
+                HashSet::new()
+            };
+
             if let Some(ref session) = session_clone {
                 if let Some(browse_id) = browse_id_for_feed_key(&key_s) {
                     if let Ok(page) =
                         fetch_innertube_shelf(&client_clone, session, browse_id, None).await
                     {
-                        fetched = page.videos;
+                        all_watched_progress.extend(page.watched_progress);
                         next_continuation = page.continuation;
+                        if key_s == RECOMMENDED {
+                            let overlay_watched: HashSet<&str> = all_watched_progress
+                                .iter()
+                                .filter(|(_, pct)| *pct > 0)
+                                .map(|(id, _)| id.as_str())
+                                .collect();
+                            fetched = page
+                                .videos
+                                .into_iter()
+                                .filter(|v| {
+                                    !watched_set.contains(&v.id)
+                                        && !watched_set.contains(v.clean_id())
+                                        && !overlay_watched.contains(v.id.as_str())
+                                        && !overlay_watched.contains(v.clean_id())
+                                })
+                                .collect();
+                        } else {
+                            fetched = page.videos;
+                        }
 
-                        // Automatically chain a 2nd page if initial shelf returned fewer than 30 items
-                        if fetched.len() < 30 {
-                            if let Some(tok) = next_continuation.take() {
-                                if let Ok(page2) = fetch_innertube_shelf(
-                                    &client_clone,
-                                    session,
-                                    browse_id,
-                                    Some(&tok),
-                                )
-                                .await
-                                {
-                                    let mut seen: HashSet<String> =
-                                        fetched.iter().map(|v| v.id.clone()).collect();
-                                    for v in page2.videos {
-                                        if seen.insert(v.id.clone()) {
-                                            fetched.push(v);
-                                        }
+                        // Automatically chain up to 2 pages if initial shelf has fewer than target items
+                        let target_min = if key_s == RECOMMENDED { 24 } else { 30 };
+                        for _ in 0..2 {
+                            if fetched.len() >= target_min {
+                                break;
+                            }
+                            let Some(tok) = next_continuation.take() else {
+                                break;
+                            };
+                            if let Ok(page2) = fetch_innertube_shelf(
+                                &client_clone,
+                                session,
+                                browse_id,
+                                Some(&tok),
+                            )
+                            .await
+                            {
+                                all_watched_progress.extend(page2.watched_progress);
+                                let overlay_watched: HashSet<&str> = all_watched_progress
+                                    .iter()
+                                    .filter(|(_, pct)| *pct > 0)
+                                    .map(|(id, _)| id.as_str())
+                                    .collect();
+                                let mut seen: HashSet<String> =
+                                    fetched.iter().map(|v| v.id.clone()).collect();
+                                for v in page2.videos {
+                                    if key_s == RECOMMENDED
+                                        && (watched_set.contains(&v.id)
+                                            || watched_set.contains(v.clean_id())
+                                            || overlay_watched.contains(v.id.as_str())
+                                            || overlay_watched.contains(v.clean_id()))
+                                    {
+                                        continue;
                                     }
-                                    next_continuation = page2.continuation;
-                                } else {
-                                    next_continuation = Some(tok);
+                                    if seen.insert(v.id.clone()) {
+                                        fetched.push(v);
+                                    }
                                 }
+                                next_continuation = page2.continuation;
+                            } else {
+                                next_continuation = Some(tok);
+                                break;
                             }
                         }
                     }
                 }
             }
-            if fetched.is_empty() {
-                fetched = fetch_feed_range(c_clone.as_deref(), &url_s, 1, 28).await;
+            if fetched.is_empty() && next_continuation.is_none() {
+                let raw = fetch_feed_range(c_clone.as_deref(), &url_s, 1, 28).await;
+                if key_s == RECOMMENDED {
+                    fetched = raw
+                        .into_iter()
+                        .filter(|v| {
+                            !watched_set.contains(&v.id) && !watched_set.contains(v.clean_id())
+                        })
+                        .collect();
+                } else {
+                    fetched = raw;
+                }
             }
+
+            let ts = now_unix();
+            if !fetched.is_empty() || !all_watched_progress.is_empty() {
+                let _ = sync_youtube_watched_items(
+                    &p_clone,
+                    &fetched,
+                    &all_watched_progress,
+                    key_s == HISTORY,
+                    ts,
+                )
+                .await;
+            }
+
+            if key_s == HISTORY {
+                if let Ok(local_hist) = get_local_watch_history_videos(&p_clone, 200).await {
+                    let mut merged = Vec::new();
+                    let mut seen = HashSet::new();
+                    for v in local_hist.into_iter().chain(fetched) {
+                        if seen.insert(v.clean_id().to_string()) {
+                            merged.push(v);
+                        }
+                    }
+                    fetched = merged;
+                }
+            }
+
             if !fetched.is_empty() {
-                let ts = now_unix();
                 let _ = batch_upsert_feed(&p_clone, &key_s, &fetched, ts).await;
                 let _ = mark_synced(&p_clone, &key_s, ts).await;
             }
@@ -619,15 +738,61 @@ async fn handle_app_message(
                 } else {
                     state.feed_continuations.remove(&feed_key);
                 }
+                if let Ok(watched) = get_watched_ids(pool).await {
+                    state.watched_ids.extend(watched);
+                }
+                if let Ok(prog) = get_all_progress_map(pool).await {
+                    for (k, v) in prog {
+                        state.progress_map.entry(k).or_insert(v);
+                    }
+                }
             }
-            if !is_from_cache && !items.is_empty() {
+            if !is_from_cache && feed_key == HISTORY {
+                for v in &items {
+                    state.watched_ids.insert(v.id.clone());
+                    state.watched_ids.insert(v.clean_id().to_string());
+                }
+                let local_hist = get_local_watch_history_videos(pool, 200)
+                    .await
+                    .unwrap_or_default();
+                let mut merged = Vec::new();
+                let mut seen = HashSet::new();
+                for v in local_hist.into_iter().chain(items) {
+                    let cid = v.clean_id().to_string();
+                    state.watched_ids.insert(v.id.clone());
+                    state.watched_ids.insert(cid.clone());
+                    if seen.insert(cid) {
+                        merged.push(v);
+                    }
+                }
+                if !merged.is_empty() {
+                    if let Some((_, list)) = state
+                        .categories
+                        .iter_mut()
+                        .find(|(c, _)| *c == Category::History)
+                    {
+                        *list = merged;
+                    }
+                }
+            } else if !is_from_cache && !items.is_empty() {
+                let filtered_items = if feed_key == RECOMMENDED {
+                    items
+                        .into_iter()
+                        .filter(|v| !state.is_video_watched(&v.id))
+                        .collect()
+                } else {
+                    items
+                };
                 if let Some((_, list)) = state
                     .categories
                     .iter_mut()
                     .find(|(c, _)| c.feed_key() == feed_key)
                 {
-                    *list = items;
+                    *list = filtered_items;
                 }
+            }
+            if !is_from_cache {
+                state.prune_watched_from_recommended();
             }
         }
         AppMessage::FetchProgress {
@@ -652,15 +817,34 @@ async fn handle_app_message(
             } else {
                 state.feed_continuations.remove(&feed_key);
             }
+            if let Ok(watched) = get_watched_ids(pool).await {
+                state.watched_ids.extend(watched);
+            }
+            if let Ok(prog) = get_all_progress_map(pool).await {
+                for (k, v) in prog {
+                    state.progress_map.entry(k).or_insert(v);
+                }
+            }
 
+            let target_cat = state
+                .categories
+                .iter()
+                .find(|(c, _)| c.feed_key() == feed_key)
+                .map(|(c, _)| *c);
+            let mut added = 0usize;
             if let Some((_, list)) = state
                 .categories
                 .iter_mut()
                 .find(|(c, _)| c.feed_key() == feed_key)
             {
                 let mut seen: HashSet<String> = list.iter().map(|v| v.id.clone()).collect();
-                let mut added = 0usize;
                 for v in &items {
+                    if feed_key == RECOMMENDED
+                        && (state.watched_ids.contains(&v.id)
+                            || state.watched_ids.contains(v.clean_id()))
+                    {
+                        continue;
+                    }
                     if seen.insert(v.id.clone()) {
                         list.push(v.clone());
                         added += 1;
@@ -669,11 +853,15 @@ async fn handle_app_message(
                 if !items.is_empty() {
                     let _ = batch_upsert_feed(pool, &feed_key, list, now_unix()).await;
                 }
-                if added > 0 {
-                    state.show_toast(format!("Loaded +{added} videos"));
-                } else if !state.feed_continuations.contains_key(&feed_key) {
-                    state.exhausted_feeds.insert(feed_key);
+            }
+            if added > 0 {
+                state.show_toast(format!("Loaded +{added} videos"));
+            } else if state.feed_continuations.contains_key(&feed_key) {
+                if let Some(cat) = target_cat {
+                    maybe_trigger_infinite_scroll_for(cat, state, pool, tx, client, true);
                 }
+            } else {
+                state.exhausted_feeds.insert(feed_key);
             }
         }
         AppMessage::SearchResults {
@@ -729,6 +917,54 @@ async fn handle_app_message(
                 .unwrap_or(false)
             {
                 state.detail_dislikes = Some(info);
+            }
+        }
+        AppMessage::CommentsLoaded {
+            video_id,
+            comments,
+            create_params,
+        } => {
+            if state
+                .detail_video
+                .as_ref()
+                .map(|v| v.id == video_id)
+                .unwrap_or(false)
+            {
+                state.detail_comments_loading = false;
+                if create_params.is_some() {
+                    state.detail_create_comment_params = create_params;
+                }
+                let mut merged: Vec<VideoComment> = state
+                    .detail_comments
+                    .iter()
+                    .filter(|c| c.is_self)
+                    .cloned()
+                    .collect();
+                for c in comments {
+                    if !merged.iter().any(|m| m.id == c.id) {
+                        merged.push(c);
+                    }
+                }
+                state.detail_comments = merged;
+            }
+        }
+        AppMessage::CommentPosted {
+            video_id,
+            comment,
+            synced_remote,
+        } => {
+            if state
+                .detail_video
+                .as_ref()
+                .map(|v| v.id == video_id)
+                .unwrap_or(false)
+                && !state.detail_comments.iter().any(|c| c.id == comment.id)
+            {
+                state.detail_comments.insert(0, comment);
+                state.detail_comment_cursor = 0;
+            }
+            if synced_remote {
+                state.show_toast("Comment posted to YouTube!");
             }
         }
         AppMessage::ThumbnailReady {
@@ -810,6 +1046,8 @@ async fn handle_app_message(
             state.active_playback_video_id = Some(video_id.clone());
             state.active_playback_title = Some(title.clone());
             state.active_session_id = session_id;
+            state.active_playback_pos = 0.0;
+            state.active_playback_dur = 0.0;
             state.sponsor_skips_session = 0;
             if let Some(ref handle) = state.remote_handle {
                 *handle.active_sock.write().await = Some(sock_path);
@@ -858,15 +1096,72 @@ async fn handle_app_message(
             state.show_toast(format!("Skipped {} (+{:.0}s)", category, saved_secs));
         }
         AppMessage::VideoAutoCompleted { video_id } => {
-            state.watched_ids.insert(video_id);
+            let clean = video_id.trim_start_matches("RD").to_string();
+            state.watched_ids.insert(video_id.clone());
+            state.watched_ids.insert(clean.clone());
+            state.prune_watched_from_recommended();
             refresh_continue_watching_state(state, pool).await;
-            state.show_toast("Marked watched (85%)");
+
+            let (pos, dur) = if state.active_playback_video_id.as_deref() == Some(video_id.as_str()) {
+                (state.active_playback_pos, state.active_playback_dur)
+            } else {
+                state
+                    .progress_map
+                    .get(&video_id)
+                    .or_else(|| state.progress_map.get(&clean))
+                    .copied()
+                    .unwrap_or((0.0, 0.0))
+            };
+            let sess_opt = state.auth_vault.active_account().cloned();
+            let cpath = state.config.cookies_path().ok();
+            let c_sync = client.clone();
+            tokio::spawn(async move {
+                let _ = report_youtube_watch_progress(
+                    &c_sync,
+                    sess_opt.as_ref(),
+                    cpath.as_deref(),
+                    &video_id,
+                    0.0,
+                    pos.max(1.0),
+                    (dur > 0.0).then_some(dur),
+                    false,
+                )
+                .await;
+            });
+
+            state.show_toast("Marked watched (85%) + synced to YouTube");
         }
         AppMessage::PlaybackDone(sess) => {
             refresh_continue_watching_state(state, pool).await;
             if sess == state.active_session_id {
-                state.active_playback_video_id = None;
+                let finished_vid = state.active_playback_video_id.take();
+                let finished_pos = state.active_playback_pos;
+                let finished_dur = state.active_playback_dur;
                 state.active_playback_title = None;
+                state.active_playback_pos = 0.0;
+                state.active_playback_dur = 0.0;
+
+                if let Some(vid) = finished_vid {
+                    if finished_pos > 3.0 {
+                        let sess_opt = state.auth_vault.active_account().cloned();
+                        let cpath = state.config.cookies_path().ok();
+                        let c_sync = client.clone();
+                        tokio::spawn(async move {
+                            let _ = report_youtube_watch_progress(
+                                &c_sync,
+                                sess_opt.as_ref(),
+                                cpath.as_deref(),
+                                &vid,
+                                0.0,
+                                finished_pos,
+                                (finished_dur > 0.0).then_some(finished_dur),
+                                false,
+                            )
+                            .await;
+                        });
+                    }
+                }
+
                 if let Some(ref handle) = state.remote_handle {
                     *handle.active_sock.write().await = None;
                     let mut rst = handle.state.write().await;
@@ -966,6 +1261,12 @@ fn open_detail_for_video(
     state.detail_subtitles.clear();
     state.detail_sponsor_segments.clear();
     state.detail_dislikes = None;
+    state.detail_comments.clear();
+    state.detail_comment_cursor = 0;
+    state.detail_comments_loading = true;
+    state.detail_create_comment_params = None;
+    state.detail_comment_composing = false;
+    state.detail_comment_input.clear();
     state.overlay = ActiveOverlay::None;
     state.screen = Screen::Detail;
 
@@ -1012,15 +1313,42 @@ fn open_detail_for_video(
 
     let c_ryd = client.clone();
     let tx_ryd = tx.clone();
+    let id_ryd = vid_id.clone();
     tokio::spawn(async move {
-        if let Ok(Some(info)) = fetch_dislikes(&c_ryd, &vid_id).await {
+        if let Ok(Some(info)) = fetch_dislikes(&c_ryd, &id_ryd).await {
             let _ = tx_ryd
                 .send(AppMessage::DislikesLoaded {
-                    video_id: vid_id,
+                    video_id: id_ryd,
                     info,
                 })
                 .await;
         }
+    });
+
+    let c_cm = client.clone();
+    let p_cm = pool.clone();
+    let tx_cm = tx.clone();
+    let sess_cm = state.auth_vault.active_account().cloned();
+    tokio::spawn(async move {
+        let mut combined = get_user_video_comments(&p_cm, &vid_id)
+            .await
+            .unwrap_or_default();
+        let mut create_params = None;
+        if let Ok(page) = fetch_video_comments(&c_cm, sess_cm.as_ref(), &vid_id).await {
+            create_params = page.create_comment_params;
+            for c in page.comments {
+                if !combined.iter().any(|existing| existing.id == c.id) {
+                    combined.push(c);
+                }
+            }
+        }
+        let _ = tx_cm
+            .send(AppMessage::CommentsLoaded {
+                video_id: vid_id,
+                comments: combined,
+                create_params,
+            })
+            .await;
     });
 }
 
@@ -1054,13 +1382,18 @@ async fn start_nonblocking_playback(
         None
     };
 
+    let cookies_path = state.config.cookies_path().ok();
+    if let Some(ref cpath) = cookies_path {
+        let _ = state.auth_vault.sync_isolated_cookie_jar(cpath);
+    }
+
     let opts = PlayOptions {
         video_id: video.id.clone(),
         title: video.title.clone(),
         local_file,
         quality_format: quality.ytdl_format().to_string(),
         player: state.config.player,
-        cookies_path: state.config.cookies_path().ok(),
+        cookies_path: cookies_path.clone(),
         start_pos,
         ipc_socket: if state.config.player == Player::Mpv {
             Some(sock_path.clone())
@@ -1077,8 +1410,58 @@ async fn start_nonblocking_playback(
 
     match spawn_player(&opts) {
         Ok(Some(_child)) => {
-            let _ = touch_watch_history(pool, Some(video), &video.id, now_unix()).await;
-            state.watched_ids.insert(video.id.clone());
+            let ts = now_unix();
+            let _ = touch_watch_history(pool, Some(video), &video.id, ts).await;
+            state.mark_video_watched(video);
+
+            if let Some((_, hist_list)) = state
+                .categories
+                .iter()
+                .find(|(c, _)| *c == Category::History)
+            {
+                let _ = batch_upsert_feed(pool, HISTORY, hist_list, ts).await;
+            }
+            let rec_len = if let Some((_, rec_list)) = state
+                .categories
+                .iter()
+                .find(|(c, _)| *c == Category::Recommended)
+            {
+                let _ = batch_upsert_feed(pool, RECOMMENDED, rec_list, ts).await;
+                rec_list.len()
+            } else {
+                usize::MAX
+            };
+            if rec_len < 12 && !state.is_fetching_more {
+                maybe_trigger_infinite_scroll_for(
+                    Category::Recommended,
+                    state,
+                    pool,
+                    tx,
+                    client,
+                    false,
+                );
+            }
+
+            let sess_sync = state.auth_vault.active_account().cloned();
+            let vid_sync = video.id.clone();
+            let dur_sync = video.duration.map(|d| d as f64);
+            let start_sync = start_pos.unwrap_or(0.0);
+            let c_sync = client.clone();
+            let cpath_sync = cookies_path.clone();
+            tokio::spawn(async move {
+                let _ = report_youtube_watch_progress(
+                    &c_sync,
+                    sess_sync.as_ref(),
+                    cpath_sync.as_deref(),
+                    &vid_sync,
+                    start_sync,
+                    start_sync,
+                    dur_sync,
+                    true,
+                )
+                .await;
+            });
+
             state.show_toast(format!(
                 "Playing via {} ({})",
                 state.config.player.label(),
@@ -1178,11 +1561,23 @@ async fn remove_video_from_continue_watching(
 
 fn maybe_trigger_infinite_scroll(
     state: &mut AppState,
+    pool: &SqlitePool,
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
     force: bool,
 ) {
     let cat = state.categories[state.active_category].0;
+    maybe_trigger_infinite_scroll_for(cat, state, pool, tx, client, force);
+}
+
+fn maybe_trigger_infinite_scroll_for(
+    cat: Category,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+    force: bool,
+) {
     let Some(url) = cat.url() else {
         return;
     };
@@ -1201,7 +1596,12 @@ fn maybe_trigger_infinite_scroll(
         }
     }
 
-    let current_len = state.categories[state.active_category].1.len();
+    let current_len = state
+        .categories
+        .iter()
+        .find(|(c, _)| *c == cat)
+        .map(|(_, l)| l.len())
+        .unwrap_or(0);
     state.is_fetching_more = true;
     state.last_pagination_at = Some(Instant::now());
 
@@ -1213,9 +1613,18 @@ fn maybe_trigger_infinite_scroll(
     ) {
         let client_clone = client.clone();
         let tx_m = tx.clone();
+        let p_inf = pool.clone();
         tokio::spawn(async move {
             match fetch_innertube_shelf(&client_clone, &session, browse_id, Some(&token)).await {
                 Ok(page) => {
+                    let _ = sync_youtube_watched_items(
+                        &p_inf,
+                        &page.videos,
+                        &page.watched_progress,
+                        key == HISTORY,
+                        now_unix(),
+                    )
+                    .await;
                     let _ = tx_m
                         .send(AppMessage::MoreFeedLoaded {
                             feed_key: key,
@@ -1251,6 +1660,7 @@ fn maybe_trigger_infinite_scroll(
 
 fn scroll_down_grid_and_prefetch(
     state: &mut AppState,
+    pool: &SqlitePool,
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
     cols: usize,
@@ -1258,7 +1668,7 @@ fn scroll_down_grid_and_prefetch(
     list_len: usize,
 ) {
     if list_len == 0 {
-        maybe_trigger_infinite_scroll(state, tx, client, false);
+        maybe_trigger_infinite_scroll(state, pool, tx, client, false);
         return;
     }
     let cols = cols.max(1);
@@ -1278,7 +1688,7 @@ fn scroll_down_grid_and_prefetch(
     let cur_row = state.category_cursors[state.active_category] / cols;
     let total_rows = list_len.div_ceil(cols);
     if cur_row + 2 >= total_rows {
-        maybe_trigger_infinite_scroll(state, tx, client, false);
+        maybe_trigger_infinite_scroll(state, pool, tx, client, false);
     }
 }
 
@@ -1565,7 +1975,7 @@ async fn handle_mouse_event(
                 }
             } else {
                 let cols = grid_columns(grid_area.width);
-                scroll_down_grid_and_prefetch(state, tx, client, cols, 1, len);
+                scroll_down_grid_and_prefetch(state, pool, tx, client, cols, 1, len);
                 return true;
             }
         }
@@ -1603,6 +2013,79 @@ async fn handle_key_event(
     // 2. Detail / Channel screens
     match state.screen {
         Screen::Detail => {
+            if state.detail_comment_composing {
+                match code {
+                    KeyCode::Esc => {
+                        state.detail_comment_composing = false;
+                    }
+                    KeyCode::Backspace => {
+                        state.detail_comment_input.pop();
+                    }
+                    KeyCode::Enter => {
+                        let body = state.detail_comment_input.trim().to_string();
+                        if !body.is_empty() {
+                            if let Some(vid_id) = state.detail_video.as_ref().map(|v| v.id.clone()) {
+                                let author = state
+                                    .auth_vault
+                                    .active_account()
+                                    .map(|a| a.display_name.clone())
+                                    .unwrap_or_else(|| "You (Local)".to_string());
+                                let now = now_unix();
+                                let _ = save_user_video_comment(pool, &vid_id, &author, &body, now).await;
+                                let local_cmt = VideoComment {
+                                    id: format!("local_{now}"),
+                                    author,
+                                    published_text: "Just now".to_string(),
+                                    text: body.clone(),
+                                    like_count_text: "1".to_string(),
+                                    reply_count: 0,
+                                    is_pinned: false,
+                                    is_self: true,
+                                };
+                                state.detail_comments.insert(0, local_cmt);
+                                state.detail_comment_cursor = 0;
+
+                                if let Some(sess) = state.auth_vault.active_account().cloned() {
+                                    let c_post = client.clone();
+                                    let tx_post = tx.clone();
+                                    let params = state.detail_create_comment_params.clone();
+                                    let v_id_p = vid_id.clone();
+                                    state.show_toast("Posting comment to YouTube...");
+                                    tokio::spawn(async move {
+                                        let msg = match post_video_comment(
+                                            &c_post,
+                                            &sess,
+                                            &v_id_p,
+                                            params.as_deref(),
+                                            &body,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => "Comment posted to YouTube!".to_string(),
+                                            Err(e) => {
+                                                format!("Saved locally (YouTube sync failed: {e})")
+                                            }
+                                        };
+                                        let _ = tx_post.send(AppMessage::ShowToast(msg)).await;
+                                    });
+                                } else {
+                                    state.show_toast(
+                                        "Comment saved locally (Sign in [L] to post to YouTube)",
+                                    );
+                                }
+                            }
+                        }
+                        state.detail_comment_input.clear();
+                        state.detail_comment_composing = false;
+                    }
+                    KeyCode::Char(c) => {
+                        state.detail_comment_input.push(c);
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+
             match code {
                 KeyCode::Esc | KeyCode::Backspace => {
                     if let Some(prev) = state.detail_history.pop() {
@@ -1627,6 +2110,10 @@ async fn handle_key_event(
                         DetailViewMode::Overview
                     };
                 }
+                KeyCode::Char('m') => {
+                    state.detail_focus_pane = 2;
+                    state.detail_comment_composing = true;
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     match state.detail_focus_pane {
                         1 => {
@@ -1641,10 +2128,10 @@ async fn handle_key_event(
                             }
                         }
                         2 => {
-                            let n = state.detail_related_entries().len();
+                            let n = state.detail_comments.len();
                             if n > 0 {
-                                state.detail_related_cursor =
-                                    (state.detail_related_cursor + 1).min(n - 1);
+                                state.detail_comment_cursor =
+                                    (state.detail_comment_cursor + 1).min(n - 1);
                             }
                         }
                         _ => {
@@ -1659,8 +2146,8 @@ async fn handle_key_event(
                                 state.detail_chapter_cursor.saturating_sub(1);
                         }
                         2 => {
-                            state.detail_related_cursor =
-                                state.detail_related_cursor.saturating_sub(1);
+                            state.detail_comment_cursor =
+                                state.detail_comment_cursor.saturating_sub(1);
                         }
                         _ => {
                             state.detail_scroll = state.detail_scroll.saturating_sub(2);
@@ -1668,16 +2155,8 @@ async fn handle_key_event(
                     }
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    if state.detail_focus_pane == 2 {
-                        let related = state.detail_related_entries();
-                        if let Some((_, rel_vid)) = related.get(state.detail_related_cursor).cloned() {
-                            if code == KeyCode::Char(' ') {
-                                start_nonblocking_playback(&rel_vid, None, state, pool, tx, client)
-                                    .await;
-                            } else {
-                                open_detail_for_video(rel_vid, state, pool, tx, client);
-                            }
-                        }
+                    if state.detail_focus_pane == 2 && code == KeyCode::Enter {
+                        state.detail_comment_composing = true;
                     } else if let Some(v) = state.detail_video.clone() {
                         let start_ch = if state.detail_focus_pane == 1 {
                             v.effective_chapters()
@@ -1738,7 +2217,7 @@ async fn handle_key_event(
                         spawn_offline_download(&v, state, pool, tx);
                     }
                 }
-                KeyCode::Char('m') => state.overlay = ActiveOverlay::Remote,
+                KeyCode::Char('M') => state.overlay = ActiveOverlay::Remote,
                 KeyCode::Char('C') => execute_hub_action(HubActionId::CastScan, state, pool, tx, client).await,
                 KeyCode::Char('s') | KeyCode::Char(',') => state.overlay = ActiveOverlay::Settings,
                 KeyCode::Char('?') => state.overlay = ActiveOverlay::Help,
@@ -1847,7 +2326,7 @@ async fn handle_key_event(
             state.show_toast("Refreshing all YouTube shelves...");
         }
         KeyCode::Char('n') | KeyCode::Char(']') => {
-            maybe_trigger_infinite_scroll(state, tx, client, true);
+            maybe_trigger_infinite_scroll(state, pool, tx, client, true);
         }
         KeyCode::Char('w') => {
             if let Some(v) = state.current_home_video() {
@@ -1956,7 +2435,7 @@ async fn handle_key_event(
                     *c = (*c + 1).min(list_len - 1);
                 }
             } else {
-                scroll_down_grid_and_prefetch(state, tx, client, cols, 1, list_len);
+                scroll_down_grid_and_prefetch(state, pool, tx, client, cols, 1, list_len);
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
@@ -1975,7 +2454,7 @@ async fn handle_key_event(
                     *c = (*c + 5).min(list_len - 1);
                 }
             } else {
-                scroll_down_grid_and_prefetch(state, tx, client, cols, visible_rows, list_len);
+                scroll_down_grid_and_prefetch(state, pool, tx, client, cols, visible_rows, list_len);
             }
         }
         KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1985,7 +2464,7 @@ async fn handle_key_event(
                     *c = (*c + 5).min(list_len - 1);
                 }
             } else {
-                scroll_down_grid_and_prefetch(state, tx, client, cols, visible_rows, list_len);
+                scroll_down_grid_and_prefetch(state, pool, tx, client, cols, visible_rows, list_len);
             }
         }
         KeyCode::PageUp => {
@@ -2006,7 +2485,7 @@ async fn handle_key_event(
                 state.category_cursors[state.active_category] = list_len - 1;
             }
             if !cw_deck {
-                maybe_trigger_infinite_scroll(state, tx, client, false);
+                maybe_trigger_infinite_scroll(state, pool, tx, client, false);
             }
         }
         _ => {}

@@ -68,7 +68,7 @@ pub fn render_help_modal(frame: &mut Frame, state: &AppState) {
             " Playback, Queue & Detail ",
             vec![
                 Line::from(vec![Span::styled(" Enter / Space", key), Span::styled("Watch in Queue / Play or Detail", desc)]),
-                Line::from(vec![Span::styled(" i            ", key), Span::styled("Detail Deck (Tab: Chapters / Up Next)", desc)]),
+                Line::from(vec![Span::styled(" i            ", key), Span::styled("Detail Deck (Tab: Chaps/Comments · m Comment)", desc)]),
                 Line::from(vec![Span::styled(" p            ", key), Span::styled("Play Options (Quality/Player/Subs)", desc)]),
                 Line::from(vec![Span::styled(" v / X        ", key), Span::styled("Toggle Queue Grid / Clear finished", desc)]),
                 Line::from(vec![Span::styled(" D / n        ", key), Span::styled("Offline download / Force load more", desc)]),

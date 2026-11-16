@@ -20,11 +20,12 @@ pub fn browse_id_for_feed_key(feed_key: &str) -> Option<&'static str> {
     }
 }
 
-/// Extracted InnerTube shelf page containing deduplicated videos and optional next continuation token.
+/// Extracted InnerTube shelf page containing deduplicated videos, resume progress, and optional next continuation token.
 #[derive(Debug, Clone, Default)]
 pub struct InnerTubeShelfPage {
     pub videos: Vec<VideoItem>,
     pub continuation: Option<String>,
+    pub watched_progress: Vec<(String, u8)>,
 }
 
 /// Apply either isolated `SAPISIDHASH` + cookie headers or OAuth `Bearer` authorization to an InnerTube request.
@@ -169,17 +170,60 @@ pub async fn innertube_edit_watch_later(
     Ok(())
 }
 
-/// Recursively extract normalized `VideoItem`s and pagination token from any InnerTube browse JSON payload.
+/// Recursively extract normalized `VideoItem`s, resume overlays, and pagination token from any InnerTube browse JSON payload.
 pub fn parse_innertube_browse_json(root: &serde_json::Value) -> InnerTubeShelfPage {
     let mut page = InnerTubeShelfPage::default();
     let mut seen = HashSet::new();
-    collect_innertube_nodes(root, &mut page.videos, &mut seen, &mut page.continuation);
+    collect_innertube_nodes(
+        root,
+        &mut page.videos,
+        &mut page.watched_progress,
+        &mut seen,
+        &mut page.continuation,
+    );
     page
+}
+
+fn extract_renderer_watched_pct(renderer: &serde_json::Value) -> Option<u8> {
+    let overlays = renderer.get("thumbnailOverlays")?.as_array()?;
+    for ov in overlays {
+        if let Some(pct) = ov
+            .pointer("/thumbnailOverlayResumePlaybackRenderer/percentDurationWatched")
+            .and_then(|v| v.as_u64())
+        {
+            if pct > 0 {
+                return Some(pct.min(100) as u8);
+            }
+        }
+    }
+    None
+}
+
+fn extract_lockup_watched_pct(lockup: &serde_json::Value) -> Option<u8> {
+    let overlays = lockup
+        .pointer("/contentImage/thumbnailViewModel/overlays")?
+        .as_array()?;
+    for ov in overlays {
+        let pct_val = ov
+            .pointer("/thumbnailOverlayProgressBarViewModel/startPercent")
+            .or_else(|| {
+                ov.pointer(
+                    "/thumbnailBottomOverlayViewModel/progressBar/thumbnailOverlayProgressBarViewModel/startPercent",
+                )
+            });
+        if let Some(pct_f) = pct_val.and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64))) {
+            if pct_f > 0.0 {
+                return Some(pct_f.round().clamp(1.0, 100.0) as u8);
+            }
+        }
+    }
+    None
 }
 
 fn collect_innertube_nodes(
     node: &serde_json::Value,
     out: &mut Vec<VideoItem>,
+    watched_progress: &mut Vec<(String, u8)>,
     seen: &mut HashSet<String>,
     continuation: &mut Option<String>,
 ) {
@@ -194,6 +238,9 @@ fn collect_innertube_nodes(
                 if let Some(renderer) = map.get(key) {
                     if let Some(item) = extract_video_from_renderer(renderer) {
                         if seen.insert(item.id.clone()) {
+                            if let Some(pct) = extract_renderer_watched_pct(renderer) {
+                                watched_progress.push((item.id.clone(), pct));
+                            }
                             out.push(item);
                         }
                     }
@@ -202,6 +249,9 @@ fn collect_innertube_nodes(
             if let Some(lockup) = map.get("lockupViewModel") {
                 if let Some(item) = extract_video_from_lockup(lockup) {
                     if seen.insert(item.id.clone()) {
+                        if let Some(pct) = extract_lockup_watched_pct(lockup) {
+                            watched_progress.push((item.id.clone(), pct));
+                        }
                         out.push(item);
                     }
                 }
@@ -219,12 +269,12 @@ fn collect_innertube_nodes(
             }
 
             for val in map.values() {
-                collect_innertube_nodes(val, out, seen, continuation);
+                collect_innertube_nodes(val, out, watched_progress, seen, continuation);
             }
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                collect_innertube_nodes(item, out, seen, continuation);
+                collect_innertube_nodes(item, out, watched_progress, seen, continuation);
             }
         }
         _ => {}
@@ -690,6 +740,615 @@ pub fn parse_youtube_rss_xml(xml: &str) -> Vec<VideoItem> {
     items
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct VideoComment {
+    pub id: String,
+    pub author: String,
+    pub published_text: String,
+    pub text: String,
+    pub like_count_text: String,
+    pub reply_count: u32,
+    pub is_pinned: bool,
+    pub is_self: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CommentsPage {
+    pub comments: Vec<VideoComment>,
+    pub continuation: Option<String>,
+    pub create_comment_params: Option<String>,
+}
+
+fn apply_innertube_web_headers(
+    req: reqwest::RequestBuilder,
+    session: Option<&GoogleAccountSession>,
+) -> reqwest::RequestBuilder {
+    if let Some(s) = session {
+        apply_innertube_auth_headers(req, s)
+    } else {
+        req.header(USER_AGENT, PHAENNA_USER_AGENT)
+            .header(CONTENT_TYPE, "application/json")
+            .header("Origin", "https://www.youtube.com")
+            .header("X-Origin", "https://www.youtube.com")
+            .header("X-YouTube-Client-Name", "1")
+            .header("X-YouTube-Client-Version", INNERTUBE_CLIENT_VERSION)
+    }
+}
+
+fn first_string_by_key<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(s) = map.get(key).and_then(|val| val.as_str()) {
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            for val in map.values() {
+                if let Some(found) = first_string_by_key(val, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = first_string_by_key(item, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_comments_continuation_in_next(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(sec) = map.get("itemSectionRenderer").and_then(|x| x.as_object()) {
+                let is_comments = sec
+                    .get("sectionIdentifier")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s == "comment-item-section")
+                    .unwrap_or(false)
+                    || sec
+                        .get("targetId")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.contains("comment"))
+                        .unwrap_or(false);
+                if is_comments {
+                    if let Some(tok) = first_string_by_key(&serde_json::Value::Object(sec.clone()), "token") {
+                        return Some(tok.to_string());
+                    }
+                }
+            }
+            if let Some(panel) = map
+                .get("engagementPanelSectionListRenderer")
+                .and_then(|x| x.as_object())
+            {
+                let is_comments = panel
+                    .get("panelIdentifier")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.contains("comments"))
+                    .unwrap_or(false);
+                if is_comments {
+                    if let Some(tok) =
+                        first_string_by_key(&serde_json::Value::Object(panel.clone()), "token")
+                    {
+                        return Some(tok.to_string());
+                    }
+                }
+            }
+            for val in map.values() {
+                if let Some(found) = find_comments_continuation_in_next(val) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = find_comments_continuation_in_next(item) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn clean_comment_body(raw: &str) -> String {
+    raw.replace("\r\n", "\n")
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn parse_reply_count_val(val: Option<&serde_json::Value>) -> u32 {
+    match val {
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .replace(',', "")
+            .parse::<u32>()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn collect_comments_nodes(
+    v: &serde_json::Value,
+    out: &mut Vec<VideoComment>,
+    seen: &mut HashSet<String>,
+    continuation: &mut Option<String>,
+    create_params: &mut Option<String>,
+) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if create_params.is_none() {
+                if let Some(p) = map.get("createCommentParams").and_then(|x| x.as_str()) {
+                    if !p.is_empty() {
+                        *create_params = Some(p.to_string());
+                    }
+                }
+            }
+
+            if let Some(cr) = map.get("commentRenderer") {
+                if let Some(id) = cr.get("commentId").and_then(|x| x.as_str()) {
+                    if !id.is_empty() && seen.insert(id.to_string()) {
+                        let author = extract_yt_text(cr.get("authorText"))
+                            .unwrap_or_else(|| "Viewer".to_string());
+                        let published_text =
+                            extract_yt_text(cr.get("publishedTimeText")).unwrap_or_default();
+                        let text = extract_yt_text(cr.get("contentText"))
+                            .map(|s| clean_comment_body(&s))
+                            .unwrap_or_default();
+                        let like_count_text = extract_yt_text(cr.get("voteCount"))
+                            .unwrap_or_else(|| "0".to_string());
+                        let reply_count = parse_reply_count_val(cr.get("replyCount"));
+                        let is_pinned = cr.get("pinnedCommentBadge").is_some();
+                        if !text.is_empty() {
+                            out.push(VideoComment {
+                                id: id.to_string(),
+                                author,
+                                published_text,
+                                text,
+                                like_count_text,
+                                reply_count,
+                                is_pinned,
+                                is_self: false,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if let Some(cep) = map.get("commentEntityPayload") {
+                let id = cep
+                    .get("properties")
+                    .and_then(|p| p.get("commentId"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                if !id.is_empty() && seen.insert(id.to_string()) {
+                    let author = cep
+                        .get("author")
+                        .and_then(|a| a.get("displayName"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("Viewer")
+                        .to_string();
+                    let published_text = cep
+                        .get("properties")
+                        .and_then(|p| p.get("publishedTime"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let text = cep
+                        .get("properties")
+                        .and_then(|p| p.get("content"))
+                        .and_then(|c| c.get("content"))
+                        .and_then(|x| x.as_str())
+                        .map(clean_comment_body)
+                        .unwrap_or_default();
+                    let like_count_text = cep
+                        .get("toolbar")
+                        .and_then(|t| t.get("likeCountNotliked"))
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("0")
+                        .to_string();
+                    let reply_count = parse_reply_count_val(
+                        cep.get("toolbar").and_then(|t| t.get("replyCount")),
+                    );
+                    if !text.is_empty() {
+                        out.push(VideoComment {
+                            id: id.to_string(),
+                            author,
+                            published_text,
+                            text,
+                            like_count_text,
+                            reply_count,
+                            is_pinned: false,
+                            is_self: false,
+                        });
+                    }
+                }
+            }
+
+            if continuation.is_none() {
+                if let Some(ci) = map.get("continuationItemRenderer") {
+                    if let Some(tok) = ci
+                        .get("continuationEndpoint")
+                        .and_then(|e| e.get("continuationCommand"))
+                        .and_then(|c| c.get("token"))
+                        .and_then(|t| t.as_str())
+                    {
+                        *continuation = Some(tok.to_string());
+                    }
+                }
+            }
+
+            for val in map.values() {
+                collect_comments_nodes(val, out, seen, continuation, create_params);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_comments_nodes(item, out, seen, continuation, create_params);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn parse_innertube_comments_json(root: &serde_json::Value) -> CommentsPage {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut continuation = None;
+    let mut create_comment_params = None;
+    if let Some(endpoints) = root.get("onResponseReceivedEndpoints") {
+        collect_comments_nodes(
+            endpoints,
+            &mut out,
+            &mut seen,
+            &mut continuation,
+            &mut create_comment_params,
+        );
+    }
+    collect_comments_nodes(
+        root,
+        &mut out,
+        &mut seen,
+        &mut continuation,
+        &mut create_comment_params,
+    );
+    CommentsPage {
+        comments: out,
+        continuation,
+        create_comment_params,
+    }
+}
+
+/// Fetch YouTube comments for a video via InnerTube `/next` + continuation payload.
+pub async fn fetch_video_comments(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    video_id: &str,
+) -> Result<CommentsPage> {
+    let clean_id = video_id.trim_start_matches("RD");
+    let init_payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "videoId": clean_id
+    });
+
+    let init_req = client
+        .post("https://www.youtube.com/youtubei/v1/next?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&init_payload);
+    let init_resp = apply_innertube_web_headers(init_req, session).send().await?;
+    if !init_resp.status().is_success() {
+        return Err(AppError::Http(format!(
+            "InnerTube comments /next HTTP {}",
+            init_resp.status()
+        )));
+    }
+    let init_json: serde_json::Value = init_resp
+        .json()
+        .await
+        .map_err(|e| AppError::Parse(format!("Invalid /next comments JSON: {e}")))?;
+
+    let mut page = parse_innertube_comments_json(&init_json);
+    let init_create_params = first_string_by_key(&init_json, "createCommentParams").map(str::to_string);
+    if page.create_comment_params.is_none() {
+        page.create_comment_params = init_create_params;
+    }
+
+    if let Some(cont_tok) = find_comments_continuation_in_next(&init_json) {
+        let cont_payload = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": INNERTUBE_CLIENT_VERSION,
+                    "hl": "en",
+                    "gl": "US"
+                }
+            },
+            "continuation": cont_tok
+        });
+        let cont_req = client
+            .post("https://www.youtube.com/youtubei/v1/next?prettyPrint=false")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&cont_payload);
+        if let Ok(cont_resp) = apply_innertube_web_headers(cont_req, session).send().await {
+            if cont_resp.status().is_success() {
+                if let Ok(cont_json) = cont_resp.json::<serde_json::Value>().await {
+                    let next_page = parse_innertube_comments_json(&cont_json);
+                    if !next_page.comments.is_empty() {
+                        page.comments = next_page.comments;
+                    }
+                    if next_page.create_comment_params.is_some() {
+                        page.create_comment_params = next_page.create_comment_params;
+                    }
+                    page.continuation = next_page.continuation;
+                }
+            }
+        }
+    }
+
+    Ok(page)
+}
+
+/// Post a comment to YouTube via InnerTube `/comment/create_comment`.
+pub async fn post_video_comment(
+    client: &reqwest::Client,
+    session: &GoogleAccountSession,
+    video_id: &str,
+    cached_params: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    let params = if let Some(p) = cached_params.filter(|s| !s.is_empty()) {
+        p.to_string()
+    } else {
+        let page = fetch_video_comments(client, Some(session), video_id).await?;
+        page.create_comment_params.ok_or_else(|| {
+            AppError::Http("YouTube createCommentParams unavailable for this session".to_string())
+        })?
+    };
+
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "createCommentParams": params,
+        "commentText": text
+    });
+
+    let req = client
+        .post("https://www.youtube.com/youtubei/v1/comment/create_comment?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload);
+    let resp = apply_innertube_auth_headers(req, session).send().await?;
+    if !resp.status().is_success() {
+        return Err(AppError::Http(format!(
+            "Create comment HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
+/// Generate a deterministic 16-character URL-safe YouTube client playback nonce (`cpn`).
+pub fn generate_cpn(video_id: &str, now_unix: u64) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ now_unix.rotate_left(17);
+    for &b in video_id.as_bytes() {
+        state = state.wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (b as u64);
+    }
+    let mut out = String::with_capacity(16);
+    for _ in 0..16 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let idx = ((state >> 32) as usize) % ALPHABET.len();
+        out.push(ALPHABET[idx] as char);
+    }
+    out
+}
+
+fn normalize_tracking_url(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Extract `(videostatsPlaybackUrl, videostatsWatchtimeUrl, ptrackingUrl)` from InnerTube `/player` JSON.
+pub fn extract_playback_tracking_urls(
+    player_json: &serde_json::Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let playback = player_json
+        .pointer("/playbackTracking/videostatsPlaybackUrl/baseUrl")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(normalize_tracking_url);
+    let watchtime = player_json
+        .pointer("/playbackTracking/videostatsWatchtimeUrl/baseUrl")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(normalize_tracking_url);
+    let ptracking = player_json
+        .pointer("/playbackTracking/ptrackingUrl/baseUrl")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(normalize_tracking_url);
+    (playback, watchtime, ptracking)
+}
+
+fn append_query(base: &str, params: &str) -> String {
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}{params}")
+}
+
+/// Register video view & watchtime progress directly in YouTube watch history.
+#[allow(clippy::too_many_arguments)]
+pub async fn report_youtube_watch_progress(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    cookies_path: Option<&std::path::Path>,
+    video_id: &str,
+    start_secs: f64,
+    current_secs: f64,
+    duration_secs: Option<f64>,
+    is_initial_start: bool,
+) -> Result<bool> {
+    let clean_id = video_id.trim_start_matches("RD");
+    if clean_id.is_empty() {
+        return Ok(false);
+    }
+
+    let mut reported = false;
+
+    if let Some(sess) = session {
+        let player_payload = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": INNERTUBE_CLIENT_VERSION,
+                    "hl": "en",
+                    "gl": "US"
+                }
+            },
+            "videoId": clean_id,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS"
+                }
+            }
+        });
+
+        let player_req = client
+            .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&player_payload);
+
+        if let Ok(resp) = apply_innertube_web_headers(player_req, Some(sess)).send().await {
+            if resp.status().is_success() {
+                if let Ok(player_json) = resp.json::<serde_json::Value>().await {
+                    let (playback_url, watchtime_url, ptracking_url) =
+                        extract_playback_tracking_urls(&player_json);
+                    let cpn = generate_cpn(clean_id, now_unix_secs().max(0) as u64);
+                    let referer = format!("https://www.youtube.com/watch?v={clean_id}");
+                    let st = start_secs.max(0.0);
+                    let et = current_secs.max(st);
+
+                    if is_initial_start {
+                        if let Some(ref p_url) = ptracking_url {
+                            let url = append_query(p_url, &format!("cpn={cpn}"));
+                            let r = apply_innertube_web_headers(
+                                client.get(&url).timeout(std::time::Duration::from_secs(6)),
+                                Some(sess),
+                            )
+                            .header("Referer", &referer)
+                            .send()
+                            .await;
+                            if let Ok(ok_r) = r {
+                                if ok_r.status().is_success() {
+                                    reported = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref pb_url) = playback_url {
+                        let url = append_query(
+                            pb_url,
+                            &format!(
+                                "ver=2&c=WEB&cver={INNERTUBE_CLIENT_VERSION}&cpn={cpn}&cmt={et:.1}"
+                            ),
+                        );
+                        let r = apply_innertube_web_headers(
+                            client.get(&url).timeout(std::time::Duration::from_secs(6)),
+                            Some(sess),
+                        )
+                        .header("Referer", &referer)
+                        .send()
+                        .await;
+                        if let Ok(ok_r) = r {
+                            if ok_r.status().is_success() {
+                                reported = true;
+                            }
+                        }
+                    }
+
+                    if let Some(ref wt_url) = watchtime_url {
+                        let mut q = format!(
+                            "ver=2&c=WEB&cver={INNERTUBE_CLIENT_VERSION}&cpn={cpn}&st={st:.1}&et={et:.1}&cmt={et:.1}&state=playing"
+                        );
+                        if let Some(dur) = duration_secs.filter(|d| *d > 0.0) {
+                            q.push_str(&format!("&len={dur:.1}"));
+                        }
+                        let url = append_query(wt_url, &q);
+                        let r = apply_innertube_web_headers(
+                            client.get(&url).timeout(std::time::Duration::from_secs(6)),
+                            Some(sess),
+                        )
+                        .header("Referer", &referer)
+                        .send()
+                        .await;
+                        if let Ok(ok_r) = r {
+                            if ok_r.status().is_success() {
+                                reported = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if is_initial_start && !reported {
+        if let Some(cpath) = cookies_path.filter(|p| p.exists()) {
+            if let Some(ytdlp_bin) = crate::api::player::find_binary("yt-dlp") {
+                let watch_url = format!("https://www.youtube.com/watch?v={clean_id}");
+                let status = tokio::process::Command::new(ytdlp_bin)
+                    .arg("--no-warnings")
+                    .arg("--simulate")
+                    .arg("--skip-download")
+                    .arg("--mark-watched")
+                    .arg("--cookies")
+                    .arg(cpath)
+                    .arg(&watch_url)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                if let Ok(st) = status {
+                    if st.success() {
+                        reported = true;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(reported)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,5 +1511,119 @@ mod tests {
         assert_eq!(page.videos[0].published_text.as_deref(), Some("3 hours ago"));
         assert_eq!(page.videos[0].duration, Some(862));
         assert!(page.videos[0].is_new_release(now_unix_secs()));
+    }
+
+    #[test]
+    fn test_parse_innertube_comments_classic_and_entity_payload() {
+        let sample = serde_json::json!({
+            "onResponseReceivedEndpoints": [{
+                "reloadContinuationItemsCommand": {
+                    "continuationItems": [{
+                        "commentThreadRenderer": {
+                            "comment": {
+                                "commentRenderer": {
+                                    "commentId": "cmt_classic_1",
+                                    "authorText": { "simpleText": "@audiofan" },
+                                    "publishedTimeText": { "runs": [{ "text": "2 hours ago" }] },
+                                    "contentText": { "runs": [
+                                        { "text": "Great breakdown of the driver layout " },
+                                        { "text": "at 2:47!" }
+                                    ]},
+                                    "voteCount": { "simpleText": "142" },
+                                    "replyCount": 4,
+                                    "pinnedCommentBadge": { "pinnedCommentBadgeRenderer": {} }
+                                }
+                            }
+                        }
+                    }]
+                }
+            }],
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [{
+                        "payload": {
+                            "commentEntityPayload": {
+                                "properties": {
+                                    "commentId": "cmt_entity_2",
+                                    "publishedTime": "18 minutes ago",
+                                    "content": { "content": "Zero word concatenation on wrapped lines please." }
+                                },
+                                "author": { "displayName": "@rust_listener" },
+                                "toolbar": {
+                                    "likeCountNotliked": "29",
+                                    "replyCount": "2"
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let parsed = parse_innertube_comments_json(&sample);
+        assert_eq!(parsed.comments.len(), 2);
+        assert_eq!(parsed.comments[0].author, "@audiofan");
+        assert!(parsed.comments[0].is_pinned);
+        assert_eq!(parsed.comments[0].text, "Great breakdown of the driver layout at 2:47!");
+        assert_eq!(parsed.comments[1].author, "@rust_listener");
+        assert_eq!(parsed.comments[1].like_count_text, "29");
+        assert_eq!(parsed.comments[1].reply_count, 2);
+    }
+
+    #[test]
+    fn test_extract_playback_tracking_urls_and_watched_overlays() {
+        let player = serde_json::json!({
+            "playbackTracking": {
+                "videostatsPlaybackUrl": { "baseUrl": "http://s.youtube.com/api/stats/playback?cl=123" },
+                "videostatsWatchtimeUrl": { "baseUrl": "https://s.youtube.com/api/stats/watchtime?cl=123" },
+                "ptrackingUrl": { "baseUrl": "https://www.youtube.com/ptracking?html=1" }
+            }
+        });
+        let (pb, wt, pt) = extract_playback_tracking_urls(&player);
+        assert_eq!(pb.as_deref(), Some("https://s.youtube.com/api/stats/playback?cl=123"));
+        assert_eq!(wt.as_deref(), Some("https://s.youtube.com/api/stats/watchtime?cl=123"));
+        assert_eq!(pt.as_deref(), Some("https://www.youtube.com/ptracking?html=1"));
+
+        let cpn = generate_cpn("dQw4w9WgXcQ", 1_700_000_000);
+        assert_eq!(cpn.len(), 16);
+        assert!(cpn
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+
+        let browse = serde_json::json!({
+            "items": [
+                {
+                    "videoRenderer": {
+                        "videoId": "vid_classic_90",
+                        "title": { "simpleText": "Classic Watched" },
+                        "thumbnailOverlays": [
+                            { "thumbnailOverlayResumePlaybackRenderer": { "percentDurationWatched": 90 } }
+                        ]
+                    }
+                },
+                {
+                    "lockupViewModel": {
+                        "contentId": "vid_lockup_64",
+                        "metadata": { "lockupMetadataViewModel": { "title": { "content": "Lockup Watched" } } },
+                        "contentImage": {
+                            "thumbnailViewModel": {
+                                "overlays": [
+                                    { "thumbnailOverlayProgressBarViewModel": { "startPercent": 64 } }
+                                ]
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+        let page = parse_innertube_browse_json(&browse);
+        assert_eq!(page.videos.len(), 2);
+        assert_eq!(
+            page.watched_progress,
+            vec![
+                ("vid_classic_90".to_string(), 90),
+                ("vid_lockup_64".to_string(), 64)
+            ]
+        );
     }
 }

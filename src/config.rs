@@ -194,6 +194,26 @@ impl VideoShaderMode {
             Self::Anime4K => "Anime4K Restore (Line Reconstruction + Deband + 2x Upscale)",
         }
     }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Off => "Off (Raw Stream)",
+            Self::Balanced => "Balanced (Deblock + CAS)",
+            Self::Reference4K => "Reference 4K Studio",
+            Self::NeuralCinema => "Neural Cinema 4K (CNN)",
+            Self::Anime4K => "Anime4K Restore (2x)",
+        }
+    }
+
+    pub const fn detail_summary(self) -> &'static str {
+        match self {
+            Self::Off => "Native decoded stream without post-processing",
+            Self::Balanced => "Bilateral deblock + Luma CAS + 16-bit deband",
+            Self::Reference4K => "AV1/VP9 deblock + 4:4:4 chroma + 2x RCAS 4K",
+            Self::NeuralCinema => "FSRCNNX 16-0-4-1 neural CNN + 4:4:4 chroma",
+            Self::Anime4K => "Line-art contour reconstruction + 2x upscale",
+        }
+    }
 }
 
 /// SponsorBlock auto-skip behavior when watching in `mpv`.

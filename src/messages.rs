@@ -1,6 +1,7 @@
 //! Central asynchronous message bus for background workers and TUI event loop.
 
 use crate::api::dislike::DislikeInfo;
+use crate::api::innertube::VideoComment;
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::db::cache::VideoItem;
@@ -54,6 +55,16 @@ pub enum AppMessage {
     DislikesLoaded {
         video_id: String,
         info: DislikeInfo,
+    },
+    CommentsLoaded {
+        video_id: String,
+        comments: Vec<VideoComment>,
+        create_params: Option<String>,
+    },
+    CommentPosted {
+        video_id: String,
+        comment: VideoComment,
+        synced_remote: bool,
     },
 
     // Thumbnail Pipeline
