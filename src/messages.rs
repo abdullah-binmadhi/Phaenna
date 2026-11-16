@@ -139,7 +139,7 @@ pub enum AppMessage {
     },
 
     // Self-Updater & UI Notifications
-    UpdateAvailable(UpdateInfo),
+    UpdateCheckResult(Option<UpdateInfo>),
     UpdateProgress(f32, String),
     UpdateSuccess(String),
     UpdateFailed(String),

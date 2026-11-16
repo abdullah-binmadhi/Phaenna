@@ -1,5 +1,6 @@
-//! 4-Phase In-App Self-Updater Modal (`U`).
+//! 4-Phase In-App Self-Updater Modal (`U`), matching Solus auto-update UX.
 
+use crate::services::updater::short_sha;
 use crate::state::{centered_rect, AppState};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
@@ -40,14 +41,54 @@ pub fn render_update_modal(frame: &mut Frame, state: &AppState) {
         ])
         .split(inner);
 
+    if let Some(ref ver) = state.update_completed_version {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("Phaenna has been updated to {ver}!"),
+                    Style::default()
+                        .fg(Color::Rgb(52, 211, 153))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "The new binary is installed atomically on disk.",
+                    Style::default().fg(theme.text),
+                )),
+            ])
+            .alignment(Alignment::Center),
+            rows[1],
+        );
+        frame.render_widget(
+            Paragraph::new("Press [Enter] to exit cleanly, then re-run `phaenna` to launch the new version.")
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(theme.accent)),
+            rows[2],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("[Enter] Exit Phaenna ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled("· [Esc] Continue Session", Style::default().fg(theme.text_dim)),
+            ]))
+            .alignment(Alignment::Center),
+            rows[3],
+        );
+        return;
+    }
+
     if let Some(ref info) = state.available_update {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled("Current: ", Style::default().fg(theme.text_dim)),
-                    Span::styled(format!("v{}", info.current_version), Style::default().fg(theme.text)),
+                    Span::styled(&info.current_version, Style::default().fg(theme.text)),
                     Span::styled("  ->  Latest: ", Style::default().fg(theme.text_dim)),
-                    Span::styled(&info.latest_version, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        &info.latest_version,
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("Asset  : ", Style::default().fg(theme.text_dim)),
@@ -60,7 +101,7 @@ pub fn render_update_modal(frame: &mut Frame, state: &AppState) {
         let notes = info
             .release_notes
             .as_deref()
-            .unwrap_or("Bug fixes, performance enhancements, and Solus parity upgrades.");
+            .unwrap_or("Bug fixes, performance enhancements, and upstream improvements.");
         frame.render_widget(
             Paragraph::new(notes)
                 .wrap(Wrap { trim: true })
@@ -68,12 +109,12 @@ pub fn render_update_modal(frame: &mut Frame, state: &AppState) {
             rows[1],
         );
 
-        if state.update_progress > 0.0 {
+        if state.is_updating || state.update_progress > 0.0 {
             let gauge = Gauge::default()
                 .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded))
                 .gauge_style(Style::default().fg(theme.primary).bg(theme.border_idle))
                 .ratio((state.update_progress / 100.0).clamp(0.0, 1.0) as f64)
-                .label(state.update_status.clone().unwrap_or_default());
+                .label(state.update_status.clone().unwrap_or_else(|| "Updating...".to_string()));
             frame.render_widget(gauge, rows[2]);
         } else if let Some(ref st) = state.update_status {
             frame.render_widget(
@@ -81,12 +122,23 @@ pub fn render_update_modal(frame: &mut Frame, state: &AppState) {
                 rows[2],
             );
         }
+    } else if state.is_checking_update {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Checking GitHub Releases for updates...\nRunning v{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                short_sha(env!("PHAENNA_GIT_SHA"))
+            ))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.accent)),
+            rows[1],
+        );
     } else {
         frame.render_widget(
             Paragraph::new(format!(
-                "You are running v{} (SHA {}).\nPress [r] to check GitHub Releases for newer builds.",
+                "You are running v{} ({}).\nPress [r] to check GitHub Releases for newer builds.",
                 env!("CARGO_PKG_VERSION"),
-                env!("PHAENNA_GIT_SHA")
+                short_sha(env!("PHAENNA_GIT_SHA"))
             ))
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.text)),

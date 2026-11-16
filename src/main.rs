@@ -31,7 +31,7 @@ use crate::db::cache::{
     batch_upsert_feed, get_all_cached_videos, get_feed_videos, get_thumb_blob,
     search_cached_videos, store_thumb_blob, upsert_video, VideoItem,
 };
-use crate::db::sync::{is_stale, mark_synced, HISTORY, RECOMMENDED, SUBSCRIPTIONS, WATCH_LATER};
+use crate::db::sync::{is_stale, last_synced, mark_synced, HISTORY, RECOMMENDED, SUBSCRIPTIONS, WATCH_LATER};
 use crate::db::user::{
     add_to_watch_later, clear_finished_continue_watching, compute_user_analytics,
     get_all_progress_map, get_continue_watching, get_continue_watching_meta_map,
@@ -55,7 +55,9 @@ use crate::services::ipc::{spawn_mpv_ipc_monitor, IpcMonitorConfig};
 use crate::services::remote::start_remote_server;
 use crate::services::shaders::{download_neural_shader_pack, VideoMasteringProfile};
 use crate::services::tailored::{build_questions, score_discovery_pool};
-use crate::services::updater::{check_for_updates, spawn_self_update};
+use crate::services::updater::{
+    check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
+};
 use crate::state::{
     ActiveOverlay, AppState, Category, ContentFilter, DetailViewMode, DownloadJobState, Screen,
     SortOrder,
@@ -169,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 0. Clean up leftover update files from previous self-updates
+    cleanup_legacy_update_files();
+
     // 1. Initialize SQLite WAL Pool (<15ms cold boot)
     let db_path = Config::db_path()?;
     let pool = db::init(&db_path.to_string_lossy()).await?;
@@ -233,15 +238,16 @@ async fn main() -> anyhow::Result<()> {
     }
     trigger_swr_feed_refreshes(&mut state, &pool, &tx, &client, false);
 
-    // 6. Optional non-blocking GitHub Releases check
+    // 6. Optional non-blocking GitHub Releases check (supports SemVer & rolling main@sha)
     if state.config.update.check_on_startup {
-        let c_clone = client.clone();
-        let tx_u = tx.clone();
-        tokio::spawn(async move {
-            if let Ok(Some(info)) = check_for_updates(&c_clone).await {
-                let _ = tx_u.send(AppMessage::UpdateAvailable(info)).await;
-            }
-        });
+        spawn_update_check(
+            &pool,
+            &tx,
+            &client,
+            state.config.update.auto_install,
+            state.config.update.check_interval,
+            true,
+        );
     }
 
     // ── Main Event Loop ───────────────────────────────────────────────────────
@@ -334,7 +340,9 @@ async fn main() -> anyhow::Result<()> {
                     {
                         break;
                     }
-                    if handle_key_event(key.code, key.modifiers, &mut state, &pool, &tx, &client).await {
+                    if handle_key_event(key.code, key.modifiers, &mut state, &pool, &tx, &client).await
+                        || state.should_quit
+                    {
                         break;
                     }
                 }
@@ -1230,23 +1238,52 @@ async fn handle_app_message(
             }
             state.show_toast(format!("✕ Download failed: {}", error));
         }
-        AppMessage::UpdateAvailable(info) => {
-            let v = info.latest_version.clone();
-            state.available_update = Some(info);
-            state.show_toast(format!("⬆ Update {} available! Press [U]", v));
+        AppMessage::UpdateCheckResult(update_opt) => {
+            let was_checking = state.is_checking_update;
+            state.is_checking_update = false;
+            if let Some(info) = update_opt {
+                let new_ver = info.latest_version.clone();
+                let is_brew = info.is_homebrew;
+                if is_brew {
+                    state.available_update = Some(info);
+                    state.show_toast(format!("Phaenna {new_ver} available: brew upgrade phaenna"));
+                } else if state.config.update.auto_install && !was_checking {
+                    state.is_updating = true;
+                    state.available_update = Some(info);
+                    state.show_toast(format!("Updating Phaenna to {new_ver} in background..."));
+                } else {
+                    state.available_update = Some(info);
+                    if state.overlay == ActiveOverlay::None {
+                        state.overlay = ActiveOverlay::Update;
+                    }
+                    state.show_toast(format!("Update {new_ver} available! Press [U]"));
+                }
+            } else if was_checking {
+                state.show_toast(format!(
+                    "Phaenna is up to date (v{} · {})",
+                    env!("CARGO_PKG_VERSION"),
+                    short_sha(env!("PHAENNA_GIT_SHA"))
+                ));
+            }
         }
         AppMessage::UpdateProgress(pct, msg) => {
+            state.is_updating = true;
             state.update_progress = pct;
             state.update_status = Some(msg);
         }
         AppMessage::UpdateSuccess(ver) => {
+            state.is_updating = false;
             state.update_progress = 100.0;
-            state.update_status = Some(format!("Updated to {} — restart phaenna!", ver));
-            state.show_toast(format!("Updated to {}!", ver));
+            state.update_completed_version = Some(ver.clone());
+            state.update_status = Some(format!("Updated to {} — press [Enter] to exit!", ver));
+            state.overlay = ActiveOverlay::Update;
+            state.show_toast(format!("Phaenna updated to {}! Press [Enter] to exit.", ver));
         }
         AppMessage::UpdateFailed(err) => {
+            state.is_updating = false;
             state.update_progress = 0.0;
             state.update_status = Some(format!("✕ {}", err));
+            state.show_toast(format!("Update failed: {err}"));
         }
         AppMessage::CastDevicesDiscovered(devs) => {
             state.is_scanning_cast = false;
@@ -1348,6 +1385,50 @@ fn load_more_selected_comment_replies(
             spawn_fetch_comment_replies(video_id, pid, tok, sess, tx.clone(), client.clone());
         }
     }
+}
+
+fn spawn_update_check(
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+    auto_install: bool,
+    check_interval: u64,
+    respect_interval: bool,
+) {
+    let tx_u = tx.clone();
+    let pool_u = pool.clone();
+    let client_u = client.clone();
+    tokio::spawn(async move {
+        let now = now_unix();
+        let should_check = if respect_interval && check_interval > 0 {
+            match last_synced(&pool_u, "update_check").await {
+                Ok(Some(last)) => (now - last) >= check_interval as i64,
+                _ => true,
+            }
+        } else {
+            true
+        };
+        if !should_check {
+            return;
+        }
+
+        match check_for_updates(&client_u).await {
+            Ok(update_opt) => {
+                let _ = mark_synced(&pool_u, "update_check", now).await;
+                if let Some(ref info) = update_opt {
+                    if auto_install && !info.is_homebrew {
+                        spawn_self_update(client_u.clone(), info.clone(), tx_u.clone());
+                    }
+                }
+                let _ = tx_u.send(AppMessage::UpdateCheckResult(update_opt)).await;
+            }
+            Err(_) => {
+                if !respect_interval {
+                    let _ = tx_u.send(AppMessage::UpdateCheckResult(None)).await;
+                }
+            }
+        }
+    });
 }
 
 fn open_detail_for_video(
@@ -1985,13 +2066,25 @@ async fn execute_hub_action(
         }
         HubActionId::CheckUpdates => {
             state.overlay = ActiveOverlay::Update;
-            let c_u = client.clone();
-            let tx_u = tx.clone();
-            tokio::spawn(async move {
-                if let Ok(Some(info)) = check_for_updates(&c_u).await {
-                    let _ = tx_u.send(AppMessage::UpdateAvailable(info)).await;
-                }
-            });
+            if !state.is_checking_update {
+                state.is_checking_update = true;
+                spawn_update_check(pool, tx, client, false, 0, false);
+            }
+        }
+        HubActionId::AutoUpdateMode => {
+            if !state.config.update.check_on_startup {
+                state.config.update.check_on_startup = true;
+                state.config.update.auto_install = false;
+                state.show_toast("Auto-Update: Check on Startup");
+            } else if !state.config.update.auto_install {
+                state.config.update.auto_install = true;
+                state.show_toast("Auto-Update: Silent Auto-Install");
+            } else {
+                state.config.update.check_on_startup = false;
+                state.config.update.auto_install = false;
+                state.show_toast("Auto-Update: Disabled");
+            }
+            let _ = state.config.save();
         }
     }
 }
@@ -3047,8 +3140,13 @@ async fn handle_overlay_key(
                 execute_hub_action(HubActionId::CheckUpdates, state, pool, tx, client).await;
             }
             KeyCode::Enter => {
-                if let Some(info) = state.available_update.clone() {
-                    spawn_self_update(client.clone(), info, tx.clone());
+                if state.update_completed_version.is_some() {
+                    state.should_quit = true;
+                } else if !state.is_updating {
+                    if let Some(info) = state.available_update.clone() {
+                        state.is_updating = true;
+                        spawn_self_update(client.clone(), info, tx.clone());
+                    }
                 }
             }
             _ => {}

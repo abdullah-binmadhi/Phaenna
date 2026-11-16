@@ -29,6 +29,7 @@ pub enum HubActionId {
     UploadRadar,
     SystemDoctor,
     CheckUpdates,
+    AutoUpdateMode,
 }
 
 #[derive(Debug, Clone)]
@@ -176,9 +177,33 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             id: HubActionId::CheckUpdates,
             category: "ACCOUNT & TOOLS",
             label: "Check GitHub Releases Update",
-            keywords: "update version github release semver",
-            badge: format!("[ v{} ]", env!("CARGO_PKG_VERSION")),
+            keywords: "update version github release semver rolling",
+            badge: if state.is_checking_update {
+                "[ Checking... ]".to_string()
+            } else if let Some(ref u) = state.available_update {
+                format!("[ Update: {} ]", u.latest_version)
+            } else {
+                format!(
+                    "[ v{} · {} ]",
+                    env!("CARGO_PKG_VERSION"),
+                    crate::services::updater::short_sha(env!("PHAENNA_GIT_SHA"))
+                )
+            },
             description: "Check upstream GitHub Releases and self-update cleanly.",
+        },
+        HubItem {
+            id: HubActionId::AutoUpdateMode,
+            category: "ACCOUNT & TOOLS",
+            label: "Auto-Update Mode",
+            keywords: "auto update startup channel install check background",
+            badge: if !cfg.update.check_on_startup {
+                "[ Disabled ▾ ]".to_string()
+            } else if cfg.update.auto_install {
+                "[ Auto-Install ▾ ]".to_string()
+            } else {
+                "[ On Startup ▾ ]".to_string()
+            },
+            description: "Cycle between On Startup prompt, silent Auto-Install, or Disabled.",
         },
     ]
 }

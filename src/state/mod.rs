@@ -266,6 +266,10 @@ pub struct AppState {
     pub available_update: Option<UpdateInfo>,
     pub update_status: Option<String>,
     pub update_progress: f32,
+    pub is_checking_update: bool,
+    pub is_updating: bool,
+    pub update_completed_version: Option<String>,
+    pub should_quit: bool,
 
     // Toast & focused-card stock-ticker marquee
     pub toast: Option<(String, Instant)>,
@@ -403,6 +407,10 @@ impl AppState {
             available_update: None,
             update_status: None,
             update_progress: 0.0,
+            is_checking_update: false,
+            is_updating: false,
+            update_completed_version: None,
+            should_quit: false,
 
             toast: None,
             ticker_step: 0,
