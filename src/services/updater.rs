@@ -15,6 +15,36 @@ use tokio::sync::mpsc::Sender;
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/abdullah-binmadhi/Phaenna/releases/latest";
 const USER_AGENT: &str = concat!("phaenna/", env!("CARGO_PKG_VERSION"));
+const MIN_BINARY_BYTES: u64 = 1_000_000;
+
+fn has_valid_native_magic(hdr: &[u8]) -> bool {
+    if hdr.len() < 4 {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            [hdr[0], hdr[1], hdr[2], hdr[3]],
+            [0xFE, 0xED, 0xFA, 0xCE]
+                | [0xCE, 0xFA, 0xED, 0xFE]
+                | [0xFE, 0xED, 0xFA, 0xCF]
+                | [0xCF, 0xFA, 0xED, 0xFE]
+                | [0xCA, 0xFE, 0xBA, 0xBE]
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        hdr.starts_with(&[0x7F, b'E', b'L', b'F'])
+    }
+    #[cfg(target_os = "windows")]
+    {
+        hdr.starts_with(b"MZ")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        true
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseAsset {
@@ -208,9 +238,7 @@ pub fn evaluate_release_update(
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name == target)
-        .or_else(|| release.assets.iter().find(|a| a.name.contains("phaenna")))
-        .or_else(|| release.assets.first())?;
+        .find(|a| a.name == target && a.size >= MIN_BINARY_BYTES)?;
 
     Some(UpdateInfo {
         current_version: display_curr,
@@ -305,6 +333,29 @@ async fn download_and_install_inner(
 
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
     drop(file);
+
+    if downloaded < MIN_BINARY_BYTES {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(AppError::Http(format!(
+            "Downloaded asset `{}` is too small ({} bytes); aborting binary replace",
+            info.asset_name, downloaded
+        )));
+    }
+    {
+        use std::io::Read;
+        let mut hdr = [0u8; 4];
+        let valid_magic = std::fs::File::open(&tmp_path)
+            .and_then(|mut f| f.read_exact(&mut hdr))
+            .map(|()| has_valid_native_magic(&hdr))
+            .unwrap_or(false);
+        if !valid_magic {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(AppError::Http(format!(
+                "Downloaded asset `{}` is not a valid native executable; aborting update",
+                info.asset_name
+            )));
+        }
+    }
 
     let _ = tx
         .send(AppMessage::UpdateProgress(
@@ -421,7 +472,7 @@ mod tests {
             assets: vec![ReleaseAsset {
                 name: target_asset_name().to_string(),
                 browser_download_url: "https://example.com/phaenna".to_string(),
-                size: 1024,
+                size: 16_000_000,
             }],
         };
 
@@ -458,5 +509,15 @@ mod tests {
             2500,
         )
         .is_none());
+
+        // 5. Never fall back to checksums or wrong-arch assets if native binary is missing/too small.
+        let mut only_checksums = mk("v1.0.1-rolling");
+        only_checksums.assets = vec![ReleaseAsset {
+            name: "SHA256SUMS.txt".to_string(),
+            browser_download_url: "https://example.com/SHA256SUMS.txt".to_string(),
+            size: 355,
+        }];
+        assert!(evaluate_release_update(only_checksums, "1.0.0", "unknown", 0).is_none());
+        assert!(!has_valid_native_magic(b"f659"));
     }
 }
