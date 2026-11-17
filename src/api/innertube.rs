@@ -296,16 +296,50 @@ fn collect_innertube_nodes(
     }
 }
 
+fn needs_join_space(prev: &str, next: &str) -> bool {
+    let Some(lc) = prev.chars().last() else {
+        return false;
+    };
+    let Some(fc) = next.chars().next() else {
+        return false;
+    };
+    if lc.is_whitespace() || fc.is_whitespace() {
+        return false;
+    }
+    if matches!(fc, ',' | '.' | '!' | '?' | ':' | ';' | ')' | ']' | '}')
+        || matches!(lc, '(' | '[' | '{' | '/' | '@')
+    {
+        return false;
+    }
+    (lc.is_alphanumeric() || matches!(lc, ')' | ']' | '%' | '"' | '\''))
+        && (fc.is_alphanumeric() || matches!(fc, '@' | '#' | '(' | '['))
+}
+
+fn strip_zero_width(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\u{200B}' | '\u{FEFF}' | '\u{200E}' | '\u{200F}'))
+        .collect()
+}
+
 fn extract_yt_text(val: Option<&serde_json::Value>) -> Option<String> {
     let obj = val?;
     if let Some(s) = obj.get("simpleText").and_then(|v| v.as_str()) {
-        return Some(s.to_string());
+        return Some(strip_zero_width(s));
     }
     if let Some(runs) = obj.get("runs").and_then(|v| v.as_array()) {
-        let joined: String = runs
-            .iter()
-            .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
-            .collect();
+        let mut joined = String::new();
+        for r in runs {
+            if let Some(seg_raw) = r.get("text").and_then(|t| t.as_str()) {
+                let seg = strip_zero_width(seg_raw);
+                if seg.is_empty() {
+                    continue;
+                }
+                if needs_join_space(&joined, &seg) {
+                    joined.push(' ');
+                }
+                joined.push_str(&seg);
+            }
+        }
         if !joined.is_empty() {
             return Some(joined);
         }
@@ -974,6 +1008,32 @@ pub fn parse_youtube_rss_xml(xml: &str) -> Vec<VideoItem> {
     items
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum VideoVote {
+    #[default]
+    None,
+    Liked,
+    Disliked,
+}
+
+impl VideoVote {
+    pub const fn as_db_int(self) -> i64 {
+        match self {
+            Self::None => 0,
+            Self::Liked => 1,
+            Self::Disliked => -1,
+        }
+    }
+
+    pub const fn from_db_int(v: i64) -> Self {
+        match v {
+            1 => Self::Liked,
+            -1 => Self::Disliked,
+            _ => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct VideoComment {
     pub id: String,
@@ -984,6 +1044,10 @@ pub struct VideoComment {
     pub reply_count: u32,
     pub is_pinned: bool,
     pub is_self: bool,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub create_reply_params: Option<String>,
     #[serde(default)]
     pub replies_continuation: Option<String>,
     #[serde(default)]
@@ -1149,6 +1213,21 @@ fn extract_reply_continuation_from_replies_node(replies_node: &serde_json::Value
     first_string_by_key(crr, "token").map(str::to_string)
 }
 
+fn normalize_like_count(raw: Option<&str>) -> String {
+    let trimmed = raw.unwrap_or("").trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extract_reply_params_from_node(node: &serde_json::Value) -> Option<String> {
+    first_string_by_key(node, "createReplyParams")
+        .or_else(|| first_string_by_key(node, "createCommentParams"))
+        .map(str::to_string)
+}
+
 fn parse_comment_renderer_node(cr: &serde_json::Value) -> Option<VideoComment> {
     let id = cr.get("commentId").and_then(|x| x.as_str())?;
     if id.is_empty() {
@@ -1162,9 +1241,11 @@ fn parse_comment_renderer_node(cr: &serde_json::Value) -> Option<VideoComment> {
     if text.is_empty() {
         return None;
     }
-    let like_count_text = extract_yt_text(cr.get("voteCount")).unwrap_or_else(|| "0".to_string());
+    let like_raw = extract_yt_text(cr.get("voteCount"));
+    let like_count_text = normalize_like_count(like_raw.as_deref());
     let reply_count = parse_reply_count_val(cr.get("replyCount"));
     let is_pinned = cr.get("pinnedCommentBadge").is_some();
+    let create_reply_params = extract_reply_params_from_node(cr);
     Some(VideoComment {
         id: id.to_string(),
         author,
@@ -1174,6 +1255,7 @@ fn parse_comment_renderer_node(cr: &serde_json::Value) -> Option<VideoComment> {
         reply_count,
         is_pinned,
         is_self: false,
+        create_reply_params,
         ..Default::default()
     })
 }
@@ -1185,6 +1267,7 @@ struct CommentParseCtx {
     continuation: Option<String>,
     create_params: Option<String>,
     reply_tokens: std::collections::HashMap<String, String>,
+    create_reply_params_by_id: std::collections::HashMap<String, String>,
     inline_replies: std::collections::HashMap<String, Vec<VideoComment>>,
     ordered_ids: Vec<String>,
     ordered_seen: HashSet<String>,
@@ -1282,6 +1365,10 @@ fn collect_comments_nodes(
                     {
                         ctx.pinned_ids.insert(cid.to_string());
                     }
+                    if let Some(rp) = extract_reply_params_from_node(cvm) {
+                        ctx.create_reply_params_by_id
+                            .insert(cid.to_string(), rp);
+                    }
                 }
             }
 
@@ -1326,16 +1413,16 @@ fn collect_comments_nodes(
                         .and_then(|x| x.as_str())
                         .map(clean_comment_body)
                         .unwrap_or_default();
-                    let like_count_text = cep
-                        .get("toolbar")
-                        .and_then(|t| t.get("likeCountNotliked"))
-                        .and_then(|x| x.as_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("0")
-                        .to_string();
+                    let like_count_text = normalize_like_count(
+                        cep.get("toolbar")
+                            .and_then(|t| t.get("likeCountNotliked"))
+                            .and_then(|x| x.as_str()),
+                    );
                     let reply_count = parse_reply_count_val(
                         cep.get("toolbar").and_then(|t| t.get("replyCount")),
                     );
+                    let create_reply_params = extract_reply_params_from_node(cep)
+                        .or_else(|| ctx.create_reply_params_by_id.remove(id));
                     if !text.is_empty() {
                         let replies_continuation = ctx.reply_tokens.remove(id);
                         let replies = ctx.inline_replies.remove(id).unwrap_or_default();
@@ -1348,6 +1435,7 @@ fn collect_comments_nodes(
                             reply_count,
                             is_pinned: ctx.pinned_ids.contains(id),
                             is_self: false,
+                            create_reply_params,
                             replies_continuation,
                             replies,
                             ..Default::default()
@@ -1404,6 +1492,9 @@ pub fn parse_innertube_comments_json(root: &serde_json::Value) -> CommentsPage {
             if c.replies_continuation.is_none() {
                 c.replies_continuation = Some(tok);
             }
+        }
+        if c.create_reply_params.is_none() {
+            c.create_reply_params = ctx.create_reply_params_by_id.remove(&c.id);
         }
         if ctx.pinned_ids.contains(&c.id) {
             c.is_pinned = true;
@@ -1889,6 +1980,93 @@ pub async fn post_video_comment(
     Ok(())
 }
 
+/// Reply to a comment or nested sub-comment via InnerTube `/comment/create_comment_reply`.
+pub async fn post_comment_reply(
+    client: &reqwest::Client,
+    session: &GoogleAccountSession,
+    video_id: &str,
+    reply_params: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    let params = match reply_params.filter(|s| !s.trim().is_empty()) {
+        Some(p) => p.to_string(),
+        None => {
+            let page = fetch_video_comments(client, Some(session), video_id).await?;
+            page.create_comment_params.ok_or_else(|| {
+                AppError::Http("YouTube createReplyParams unavailable for this thread".to_string())
+            })?
+        }
+    };
+
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "createReplyParams": params,
+        "commentText": text
+    });
+
+    let req = client
+        .post("https://www.youtube.com/youtubei/v1/comment/create_comment_reply?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload);
+    let resp = apply_innertube_auth_headers(req, session).send().await?;
+    if !resp.status().is_success() {
+        return Err(AppError::Http(format!(
+            "Create reply HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
+/// Submit Like, Dislike, or Remove Vote to YouTube InnerTube `/like/{like,dislike,removelike}`.
+pub async fn send_video_vote(
+    client: &reqwest::Client,
+    session: &GoogleAccountSession,
+    video_id: &str,
+    vote: VideoVote,
+) -> Result<()> {
+    let clean_id = video_id.trim_start_matches("RD");
+    let action = match vote {
+        VideoVote::Liked => "like",
+        VideoVote::Disliked => "dislike",
+        VideoVote::None => "removelike",
+    };
+    let endpoint = format!("https://www.youtube.com/youtubei/v1/like/{action}?prettyPrint=false");
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "target": {
+            "videoId": clean_id
+        }
+    });
+
+    let req = client
+        .post(&endpoint)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload);
+    let resp = apply_innertube_auth_headers(req, session).send().await?;
+    if !resp.status().is_success() {
+        return Err(AppError::Http(format!(
+            "InnerTube vote ({action}) HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
+}
+
 /// Generate a deterministic 16-character URL-safe YouTube client playback nonce (`cpn`).
 pub fn generate_cpn(video_id: &str, now_unix: u64) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -2352,6 +2530,21 @@ mod tests {
             parsed.comments[1].replies_continuation.as_deref(),
             Some("reply_tok_entity_2")
         );
+
+        let spaced_runs = serde_json::json!({
+            "runs": [
+                {"text": "Watch"},
+                {"text": "@rust_listener"},
+                {"text": "check"},
+                {"text": "https://example.com"}
+            ]
+        });
+        assert_eq!(
+            extract_yt_text(Some(&spaced_runs)).as_deref(),
+            Some("Watch @rust_listener check https://example.com")
+        );
+        assert_eq!(normalize_like_count(Some("   ")), "0");
+        assert_eq!(normalize_like_count(Some(" 42 ")), "42");
     }
 
     #[test]

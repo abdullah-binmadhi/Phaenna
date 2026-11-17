@@ -987,15 +987,17 @@ pub async fn save_user_video_comment(
     author: &str,
     content: &str,
     created_at: i64,
+    parent_comment_id: Option<&str>,
 ) -> Result<()> {
     let clean = video_id.trim_start_matches("RD");
     sqlx::query(
-        "INSERT INTO user_video_comments (video_id, author, content, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO user_video_comments (video_id, author, content, created_at, parent_comment_id) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(clean)
     .bind(author)
     .bind(content.trim())
     .bind(created_at)
+    .bind(parent_comment_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -1006,8 +1008,8 @@ pub async fn get_user_video_comments(
     video_id: &str,
 ) -> Result<Vec<crate::api::innertube::VideoComment>> {
     let clean = video_id.trim_start_matches("RD");
-    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
-        "SELECT id, author, content, created_at FROM user_video_comments WHERE video_id = ? ORDER BY created_at DESC, id DESC",
+    let rows: Vec<(i64, String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, author, content, created_at, parent_comment_id FROM user_video_comments WHERE video_id = ? ORDER BY created_at DESC, id DESC",
     )
     .bind(clean)
     .fetch_all(pool)
@@ -1015,18 +1017,59 @@ pub async fn get_user_video_comments(
 
     Ok(rows
         .into_iter()
-        .map(|(id, author, text, _ts)| crate::api::innertube::VideoComment {
+        .map(|(id, author, text, _ts, parent_id)| crate::api::innertube::VideoComment {
             id: format!("local_{}", id),
             author,
             published_text: "Just now (Saved)".to_string(),
             text,
-            like_count_text: "1".to_string(),
+            like_count_text: "0".to_string(),
             reply_count: 0,
             is_pinned: false,
             is_self: true,
+            parent_id,
             ..Default::default()
         })
         .collect())
+}
+
+pub async fn set_video_vote(
+    pool: &SqlitePool,
+    video_id: &str,
+    vote: crate::api::innertube::VideoVote,
+    updated_at: i64,
+) -> Result<()> {
+    let clean = video_id.trim_start_matches("RD");
+    if vote == crate::api::innertube::VideoVote::None {
+        sqlx::query("DELETE FROM user_video_votes WHERE video_id = ?")
+            .bind(clean)
+            .execute(pool)
+            .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO user_video_votes (video_id, vote, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(video_id) DO UPDATE SET vote = excluded.vote, updated_at = excluded.updated_at",
+        )
+        .bind(clean)
+        .bind(vote.as_db_int())
+        .bind(updated_at)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn get_video_vote(
+    pool: &SqlitePool,
+    video_id: &str,
+) -> Result<crate::api::innertube::VideoVote> {
+    let clean = video_id.trim_start_matches("RD");
+    let val: Option<i64> = sqlx::query_scalar("SELECT vote FROM user_video_votes WHERE video_id = ?")
+        .bind(clean)
+        .fetch_optional(pool)
+        .await?;
+    Ok(val
+        .map(crate::api::innertube::VideoVote::from_db_int)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]

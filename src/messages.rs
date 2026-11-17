@@ -1,7 +1,7 @@
 //! Central asynchronous message bus for background workers and TUI event loop.
 
 use crate::api::dislike::DislikeInfo;
-use crate::api::innertube::VideoComment;
+use crate::api::innertube::{VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::db::cache::{VideoItem, VideoStatsUpdate};
@@ -71,6 +71,10 @@ pub enum AppMessage {
         video_id: String,
         info: DislikeInfo,
     },
+    VideoVoteLoaded {
+        video_id: String,
+        vote: VideoVote,
+    },
     CommentsLoaded {
         video_id: String,
         comments: Vec<VideoComment>,
@@ -85,6 +89,7 @@ pub enum AppMessage {
     CommentPosted {
         video_id: String,
         comment: VideoComment,
+        parent_comment_id: Option<String>,
         synced_remote: bool,
     },
 

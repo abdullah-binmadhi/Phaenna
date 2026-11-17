@@ -14,7 +14,8 @@ use crate::api::innertube::{
     browse_id_for_feed_key, fetch_channel_rss, fetch_channel_shorts, fetch_comment_replies,
     fetch_innertube_shelf, fetch_search_suggestions, fetch_suggested_shorts,
     fetch_video_card_enrichment, fetch_video_comments, innertube_edit_watch_later,
-    post_video_comment, report_youtube_watch_progress, search_innertube, VideoComment,
+    post_comment_reply, post_video_comment, report_youtube_watch_progress, search_innertube,
+    send_video_vote, VideoComment, VideoVote,
 };
 use crate::api::player::{
     detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
@@ -42,9 +43,9 @@ use crate::db::user::{
     add_to_watch_later, clear_finished_continue_watching, compute_user_analytics,
     get_all_progress_map, get_continue_watching, get_continue_watching_meta_map,
     get_local_watch_history_videos, get_offline_videos, get_sponsorblock_segments,
-    get_user_video_comments, get_watch_later_sources, get_watched_ids,
+    get_user_video_comments, get_video_vote, get_watch_later_sources, get_watched_ids,
     move_continue_watching_item, pin_to_continue_watching, remove_continue_watching,
-    remove_from_watch_later, save_sponsorblock_segments, save_user_video_comment,
+    remove_from_watch_later, save_sponsorblock_segments, save_user_video_comment, set_video_vote,
     sync_youtube_watched_items, touch_watch_history, WatchLaterSource,
 };
 use crate::messages::AppMessage;
@@ -67,9 +68,9 @@ use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
 };
 use crate::state::{
-    ActiveOverlay, AppState, Category, ContentFilter, DetailViewMode, DownloadJobState,
-    NowPlayingHit, PlayOptionsHit, Screen, SearchHit, SearchScope, SearchSortOrder,
-    SearchTypeFilter, ShortsSource, SortOrder,
+    ActiveOverlay, AppState, Category, ContentFilter, DetailHit, DetailViewMode,
+    DownloadJobState, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen, SearchHit, SearchScope,
+    SearchSortOrder, SearchTypeFilter, ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::help::confirm_quit_button_rects;
@@ -1159,6 +1160,10 @@ fn open_channel_for_video(
     state.channel_videos.clear();
     state.channel_cursor = 0;
     state.is_loading_channel = true;
+    if state.screen != Screen::Channel {
+        state.channel_return_screen = state.screen;
+    }
+    state.overlay = ActiveOverlay::None;
     state.screen = Screen::Channel;
 
     let target = ch_id.unwrap_or_else(|| format!("@{}", ch_name.replace(' ', "")));
@@ -1527,6 +1532,16 @@ async fn handle_app_message(
                 state.detail_dislikes = Some(info);
             }
         }
+        AppMessage::VideoVoteLoaded { video_id, vote } => {
+            if state
+                .detail_video
+                .as_ref()
+                .map(|v| v.id == video_id)
+                .unwrap_or(false)
+            {
+                state.detail_video_vote = vote;
+            }
+        }
         AppMessage::CommentsLoaded {
             video_id,
             comments,
@@ -1545,15 +1560,30 @@ async fn handle_app_message(
                 let mut merged: Vec<VideoComment> = state
                     .detail_comments
                     .iter()
-                    .filter(|c| c.is_self)
+                    .filter(|c| c.is_self && c.parent_id.is_none())
                     .cloned()
                     .collect();
+                let mut orphan_replies: Vec<VideoComment> = Vec::new();
                 for c in comments {
-                    if !merged.iter().any(|m| m.id == c.id) {
+                    if c.parent_id.is_some() {
+                        orphan_replies.push(c);
+                    } else if !merged.iter().any(|m| m.id == c.id) {
                         merged.push(c);
                     }
                 }
                 state.detail_comments = merged;
+                for rep in orphan_replies {
+                    if let Some(pid) = rep.parent_id.clone() {
+                        if let Some(root_idx) = state.detail_comments.iter().position(|c| {
+                            c.id == pid || c.replies.iter().any(|r| r.id == pid)
+                        }) {
+                            let root_id = state.detail_comments[root_idx].id.clone();
+                            state.insert_comment_reply(&root_id, &pid, rep);
+                        } else {
+                            state.detail_comments.insert(0, rep);
+                        }
+                    }
+                }
             }
         }
         AppMessage::CommentRepliesLoaded {
@@ -1586,6 +1616,7 @@ async fn handle_app_message(
         AppMessage::CommentPosted {
             video_id,
             comment,
+            parent_comment_id,
             synced_remote,
         } => {
             if state
@@ -1593,10 +1624,18 @@ async fn handle_app_message(
                 .as_ref()
                 .map(|v| v.id == video_id)
                 .unwrap_or(false)
-                && !state.detail_comments.iter().any(|c| c.id == comment.id)
             {
-                state.detail_comments.insert(0, comment);
-                state.detail_comment_cursor = 0;
+                if let Some(pid) = parent_comment_id {
+                    if let Some(root_idx) = state.detail_comments.iter().position(|c| {
+                        c.id == pid || c.replies.iter().any(|r| r.id == pid)
+                    }) {
+                        let root_id = state.detail_comments[root_idx].id.clone();
+                        state.insert_comment_reply(&root_id, &pid, comment);
+                    }
+                } else if !state.detail_comments.iter().any(|c| c.id == comment.id) {
+                    state.detail_comments.insert(0, comment);
+                    state.detail_comment_cursor = 0;
+                }
             }
             if synced_remote {
                 state.show_toast("Comment posted to YouTube!");
@@ -1979,7 +2018,7 @@ fn spawn_fetch_comment_replies(
     });
 }
 
-fn toggle_selected_comment_replies(
+fn toggle_comment_tree_node(
     state: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
@@ -1987,23 +2026,82 @@ fn toggle_selected_comment_replies(
     let Some(video_id) = state.detail_video.as_ref().map(|v| v.id.clone()) else {
         return;
     };
-    let idx = state.detail_comment_cursor;
-    let sess = state.auth_vault.active_account().cloned();
-    let Some(c) = state.detail_comments.get_mut(idx) else {
+    let flat = state.build_comment_tree();
+    let Some(node) = flat.get(state.detail_comment_cursor) else {
         return;
     };
-    if c.replies_expanded {
-        c.replies_expanded = false;
+    let sess = state.auth_vault.active_account().cloned();
+
+    if node.depth == 0 {
+        let Some(c) = state.detail_comments.get_mut(node.root_idx) else {
+            return;
+        };
+        if c.replies_expanded {
+            c.replies_expanded = false;
+            return;
+        }
+        c.replies_expanded = true;
+        if c.replies.is_empty() && !c.replies_loading {
+            if let Some(tok) = c.replies_continuation.take() {
+                c.replies_loading = true;
+                let pid = c.id.clone();
+                spawn_fetch_comment_replies(video_id, pid, tok, sess, tx.clone(), client.clone());
+            }
+        }
+    } else if node.has_children && !state.detail_comment_collapsed.remove(&node.comment.id) {
+        state.detail_comment_collapsed.insert(node.comment.id.clone());
+    }
+}
+
+fn fold_or_jump_parent(state: &mut AppState) {
+    let flat = state.build_comment_tree();
+    let Some(node) = flat.get(state.detail_comment_cursor) else {
+        return;
+    };
+    if node.has_children && !node.collapsed {
+        if node.depth == 0 {
+            if let Some(c) = state.detail_comments.get_mut(node.root_idx) {
+                c.replies_expanded = false;
+            }
+        } else {
+            state.detail_comment_collapsed.insert(node.comment.id.clone());
+        }
         return;
     }
-    c.replies_expanded = true;
-    if c.replies.is_empty() && !c.replies_loading {
-        if let Some(tok) = c.replies_continuation.take() {
-            c.replies_loading = true;
-            let pid = c.id.clone();
-            spawn_fetch_comment_replies(video_id, pid, tok, sess, tx.clone(), client.clone());
+    if let Some(ref pid) = node.parent_id {
+        if let Some(p_idx) = flat.iter().position(|n| n.comment.id == *pid) {
+            state.detail_comment_cursor = p_idx;
         }
     }
+}
+
+fn begin_reply_to_selected_node(state: &mut AppState) {
+    let flat = state.build_comment_tree();
+    let Some(node) = flat.get(state.detail_comment_cursor) else {
+        state.detail_reply_target = None;
+        state.detail_comment_input.clear();
+        state.detail_focus_pane = 2;
+        state.detail_comment_composing = true;
+        return;
+    };
+    let root_params = state
+        .detail_comments
+        .get(node.root_idx)
+        .and_then(|c| c.create_reply_params.clone());
+    let params = node.comment.create_reply_params.clone().or(root_params);
+    state.detail_reply_target = Some(ReplyTarget {
+        root_id: node.root_id.clone(),
+        parent_id: node.comment.id.clone(),
+        author: node.comment.author.clone(),
+        reply_params: params,
+    });
+    state.detail_comment_input = if node.comment.author.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{} ", node.comment.author.trim())
+    };
+    state.detail_focus_pane = 2;
+    state.detail_comment_composing = true;
 }
 
 fn load_more_selected_comment_replies(
@@ -2014,9 +2112,13 @@ fn load_more_selected_comment_replies(
     let Some(video_id) = state.detail_video.as_ref().map(|v| v.id.clone()) else {
         return;
     };
-    let idx = state.detail_comment_cursor;
+    let flat = state.build_comment_tree();
+    let root_idx = flat
+        .get(state.detail_comment_cursor)
+        .map(|n| n.root_idx)
+        .unwrap_or(state.detail_comment_cursor);
     let sess = state.auth_vault.active_account().cloned();
-    let Some(c) = state.detail_comments.get_mut(idx) else {
+    let Some(c) = state.detail_comments.get_mut(root_idx) else {
         return;
     };
     if !c.replies_loading {
@@ -2026,6 +2128,46 @@ fn load_more_selected_comment_replies(
             let pid = c.id.clone();
             spawn_fetch_comment_replies(video_id, pid, tok, sess, tx.clone(), client.clone());
         }
+    }
+}
+
+async fn toggle_video_vote(
+    target_vote: VideoVote,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let Some(vid) = state.detail_video.as_ref().map(|v| v.id.clone()) else {
+        return;
+    };
+    let next = if state.detail_video_vote == target_vote {
+        VideoVote::None
+    } else {
+        target_vote
+    };
+    state.detail_video_vote = next;
+    let _ = set_video_vote(pool, &vid, next, now_unix()).await;
+
+    let label = match next {
+        VideoVote::Liked => "Liked video",
+        VideoVote::Disliked => "Disliked video",
+        VideoVote::None => "Removed vote",
+    };
+
+    if let Some(sess) = state.auth_vault.active_account().cloned() {
+        let c_v = client.clone();
+        let tx_v = tx.clone();
+        state.show_toast(format!("{label} (syncing to YouTube...)"));
+        tokio::spawn(async move {
+            let msg = match send_video_vote(&c_v, &sess, &vid, next).await {
+                Ok(()) => format!("{label} (synced to YouTube)"),
+                Err(e) => format!("{label} (saved locally: {e})"),
+            };
+            let _ = tx_v.send(AppMessage::ShowToast(msg)).await;
+        });
+    } else {
+        state.show_toast(format!("{label} (saved locally · sign in [L] to sync)"));
     }
 }
 
@@ -2096,14 +2238,20 @@ fn open_detail_for_video(
     state.detail_subtitles.clear();
     state.detail_sponsor_segments.clear();
     state.detail_dislikes = None;
+    state.detail_video_vote = VideoVote::None;
     state.detail_comments.clear();
     state.detail_comment_cursor = 0;
+    state.detail_comment_collapsed.clear();
+    state.detail_reply_target = None;
     state.detail_comments_loading = true;
     state.detail_create_comment_params = None;
     state.detail_comment_composing = false;
     state.detail_comment_input.clear();
     state.detail_comment_hitboxes.clear();
+    state.detail_comment_node_hitboxes.clear();
     state.detail_comment_last_click = None;
+    state.detail_last_node_click = None;
+    state.detail_hitboxes.clear();
     state.overlay = ActiveOverlay::None;
     state.screen = Screen::Detail;
 
@@ -2143,6 +2291,20 @@ fn open_detail_for_video(
                 .send(AppMessage::SponsorSegmentsLoaded {
                     video_id: id_sb,
                     segments: segs,
+                })
+                .await;
+        }
+    });
+
+    let p_vote = pool.clone();
+    let tx_vote = tx.clone();
+    let id_vote = vid_id.clone();
+    tokio::spawn(async move {
+        if let Ok(vote) = get_video_vote(&p_vote, &id_vote).await {
+            let _ = tx_vote
+                .send(AppMessage::VideoVoteLoaded {
+                    video_id: id_vote,
+                    vote,
                 })
                 .await;
         }
@@ -3603,38 +3765,126 @@ async fn handle_mouse_event(
 
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some((_, hit)) = state
+                        .detail_hitboxes
+                        .iter()
+                        .rev()
+                        .find(|(r, h)| in_rect(*r) && !matches!(h, DetailHit::FocusPane(_)))
+                        .cloned()
+                    {
+                        match hit {
+                            DetailHit::Play => {
+                                if let Some(v) = state.detail_video.clone() {
+                                    start_nonblocking_playback(&v, None, state, pool, tx, client).await;
+                                }
+                            }
+                            DetailHit::VoteLike => {
+                                toggle_video_vote(VideoVote::Liked, state, pool, tx, client).await;
+                            }
+                            DetailHit::VoteDislike => {
+                                toggle_video_vote(VideoVote::Disliked, state, pool, tx, client).await;
+                            }
+                            DetailHit::PinQueue => {
+                                if let Some(v) = state.detail_video.clone() {
+                                    pin_video_to_continue_watching(&v, state, pool).await;
+                                }
+                            }
+                            DetailHit::WatchLater => {
+                                if let Some(v) = state.detail_video.clone() {
+                                    toggle_watch_later(&v, state, pool, client).await;
+                                }
+                            }
+                            DetailHit::Download => {
+                                if let Some(v) = state.detail_video.clone() {
+                                    spawn_offline_download(&v, state, pool, tx);
+                                }
+                            }
+                            DetailHit::OpenChannel(v) => {
+                                open_channel_for_video(&v, state, tx, client);
+                            }
+                            DetailHit::SelectUpNext(v) => {
+                                open_detail_for_video(v, state, pool, tx, client);
+                            }
+                            DetailHit::SelectChapter(ci) => {
+                                state.detail_focus_pane = 1;
+                                state.detail_chapter_cursor = ci;
+                                if let Some(v) = state.detail_video.clone() {
+                                    if let Some(ch) = v.effective_chapters().get(ci) {
+                                        start_nonblocking_playback(
+                                            &v,
+                                            Some(ch.start_time),
+                                            state,
+                                            pool,
+                                            tx,
+                                            client,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            DetailHit::SortComments(sort) => {
+                                state.detail_focus_pane = 2;
+                                state.detail_comment_sort = sort;
+                                state.detail_comment_cursor = 0;
+                            }
+                            DetailHit::FocusPane(_) => {}
+                        }
+                        return true;
+                    }
                     if in_rect(state.detail_comment_composer_rect) {
                         state.detail_focus_pane = 2;
+                        state.detail_reply_target = None;
+                        state.detail_comment_input.clear();
                         state.detail_comment_composing = true;
-                        state.detail_comment_last_click = None;
+                        state.detail_last_node_click = None;
                         return true;
                     }
                     if in_rect(state.detail_comments_panel_rect) {
                         state.detail_focus_pane = 2;
                         state.detail_comment_composing = false;
-                        if let Some(&(_, _, idx)) = state
-                            .detail_comment_hitboxes
+                        if let Some(nh) = state
+                            .detail_comment_node_hitboxes
                             .iter()
-                            .find(|&&(y0, y1, _)| mouse.row >= y0 && mouse.row <= y1)
+                            .find(|h| mouse.row >= h.y0 && mouse.row <= h.y1)
+                            .cloned()
                         {
+                            state.detail_comment_cursor = nh.flat_idx;
+                            if nh.reply_rect.map(&in_rect).unwrap_or(false) {
+                                state.detail_last_node_click = None;
+                                begin_reply_to_selected_node(state);
+                                return true;
+                            }
+                            if nh.fold_rect.map(&in_rect).unwrap_or(false) {
+                                state.detail_last_node_click = None;
+                                toggle_comment_tree_node(state, tx, client);
+                                return true;
+                            }
                             let is_dbl = matches!(
-                                state.detail_comment_last_click,
-                                Some((prev, ts))
-                                    if prev == idx && ts.elapsed() <= Duration::from_millis(450)
+                                state.detail_last_node_click,
+                                Some((ref prev_id, ts))
+                                    if prev_id == &nh.node_id && ts.elapsed() <= Duration::from_millis(450)
                             );
-                            state.detail_comment_cursor = idx;
                             if is_dbl {
-                                state.detail_comment_last_click = None;
-                                toggle_selected_comment_replies(state, tx, client);
+                                state.detail_last_node_click = None;
+                                toggle_comment_tree_node(state, tx, client);
                             } else {
-                                state.detail_comment_last_click = Some((idx, Instant::now()));
+                                state.detail_last_node_click = Some((nh.node_id, Instant::now()));
                             }
                         }
                         return true;
                     }
+                    if let Some((_, DetailHit::FocusPane(pane))) = state
+                        .detail_hitboxes
+                        .iter()
+                        .find(|(r, h)| in_rect(*r) && matches!(h, DetailHit::FocusPane(_)))
+                        .cloned()
+                    {
+                        state.detail_focus_pane = pane;
+                        return true;
+                    }
                 }
                 MouseEventKind::ScrollDown if in_rect(state.detail_comments_panel_rect) => {
-                    let n = state.detail_comments.len();
+                    let n = state.build_comment_tree().len();
                     if n > 0 {
                         state.detail_comment_cursor = (state.detail_comment_cursor + 1).min(n - 1);
                     }
@@ -3651,6 +3901,10 @@ async fn handle_mouse_event(
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
             if state.overlay != ActiveOverlay::None {
                 state.overlay = ActiveOverlay::None;
+                return true;
+            }
+            if state.screen == Screen::Channel {
+                state.screen = state.channel_return_screen;
                 return true;
             }
             if state.screen != Screen::Home {
@@ -3682,6 +3936,23 @@ async fn handle_mouse_event(
                 .copied()
             {
                 apply_now_playing_hit(hit, state, pool, tx, client).await;
+                return true;
+            }
+            if let Some(ch_video) = state
+                .home_channel_hitboxes
+                .iter()
+                .rev()
+                .find(|(r, _)| {
+                    r.width > 0
+                        && r.height > 0
+                        && mouse.column >= r.x
+                        && mouse.column < r.x + r.width
+                        && mouse.row >= r.y
+                        && mouse.row < r.y + r.height
+                })
+                .map(|(_, v)| v.clone())
+            {
+                open_channel_for_video(&ch_video, state, tx, client);
                 return true;
             }
             if mouse.row == top_area.y {
@@ -3803,6 +4074,8 @@ async fn handle_key_event(
                 match code {
                     KeyCode::Esc => {
                         state.detail_comment_composing = false;
+                        state.detail_reply_target = None;
+                        state.detail_comment_input.clear();
                     }
                     KeyCode::Backspace => {
                         state.detail_comment_input.pop();
@@ -3817,53 +4090,117 @@ async fn handle_key_event(
                                     .map(|a| a.display_name.clone())
                                     .unwrap_or_else(|| "You (Local)".to_string());
                                 let now = now_unix();
-                                let _ = save_user_video_comment(pool, &vid_id, &author, &body, now).await;
-                                let local_cmt = VideoComment {
-                                    id: format!("local_{now}"),
-                                    author,
-                                    published_text: "Just now".to_string(),
-                                    text: body.clone(),
-                                    like_count_text: "1".to_string(),
-                                    reply_count: 0,
-                                    is_pinned: false,
-                                    is_self: true,
-                                    ..Default::default()
-                                };
-                                state.detail_comments.insert(0, local_cmt);
-                                state.detail_comment_cursor = 0;
+                                if let Some(rt) = state.detail_reply_target.take() {
+                                    let _ = save_user_video_comment(
+                                        pool,
+                                        &vid_id,
+                                        &author,
+                                        &body,
+                                        now,
+                                        Some(&rt.parent_id),
+                                    )
+                                    .await;
+                                    let reply_id = format!("local_rep_{now}");
+                                    let local_reply = VideoComment {
+                                        id: reply_id.clone(),
+                                        author,
+                                        published_text: "Just now".to_string(),
+                                        text: body.clone(),
+                                        like_count_text: "0".to_string(),
+                                        reply_count: 0,
+                                        is_pinned: false,
+                                        is_self: true,
+                                        parent_id: Some(rt.parent_id.clone()),
+                                        ..Default::default()
+                                    };
+                                    state.insert_comment_reply(&rt.root_id, &rt.parent_id, local_reply);
+                                    let flat = state.build_comment_tree();
+                                    if let Some(pos) = flat.iter().position(|n| n.comment.id == reply_id) {
+                                        state.detail_comment_cursor = pos;
+                                    }
 
-                                if let Some(sess) = state.auth_vault.active_account().cloned() {
-                                    let c_post = client.clone();
-                                    let tx_post = tx.clone();
-                                    let params = state.detail_create_comment_params.clone();
-                                    let v_id_p = vid_id.clone();
-                                    state.show_toast("Posting comment to YouTube...");
-                                    tokio::spawn(async move {
-                                        let msg = match post_video_comment(
-                                            &c_post,
-                                            &sess,
-                                            &v_id_p,
-                                            params.as_deref(),
-                                            &body,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => "Comment posted to YouTube!".to_string(),
-                                            Err(e) => {
-                                                format!("Saved locally (YouTube sync failed: {e})")
-                                            }
-                                        };
-                                        let _ = tx_post.send(AppMessage::ShowToast(msg)).await;
-                                    });
+                                    if let Some(sess) = state.auth_vault.active_account().cloned() {
+                                        let c_post = client.clone();
+                                        let tx_post = tx.clone();
+                                        let rparams = rt.reply_params.clone();
+                                        let v_id_p = vid_id.clone();
+                                        state.show_toast(format!("Posting reply to {}...", rt.author));
+                                        tokio::spawn(async move {
+                                            let msg = match post_comment_reply(
+                                                &c_post,
+                                                &sess,
+                                                &v_id_p,
+                                                rparams.as_deref(),
+                                                &body,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => "Reply posted to YouTube!".to_string(),
+                                                Err(e) => format!("Reply saved locally (YouTube sync failed: {e})"),
+                                            };
+                                            let _ = tx_post.send(AppMessage::ShowToast(msg)).await;
+                                        });
+                                    } else {
+                                        state.show_toast("Reply saved locally (Sign in [L] to sync to YouTube)");
+                                    }
                                 } else {
-                                    state.show_toast(
-                                        "Comment saved locally (Sign in [L] to post to YouTube)",
-                                    );
+                                    let _ = save_user_video_comment(
+                                        pool,
+                                        &vid_id,
+                                        &author,
+                                        &body,
+                                        now,
+                                        None,
+                                    )
+                                    .await;
+                                    let local_cmt = VideoComment {
+                                        id: format!("local_{now}"),
+                                        author,
+                                        published_text: "Just now".to_string(),
+                                        text: body.clone(),
+                                        like_count_text: "0".to_string(),
+                                        reply_count: 0,
+                                        is_pinned: false,
+                                        is_self: true,
+                                        ..Default::default()
+                                    };
+                                    state.detail_comments.insert(0, local_cmt);
+                                    state.detail_comment_cursor = 0;
+
+                                    if let Some(sess) = state.auth_vault.active_account().cloned() {
+                                        let c_post = client.clone();
+                                        let tx_post = tx.clone();
+                                        let params = state.detail_create_comment_params.clone();
+                                        let v_id_p = vid_id.clone();
+                                        state.show_toast("Posting comment to YouTube...");
+                                        tokio::spawn(async move {
+                                            let msg = match post_video_comment(
+                                                &c_post,
+                                                &sess,
+                                                &v_id_p,
+                                                params.as_deref(),
+                                                &body,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => "Comment posted to YouTube!".to_string(),
+                                                Err(e) => {
+                                                    format!("Saved locally (YouTube sync failed: {e})")
+                                                }
+                                            };
+                                            let _ = tx_post.send(AppMessage::ShowToast(msg)).await;
+                                        });
+                                    } else {
+                                        state.show_toast(
+                                            "Comment saved locally (Sign in [L] to post to YouTube)",
+                                        );
+                                    }
                                 }
                             }
                         }
                         state.detail_comment_input.clear();
                         state.detail_comment_composing = false;
+                        state.detail_reply_target = None;
                     }
                     KeyCode::Char(c) => {
                         state.detail_comment_input.push(c);
@@ -3899,7 +4236,15 @@ async fn handle_key_event(
                 }
                 KeyCode::Char('m') => {
                     state.detail_focus_pane = 2;
+                    state.detail_reply_target = None;
+                    state.detail_comment_input.clear();
                     state.detail_comment_composing = true;
+                }
+                KeyCode::Char('u') => {
+                    toggle_video_vote(VideoVote::Liked, state, pool, tx, client).await;
+                }
+                KeyCode::Char('v') => {
+                    toggle_video_vote(VideoVote::Disliked, state, pool, tx, client).await;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     match state.detail_focus_pane {
@@ -3915,7 +4260,7 @@ async fn handle_key_event(
                             }
                         }
                         2 => {
-                            let n = state.detail_comments.len();
+                            let n = state.build_comment_tree().len();
                             if n > 0 {
                                 state.detail_comment_cursor =
                                     (state.detail_comment_cursor + 1).min(n - 1);
@@ -3941,34 +4286,27 @@ async fn handle_key_event(
                         }
                     }
                 }
-                KeyCode::Char('r') | KeyCode::Char('l') | KeyCode::Right
-                    if state.detail_focus_pane == 2 =>
-                {
-                    toggle_selected_comment_replies(state, tx, client);
+                KeyCode::Char('r') if state.detail_focus_pane == 2 => {
+                    begin_reply_to_selected_node(state);
+                }
+                KeyCode::Char('l') | KeyCode::Right if state.detail_focus_pane == 2 => {
+                    toggle_comment_tree_node(state, tx, client);
                 }
                 KeyCode::Char('h') | KeyCode::Left if state.detail_focus_pane == 2 => {
-                    if let Some(c) = state.detail_comments.get_mut(state.detail_comment_cursor) {
-                        c.replies_expanded = false;
-                    }
+                    fold_or_jump_parent(state);
                 }
                 KeyCode::Char('n') if state.detail_focus_pane == 2 => {
                     load_more_selected_comment_replies(state, tx, client);
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if state.detail_focus_pane == 2 && code == KeyCode::Enter {
-                        let has_replies = state
-                            .detail_comments
-                            .get(state.detail_comment_cursor)
-                            .map(|c| {
-                                c.reply_count > 0
-                                    || !c.replies.is_empty()
-                                    || c.replies_continuation.is_some()
-                            })
-                            .unwrap_or(false);
-                        if has_replies {
-                            toggle_selected_comment_replies(state, tx, client);
-                        } else {
-                            state.detail_comment_composing = true;
+                        let flat = state.build_comment_tree();
+                        if let Some(node) = flat.get(state.detail_comment_cursor) {
+                            if node.has_children {
+                                toggle_comment_tree_node(state, tx, client);
+                            } else {
+                                begin_reply_to_selected_node(state);
+                            }
                         }
                     } else if let Some(v) = state.detail_video.clone() {
                         let start_ch = if state.detail_focus_pane == 1 {
@@ -4013,7 +4351,7 @@ async fn handle_key_event(
         }
         Screen::Channel => {
             match code {
-                KeyCode::Esc | KeyCode::Backspace => state.screen = Screen::Detail,
+                KeyCode::Esc | KeyCode::Backspace => state.screen = state.channel_return_screen,
                 KeyCode::Char('j') | KeyCode::Down => {
                     if !state.channel_videos.is_empty() {
                         state.channel_cursor =

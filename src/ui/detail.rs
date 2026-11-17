@@ -5,8 +5,12 @@
 //! - Right Column : Expanded Full-Height YouTube Comments Section with Word-Safe Wrapping & Live Composer
 
 use crate::api::dislike::format_compact_count;
+use crate::api::innertube::VideoVote;
 use crate::db::cache::{format_duration_secs, VideoChapter, VideoItem};
-use crate::state::{occluded_by_modal, ActiveOverlay, AppState};
+use crate::state::{
+    occluded_by_modal, ActiveOverlay, AppState, CommentNodeHitbox, CommentSort, CommentTreeRow,
+    DetailHit,
+};
 use crate::ui::components::cover::{render_thumbnail_cover, unix_now_secs};
 use crate::ui::home::marquee_window;
 use crate::ui::theme::ThemePalette;
@@ -22,7 +26,11 @@ use ratatui::{
 pub fn wrap_words(text: &str, max_width: usize) -> Vec<String> {
     let limit = max_width.max(8);
     let mut out = Vec::new();
-    let normalized = text.replace("\r\n", "\n").replace(['\t', '\u{00a0}'], " ");
+    let cleaned: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\u{200B}' | '\u{FEFF}' | '\u{200E}' | '\u{200F}'))
+        .collect();
+    let normalized = cleaned.replace("\r\n", "\n").replace(['\t', '\u{00a0}'], " ");
 
     for raw_line in normalized.split('\n') {
         let words: Vec<&str> = raw_line.split_whitespace().collect();
@@ -95,7 +103,7 @@ pub fn wrap_words(text: &str, max_width: usize) -> Vec<String> {
 }
 
 /// Truncate cleanly at a word boundary when text exceeds `max_width`.
-fn truncate_word_boundary(text: &str, max_width: usize) -> String {
+pub fn truncate_word_boundary(text: &str, max_width: usize) -> String {
     let limit = max_width.max(4);
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= limit {
@@ -279,6 +287,10 @@ fn style_description_lines(
 }
 
 pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect: Option<Rect>) {
+    state.detail_hitboxes.clear();
+    state.detail_comment_hitboxes.clear();
+    state.detail_comment_node_hitboxes.clear();
+
     let Some(video) = state.detail_video.clone() else {
         return;
     };
@@ -287,19 +299,20 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
     let now_unix = unix_now_secs();
 
     let show_np = state.has_live_ipc() && area.height >= 24;
+    let hdr_h: u16 = if area.height >= 22 { 4 } else { 3 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints(if show_np {
             vec![
-                Constraint::Length(3),
+                Constraint::Length(hdr_h),
                 Constraint::Min(14),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ]
         } else {
             vec![
-                Constraint::Length(3),
+                Constraint::Length(hdr_h),
                 Constraint::Min(14),
                 Constraint::Length(1),
             ]
@@ -308,17 +321,16 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
 
     render_header_bar(frame, rows[0], state, &video, &pal, now_unix);
 
-    // Aspect-locked left column width matching a 16:9 thumbnail (`~3.55 * inner_rows + 2`)
-    let art_inner_h = ((rows[1].height as f32 * 0.30).round() as u16).clamp(7, 10);
-    let art_outer_h = (art_inner_h + 2).min(rows[1].height.saturating_sub(14).max(7));
+    // Aspect-locked left column matching a 16:9 thumbnail (`~3.55 * inner_rows + 2`)
+    let art_inner_h = ((rows[1].height as f32 * 0.25).round() as u16).clamp(5, 8);
+    let art_outer_h = (art_inner_h + 2).min(rows[1].height.saturating_sub(14).max(6));
     let left_w = ((art_inner_h as f32 * 3.55).round() as u16 + 2)
         .clamp(30, 38)
-        .min((rows[1].width * 27 / 100).max(28));
+        .min((rows[1].width * 29 / 100).max(28));
 
     if rows[1].width >= 104 {
         let remaining_w = rows[1].width.saturating_sub(left_w);
-        // Narrow synopsis panel (~36% of remaining) so the Comments section gets ~64% priority width
-        let synopsis_w = ((remaining_w as u32 * 36 / 100) as u16).clamp(28, 44);
+        let synopsis_w = ((remaining_w as u32 * 35 / 100) as u16).clamp(28, 42);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -330,7 +342,7 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
 
         render_left_column(frame, cols[0], state, &video, &pal, art_outer_h, now_unix, modal_rect);
         render_center_column(frame, cols[1], state, &video, &pal);
-        render_comments_panel(frame, cols[2], state, &pal);
+        render_comments_panel(frame, cols[2], state, &video, &pal);
     } else {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -341,11 +353,11 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
 
         let right_stack = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+            .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
             .split(cols[1]);
 
         render_synopsis_panel(frame, right_stack[0], state, &video, &pal);
-        render_comments_panel(frame, right_stack[1], state, &pal);
+        render_comments_panel(frame, right_stack[1], state, &video, &pal);
     }
 
     if show_np {
@@ -357,10 +369,41 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
     }
 }
 
+fn effective_vote_counts(state: &AppState, video: &VideoItem) -> (Option<i64>, Option<i64>, Option<f64>) {
+    let base_likes = state
+        .detail_dislikes
+        .as_ref()
+        .map(|d| d.likes)
+        .or_else(|| video.like_count.map(|c| c as i64));
+    let base_dislikes = state
+        .detail_dislikes
+        .as_ref()
+        .map(|d| d.dislikes)
+        .or_else(|| video.dislike_count.map(|c| c as i64));
+
+    let likes = base_likes.map(|l| match state.detail_video_vote {
+        VideoVote::Liked => l.saturating_add(1),
+        _ => l,
+    });
+    let dislikes = base_dislikes.map(|d| match state.detail_video_vote {
+        VideoVote::Disliked => d.saturating_add(1),
+        _ => d,
+    });
+    let pct = match (likes, dislikes) {
+        (Some(l), Some(d)) if (l + d) > 0 => Some((l as f64 / (l + d) as f64) * 100.0),
+        _ => state
+            .detail_dislikes
+            .as_ref()
+            .map(|d| d.like_ratio_pct())
+            .or_else(|| video.like_ratio_pct()),
+    };
+    (likes, dislikes, pct)
+}
+
 fn render_header_bar(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     video: &VideoItem,
     pal: &ThemePalette,
     now_unix: i64,
@@ -372,73 +415,209 @@ fn render_header_bar(
     };
 
     let hdr_blk = Block::default()
+        .title(Span::styled(
+            format!(" Detail Deck · {pane_label} "),
+            Style::default()
+                .fg(pal.secondary)
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(pal.primary));
-    let inner_w = area.width.saturating_sub(2) as usize;
-
-    let mut suffix_len = video.display_uploader().chars().count() + 18 + pane_label.len();
-    if video.is_new_release(now_unix) {
-        suffix_len += 6;
+    let inner = hdr_blk.inner(area);
+    frame.render_widget(hdr_blk, area);
+    if inner.width < 16 || inner.height == 0 {
+        return;
     }
+
+    let inner_w = inner.width as usize;
+    let uploader_pill = format!("[ {} > ]", video.display_uploader());
+    let uploader_w = uploader_pill.chars().count();
+    let views_compact = video.compact_views(true).unwrap_or_default();
+    let age_compact = video.compact_age(now_unix, true).unwrap_or_default();
+    let meta_tail = [views_compact, age_compact, video.display_duration()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let mut right_badges_len = meta_tail.chars().count();
     if state.is_in_continue_watching(&video.id) {
-        suffix_len += 11;
+        right_badges_len += 11;
     }
     if state.offline_paths.contains_key(&video.id) {
-        suffix_len += 10;
+        right_badges_len += 10;
     }
-    let title_budget = inner_w.saturating_sub(suffix_len + 6).max(16);
+    let prefix_w = if video.is_new_release(now_unix) { 6 } else { 0 };
+    let title_budget = inner_w
+        .saturating_sub(prefix_w + uploader_w + right_badges_len + 8)
+        .max(12);
     let shown_title = marquee_window(&video.title, title_budget, state.ticker_step);
 
-    let mut spans = Vec::new();
+    let mut row1_spans = Vec::new();
+    let mut cur_x = inner.x;
     if video.is_new_release(now_unix) {
-        spans.push(Span::styled(
+        row1_spans.push(Span::styled(
             " NEW ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Rgb(52, 211, 153))
                 .add_modifier(Modifier::BOLD),
         ));
+        row1_spans.push(Span::raw(" "));
+        cur_x += 6;
     }
-    spans.push(Span::styled(
-        format!(" > {shown_title} "),
+    let title_seg = format!("{shown_title}  ");
+    cur_x += title_seg.chars().count() as u16;
+    row1_spans.push(Span::styled(
+        title_seg,
         Style::default()
             .fg(pal.primary)
             .add_modifier(Modifier::BOLD),
     ));
-    if let Some(age) = video.compact_age(now_unix, true) {
-        spans.push(Span::styled(
-            format!("· {} · {} ", video.display_uploader(), age),
-            Style::default().fg(pal.secondary),
+
+    let ch_x = cur_x;
+    row1_spans.push(Span::styled(
+        uploader_pill.clone(),
+        Style::default()
+            .fg(Color::Black)
+            .bg(pal.secondary)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if ch_x < inner.x + inner.width {
+        let max_ch_w = (inner.x + inner.width).saturating_sub(ch_x);
+        state.detail_hitboxes.push((
+            Rect::new(ch_x, inner.y, (uploader_w as u16).min(max_ch_w), 1),
+            DetailHit::OpenChannel(video.clone()),
         ));
-    } else {
-        spans.push(Span::styled(
-            format!("· {} ", video.display_uploader()),
-            Style::default().fg(pal.secondary),
+    }
+
+    if !meta_tail.is_empty() {
+        row1_spans.push(Span::styled(
+            format!("  {meta_tail}"),
+            Style::default().fg(pal.text_dim),
         ));
     }
     if state.is_in_continue_watching(&video.id) {
-        spans.push(Span::styled(
-            "[IN QUEUE] ",
+        row1_spans.push(Span::styled(
+            "  [IN QUEUE]",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     }
     if state.offline_paths.contains_key(&video.id) {
-        spans.push(Span::styled(
-            "[OFFLINE] ",
+        row1_spans.push(Span::styled(
+            "  [OFFLINE]",
             Style::default()
                 .fg(pal.accent)
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    spans.push(Span::styled(
-        format!("[Tab: {pane_label}]"),
-        Style::default().fg(pal.text_dim),
-    ));
 
-    frame.render_widget(Paragraph::new(Line::from(spans)).block(hdr_blk), area);
+    let mut hdr_lines = vec![Line::from(row1_spans)];
+
+    if inner.height >= 2 {
+        let (likes_opt, dislikes_opt, _) = effective_vote_counts(state, video);
+        let like_lbl = likes_opt
+            .map(|c| format!("[ + Like {} ]", format_compact_count(c)))
+            .unwrap_or_else(|| "[ + Like ]".to_string());
+        let dislike_lbl = dislikes_opt
+            .map(|c| format!("[ - Dislike {} ]", format_compact_count(c)))
+            .unwrap_or_else(|| "[ - Dislike ]".to_string());
+        let queue_lbl = if state.is_in_continue_watching(&video.id) {
+            "[ In Queue ]"
+        } else {
+            "[ + Queue ]"
+        };
+        let wl_lbl = if state.watch_later_sources.contains_key(&video.id) {
+            "[ Saved WL ]"
+        } else {
+            "[ Watch Later ]"
+        };
+
+        let like_st = if state.detail_video_vote == VideoVote::Liked {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(52, 211, 153))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal.text).add_modifier(Modifier::BOLD)
+        };
+        let dislike_st = if state.detail_video_vote == VideoVote::Disliked {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(248, 113, 113))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal.text_dim)
+        };
+
+        let buttons: Vec<(String, Style, DetailHit)> = vec![
+            (
+                "[ Play Space ]".to_string(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(pal.accent)
+                    .add_modifier(Modifier::BOLD),
+                DetailHit::Play,
+            ),
+            (like_lbl, like_st, DetailHit::VoteLike),
+            (dislike_lbl, dislike_st, DetailHit::VoteDislike),
+            (
+                queue_lbl.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                DetailHit::PinQueue,
+            ),
+            (
+                wl_lbl.to_string(),
+                Style::default().fg(Color::Rgb(251, 191, 36)),
+                DetailHit::WatchLater,
+            ),
+            (
+                "[ Download ]".to_string(),
+                Style::default().fg(pal.secondary),
+                DetailHit::Download,
+            ),
+        ];
+
+        let row2_y = inner.y + 1;
+        let mut bx = inner.x;
+        let mut r2_spans = Vec::new();
+        for (idx, (lbl, st, hit)) in buttons.into_iter().enumerate() {
+            if idx > 0 {
+                r2_spans.push(Span::raw("  "));
+                bx += 2;
+            }
+            let w = lbl.chars().count() as u16;
+            if bx + w <= inner.x + inner.width {
+                state
+                    .detail_hitboxes
+                    .push((Rect::new(bx, row2_y, w, 1), hit));
+                r2_spans.push(Span::styled(lbl, st));
+                bx += w;
+            } else {
+                break;
+            }
+        }
+        if let Some((pos, dur)) = state.progress_map.get(&video.id) {
+            if *dur > 0.0 {
+                let pct = ((*pos / *dur) * 100.0).round() as u32;
+                let res_txt = format!("Resume {} · {pct}%", format_duration_secs(*pos as u64));
+                let res_w = res_txt.chars().count() as u16;
+                if bx + res_w + 2 <= inner.x + inner.width {
+                    let gap = (inner.x + inner.width).saturating_sub(bx + res_w);
+                    r2_spans.push(Span::raw(" ".repeat(gap as usize)));
+                    r2_spans.push(Span::styled(
+                        res_txt,
+                        Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+        }
+        hdr_lines.push(Line::from(r2_spans));
+    }
+
+    frame.render_widget(Paragraph::new(hdr_lines), inner);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,13 +631,23 @@ fn render_left_column(
     now_unix: i64,
     modal_rect: Option<Rect>,
 ) {
+    let show_creator = area.height >= 30;
     let left_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(art_outer_h),
-            Constraint::Length(8),
-            Constraint::Min(8),
-        ])
+        .constraints(if show_creator {
+            vec![
+                Constraint::Length(art_outer_h),
+                Constraint::Length(4),
+                Constraint::Length(8),
+                Constraint::Min(7),
+            ]
+        } else {
+            vec![
+                Constraint::Length(art_outer_h),
+                Constraint::Length(7),
+                Constraint::Min(7),
+            ]
+        })
         .split(area);
 
     // 1. Aspect-locked 16:9 Artwork Stage
@@ -483,10 +672,104 @@ fn render_left_column(
         render_thumbnail_cover(frame, art_inner, &video.id, state, "Loading thumbnail...");
     }
 
-    // 2. Engagement, Sentiment & Compact SponsorBlock Telemetry Card
-    let stats_blk = Block::default()
+    // 2. Creator Card (explicit click-through to Channel catalog)
+    let (stats_area, ch_area) = if show_creator {
+        render_creator_card(frame, left_rows[1], state, video, pal);
+        (left_rows[2], left_rows[3])
+    } else {
+        (left_rows[1], left_rows[2])
+    };
+
+    // 3. Engagement, Sentiment, Like/Dislike Pills & SponsorBlock Telemetry
+    render_engagement_card(frame, stats_area, state, video, pal, now_unix);
+
+    // 4. Chapters + Dynamic "More from @Creator" auto-fill (zero empty vertical gap)
+    render_chapters_and_creator_fill(frame, ch_area, state, video, pal);
+}
+
+fn render_creator_card(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    video: &VideoItem,
+    pal: &ThemePalette,
+) {
+    let blk = Block::default()
         .title(Span::styled(
-            " Engagement & Sentiment ",
+            " Creator [c] ",
+            Style::default()
+                .fg(pal.secondary)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.border_idle));
+    let inner = blk.inner(area);
+    frame.render_widget(blk, area);
+    if inner.width < 10 || inner.height == 0 {
+        return;
+    }
+
+    let up_name = video.display_uploader();
+    let initial = up_name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('Y');
+    let known_cnt = state.same_creator_videos(video, 20).len();
+    let ch_btn = "[ Open Channel > ]";
+    let btn_w = ch_btn.chars().count() as u16;
+    let name_w = (inner.width as usize).saturating_sub(btn_w as usize + 8).max(6);
+    let shown_name = truncate_word_boundary(up_name, name_w);
+    let pad = (inner.width as usize).saturating_sub(6 + shown_name.chars().count() + btn_w as usize);
+
+    let line1 = Line::from(vec![
+        Span::styled(
+            format!("[{initial}] "),
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            shown_name,
+            Style::default().fg(pal.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(pad.max(1))),
+        Span::styled(
+            ch_btn,
+            Style::default()
+                .fg(Color::Black)
+                .bg(pal.secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let mut lines = vec![line1];
+    if inner.height >= 2 {
+        let info = if known_cnt > 0 {
+            format!("Click to browse {known_cnt} cached uploads + full catalog")
+        } else {
+            "Click or press [c] to open full channel catalog".to_string()
+        };
+        lines.push(Line::from(Span::styled(
+            truncate_word_boundary(&info, inner.width as usize),
+            Style::default().fg(pal.text_dim),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+    state
+        .detail_hitboxes
+        .push((area, DetailHit::OpenChannel(video.clone())));
+}
+
+fn render_engagement_card(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    video: &VideoItem,
+    pal: &ThemePalette,
+    now_unix: i64,
+) {
+    let blk = Block::default()
+        .title(Span::styled(
+            " Engagement & Votes ",
             Style::default()
                 .fg(pal.accent)
                 .add_modifier(Modifier::BOLD),
@@ -494,8 +777,67 @@ fn render_left_column(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(pal.border_idle));
-    let stats_inner = stats_blk.inner(left_rows[1]);
-    frame.render_widget(stats_blk, left_rows[1]);
+    let stats_inner = blk.inner(area);
+    frame.render_widget(blk, area);
+    if stats_inner.width < 12 || stats_inner.height == 0 {
+        return;
+    }
+
+    let (likes_opt, dislikes_opt, like_pct) = effective_vote_counts(state, video);
+    let like_pill = likes_opt
+        .map(|l| format!("[u] +{}", format_compact_count(l)))
+        .unwrap_or_else(|| "[u] +Like".to_string());
+    let dislike_pill = dislikes_opt
+        .map(|d| format!("[v] -{}", format_compact_count(d)))
+        .unwrap_or_else(|| "[v] -Dislike".to_string());
+
+    let like_st = if state.detail_video_vote == VideoVote::Liked {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(52, 211, 153))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Rgb(52, 211, 153))
+            .add_modifier(Modifier::BOLD)
+    };
+    let dislike_st = if state.detail_video_vote == VideoVote::Disliked {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(248, 113, 113))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(248, 113, 113))
+    };
+
+    let lw = like_pill.chars().count() as u16;
+    let dw = dislike_pill.chars().count() as u16;
+    state.detail_hitboxes.push((
+        Rect::new(stats_inner.x, stats_inner.y, lw.min(stats_inner.width), 1),
+        DetailHit::VoteLike,
+    ));
+    let dx = stats_inner.x + lw + 2;
+    if dx < stats_inner.x + stats_inner.width {
+        state.detail_hitboxes.push((
+            Rect::new(
+                dx,
+                stats_inner.y,
+                dw.min((stats_inner.x + stats_inner.width).saturating_sub(dx)),
+                1,
+            ),
+            DetailHit::VoteDislike,
+        ));
+    }
+
+    let pct_badge = like_pct
+        .map(|p| format!("  {:.1}%", p))
+        .unwrap_or_default();
+    let vote_row = Line::from(vec![
+        Span::styled(like_pill, like_st),
+        Span::raw("  "),
+        Span::styled(dislike_pill, dislike_st),
+        Span::styled(pct_badge, Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+    ]);
 
     let views_str = video.compact_views(true).unwrap_or_else(|| "Views loading".into());
     let age_str = video
@@ -514,25 +856,6 @@ fn render_left_column(
         })
         .unwrap_or_else(|| "Unwatched · 00:00".to_string());
 
-    let (like_pct, sentiment_txt) = if let Some(ref d) = state.detail_dislikes {
-        (
-            Some(d.like_ratio_pct()),
-            format!(
-                "Likes {} · Dislikes {} ({:.1}%)",
-                format_compact_count(d.likes),
-                format_compact_count(d.dislikes),
-                d.like_ratio_pct()
-            ),
-        )
-    } else if let Some(l) = video.like_count {
-        (
-            video.like_ratio_pct(),
-            format!("{} likes (syncing...)", format_compact_count(l as i64)),
-        )
-    } else {
-        (None, "Fetching ReturnYouTubeDislike...".to_string())
-    };
-
     let total_dur = video.duration.unwrap_or(600) as f64;
     let sb_bar = render_sponsor_timeline_line(state, total_dur, stats_inner.width as usize);
     let sb_label = if state.detail_sponsor_segments.is_empty() {
@@ -544,50 +867,130 @@ fn render_left_column(
             state.config.sponsorblock_mode.label()
         )
     };
+    let thread_total = state.detail_comments.len();
+    let total_replies: usize = state
+        .detail_comments
+        .iter()
+        .map(|c| (c.reply_count as usize).max(c.replies.len()))
+        .sum();
+    let talk_line = format!("Talk   : {thread_total} threads · {total_replies} replies");
 
     let stat_lines = vec![
+        vote_row,
+        build_sentiment_gauge(like_pct, stats_inner.width as usize, pal),
         Line::from(vec![
             Span::styled("Reach  : ", Style::default().fg(pal.text_dim)),
-            Span::styled(format!("{views_str} · {age_str}"), Style::default().fg(pal.text)),
+            Span::styled(
+                truncate_word_boundary(&format!("{views_str} · {age_str}"), (stats_inner.width as usize).saturating_sub(9)),
+                Style::default().fg(pal.text),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Runtime: ", Style::default().fg(pal.text_dim)),
             Span::styled(
-                format!("{} · {}", video.display_duration(), resume_str),
+                truncate_word_boundary(&format!("{} · {}", video.display_duration(), resume_str), (stats_inner.width as usize).saturating_sub(9)),
                 Style::default().fg(pal.primary),
             ),
         ]),
-        build_sentiment_gauge(like_pct, stats_inner.width as usize, pal),
-        Line::from(Span::styled(sentiment_txt, Style::default().fg(pal.accent))),
         sb_bar,
-        Line::from(Span::styled(sb_label, Style::default().fg(pal.text_dim))),
+        Line::from(Span::styled(
+            truncate_word_boundary(&sb_label, stats_inner.width as usize),
+            Style::default().fg(pal.text_dim),
+        )),
+        Line::from(Span::styled(
+            truncate_word_boundary(&talk_line, stats_inner.width as usize),
+            Style::default().fg(pal.secondary),
+        )),
     ];
-    frame.render_widget(Paragraph::new(stat_lines).wrap(Wrap { trim: true }), stats_inner);
-
-    // 3. Chapters Panel (relocated to bottom-left in place of SponsorBlock + Deck Controls)
-    render_chapters_panel(frame, left_rows[2], state, video, pal);
+    frame.render_widget(Paragraph::new(stat_lines), stats_inner);
 }
 
 fn render_center_column(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     video: &VideoItem,
     pal: &ThemePalette,
 ) {
-    let center_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(6)])
-        .split(area);
+    let up_next = state.detail_up_next_videos(6);
+    if area.height >= 26 && !up_next.is_empty() {
+        let up_h = (up_next.len() as u16 + 2).clamp(5, 9);
+        let center_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(9),
+                Constraint::Length(up_h),
+                Constraint::Length(5),
+            ])
+            .split(area);
+        render_synopsis_panel(frame, center_rows[0], state, video, pal);
+        render_up_next_panel(frame, center_rows[1], state, &up_next, pal);
+        render_mastering_panel(frame, center_rows[2], state, video, pal);
+    } else {
+        let center_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(6)])
+            .split(area);
+        render_synopsis_panel(frame, center_rows[0], state, video, pal);
+        render_mastering_panel(frame, center_rows[1], state, video, pal);
+    }
+}
 
-    render_synopsis_panel(frame, center_rows[0], state, video, pal);
-    render_mastering_panel(frame, center_rows[1], state, video, pal);
+fn render_up_next_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    items: &[VideoItem],
+    pal: &ThemePalette,
+) {
+    let blk = Block::default()
+        .title(Span::styled(
+            format!(" Up Next · {} Queued ", items.len()),
+            Style::default()
+                .fg(pal.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.border_idle));
+    let inner = blk.inner(area);
+    frame.render_widget(blk, area);
+    if inner.width < 12 || inner.height == 0 {
+        return;
+    }
+
+    let max_rows = inner.height as usize;
+    let mut lines = Vec::new();
+    for (i, item) in items.iter().take(max_rows).enumerate() {
+        let y = inner.y + i as u16;
+        let dur = item.display_duration();
+        let up = item.display_uploader();
+        let meta = format!(" {up} · {dur}");
+        let meta_w = meta.chars().count();
+        let title_w = (inner.width as usize).saturating_sub(meta_w + 3).max(8);
+        let t_str = truncate_word_boundary(&item.title, title_w);
+        let pad = (inner.width as usize).saturating_sub(2 + t_str.chars().count() + meta_w);
+        lines.push(Line::from(vec![
+            Span::styled(if i == 0 { "> " } else { "  " }, Style::default().fg(pal.accent)),
+            Span::styled(
+                t_str,
+                Style::default().fg(if i == 0 { pal.primary } else { pal.text }),
+            ),
+            Span::raw(" ".repeat(pad.max(1))),
+            Span::styled(meta.trim_start().to_string(), Style::default().fg(pal.text_dim)),
+        ]));
+        state.detail_hitboxes.push((
+            Rect::new(inner.x, y, inner.width, 1),
+            DetailHit::SelectUpNext(item.clone()),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_synopsis_panel(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     video: &VideoItem,
     pal: &ThemePalette,
 ) {
@@ -616,6 +1019,9 @@ fn render_synopsis_panel(
         }));
     let inner = desc_blk.inner(area);
     frame.render_widget(desc_blk, area);
+    state
+        .detail_hitboxes
+        .push((area, DetailHit::FocusPane(0)));
 
     let desc_raw = video
         .description
@@ -639,7 +1045,7 @@ fn render_mastering_panel(
 ) {
     let blk = Block::default()
         .title(Span::styled(
-            " Mastering ([p] Override) ",
+            " Playback & Mastering ([p] Studio) ",
             Style::default()
                 .fg(pal.secondary)
                 .add_modifier(Modifier::BOLD),
@@ -668,7 +1074,6 @@ fn render_mastering_panel(
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("Player: ", Style::default().fg(pal.text_dim)),
             Span::styled(
                 state.config.player.as_str().to_uppercase(),
                 Style::default()
@@ -680,21 +1085,30 @@ fn render_mastering_panel(
                 state.config.quality.short_badge(),
                 Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Shader: ", Style::default().fg(pal.text_dim)),
+            Span::styled(" · ", Style::default().fg(pal.divider)),
             Span::styled(
-                state.config.shader_mode.short_label(),
+                state.config.performance_mode.short_badge(),
+                Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(pal.divider)),
+            Span::styled(
+                state.config.motion_mode.short_badge(),
                 Style::default().fg(pal.secondary),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Subs  : ", Style::default().fg(pal.text_dim)),
-            Span::styled(sub_summary, Style::default().fg(pal.text)),
+            Span::styled("Audio : ", Style::default().fg(pal.text_dim)),
+            Span::styled(
+                format!("{} · Subs {sub_summary}", state.config.dub_preference.label()),
+                Style::default().fg(pal.text),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("Mode  : ", Style::default().fg(pal.text_dim)),
-            Span::styled(source_str, Style::default().fg(pal.accent)),
+            Span::styled("Shader: ", Style::default().fg(pal.text_dim)),
+            Span::styled(
+                format!("{} · {source_str}", state.config.shader_mode.short_label()),
+                Style::default().fg(pal.accent),
+            ),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
@@ -717,10 +1131,10 @@ fn chapter_duration_badge(ch: &VideoChapter) -> String {
     }
 }
 
-fn render_chapters_panel(
+fn render_chapters_and_creator_fill(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     video: &VideoItem,
     pal: &ThemePalette,
 ) {
@@ -750,29 +1164,47 @@ fn render_chapters_panel(
         }));
     let ch_inner = ch_blk.inner(area);
     frame.render_widget(ch_blk, area);
+    state
+        .detail_hitboxes
+        .push((area, DetailHit::FocusPane(1)));
 
-    if chapters.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No chapters found in video metadata or description.")
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: true })
-                .style(Style::default().fg(pal.text_dim)),
-            ch_inner,
-        );
+    if ch_inner.width < 12 || ch_inner.height == 0 {
         return;
     }
 
-    let cur = state.detail_chapter_cursor.min(chapters.len().saturating_sub(1));
-    let vis_h = ch_inner.height.max(1) as usize;
-    let scroll_off = if cur >= vis_h { cur + 1 - vis_h } else { 0 };
-    let title_budget = (ch_inner.width as usize).saturating_sub(17).max(8);
+    let vis_h = ch_inner.height as usize;
+    let creator_more = state.same_creator_videos(video, vis_h);
+    let reserve_more = if !creator_more.is_empty() && vis_h > chapters.len() + 2 {
+        (vis_h - chapters.len()).min(creator_more.len() + 2)
+    } else if chapters.is_empty() && !creator_more.is_empty() {
+        vis_h
+    } else {
+        0
+    };
+    let chap_rows = vis_h.saturating_sub(reserve_more);
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let lines: Vec<Line> = chapters
-        .iter()
-        .enumerate()
-        .skip(scroll_off)
-        .take(vis_h)
-        .map(|(i, c)| {
+    if chapters.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No chapters listed in metadata.",
+            Style::default().fg(pal.text_dim),
+        )));
+    } else {
+        let cur = state.detail_chapter_cursor.min(chapters.len().saturating_sub(1));
+        let scroll_off = if cur >= chap_rows.max(1) {
+            cur + 1 - chap_rows.max(1)
+        } else {
+            0
+        };
+        let title_budget = (ch_inner.width as usize).saturating_sub(17).max(8);
+
+        for (i, c) in chapters
+            .iter()
+            .enumerate()
+            .skip(scroll_off)
+            .take(chap_rows)
+        {
+            let row_y = ch_inner.y + lines.len() as u16;
             let sel = i == cur;
             let row_bg = if sel && focused {
                 pal.primary
@@ -795,7 +1227,7 @@ fn render_chapters_panel(
                 truncate_word_boundary(&c.title, title_budget)
             };
             let dur = chapter_duration_badge(c);
-            Line::from(vec![
+            lines.push(Line::from(vec![
                 Span::styled(
                     marker,
                     Style::default()
@@ -819,29 +1251,139 @@ fn render_chapters_panel(
                         .fg(if sel && focused { Color::Black } else { pal.text_dim })
                         .bg(row_bg),
                 ),
-            ])
-        })
-        .collect();
+            ]));
+            state.detail_hitboxes.push((
+                Rect::new(ch_inner.x, row_y, ch_inner.width, 1),
+                DetailHit::SelectChapter(i),
+            ));
+        }
+    }
+
+    let remaining = vis_h.saturating_sub(lines.len());
+    if remaining >= 2 && !creator_more.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate_word_boundary(
+                &format!("More from {} [c]", video.display_uploader()),
+                ch_inner.width as usize,
+            ),
+            Style::default()
+                .fg(pal.secondary)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let max_vids = remaining.saturating_sub(2);
+        for v in creator_more.into_iter().take(max_vids) {
+            let row_y = ch_inner.y + lines.len() as u16;
+            let dur = v.display_duration();
+            let tb = (ch_inner.width as usize)
+                .saturating_sub(dur.chars().count() + 4)
+                .max(6);
+            let t = truncate_word_boundary(&v.title, tb);
+            let pad = (ch_inner.width as usize)
+                .saturating_sub(2 + t.chars().count() + dur.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(pal.text_dim)),
+                Span::styled(t, Style::default().fg(pal.text)),
+                Span::raw(" ".repeat(pad.max(1))),
+                Span::styled(dur, Style::default().fg(pal.text_dim)),
+            ]));
+            state.detail_hitboxes.push((
+                Rect::new(ch_inner.x, row_y, ch_inner.width, 1),
+                DetailHit::SelectUpNext(v),
+            ));
+        }
+        if lines.len() < vis_h {
+            let row_y = ch_inner.y + lines.len() as u16;
+            lines.push(Line::from(Span::styled(
+                "  [ View full channel catalog  c ]",
+                Style::default()
+                    .fg(pal.secondary)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            state.detail_hitboxes.push((
+                Rect::new(ch_inner.x, row_y, ch_inner.width, 1),
+                DetailHit::OpenChannel(video.clone()),
+            ));
+        }
+    }
+
     frame.render_widget(Paragraph::new(lines), ch_inner);
+}
+
+fn depth_rail_color(depth: usize, pal: &ThemePalette) -> Color {
+    match depth % 5 {
+        0 => pal.accent,
+        1 => pal.secondary,
+        2 => Color::Cyan,
+        3 => Color::Rgb(168, 85, 247),
+        _ => Color::Rgb(52, 211, 153),
+    }
+}
+
+fn build_node_rail_spans(
+    row: &CommentTreeRow,
+    pal: &ThemePalette,
+    bg: Color,
+    is_header: bool,
+) -> (Vec<Span<'static>>, usize) {
+    if row.depth == 0 {
+        return if is_header {
+            (Vec::new(), 0)
+        } else {
+            (
+                vec![Span::styled("| ", Style::default().fg(pal.divider).bg(bg))],
+                2,
+            )
+        };
+    }
+
+    let mut spans = Vec::with_capacity(row.depth + 1);
+    let mut cols = 0usize;
+    for k in 0..(row.depth - 1) {
+        let active = row.rail_active.get(k).copied().unwrap_or(false);
+        let col = depth_rail_color(k, pal);
+        if active {
+            spans.push(Span::styled("|   ", Style::default().fg(col).bg(bg)));
+        } else {
+            spans.push(Span::styled("    ", Style::default().bg(bg)));
+        }
+        cols += 4;
+    }
+
+    let cur_col = depth_rail_color(row.depth - 1, pal);
+    if is_header {
+        let branch = if row.is_last_sibling { "+-- " } else { "|-- " };
+        spans.push(Span::styled(branch, Style::default().fg(cur_col).bg(bg)));
+        cols += 4;
+    } else {
+        let cont = if row.is_last_sibling { "    " } else { "|   " };
+        spans.push(Span::styled(cont, Style::default().fg(cur_col).bg(bg)));
+        spans.push(Span::styled("| ", Style::default().fg(pal.divider).bg(bg)));
+        cols += 6;
+    }
+    (spans, cols)
 }
 
 fn render_comments_panel(
     frame: &mut Frame,
     area: Rect,
     state: &mut AppState,
+    video: &VideoItem,
     pal: &ThemePalette,
 ) {
     state.detail_comments_panel_rect = area;
-    state.detail_comment_hitboxes.clear();
 
     let focused = state.detail_focus_pane == 2 || state.detail_comment_composing;
     let total = state.detail_comments.len();
     let title = if state.detail_comment_composing {
-        format!(" Comments ({total}) [WRITING · Enter Post · Esc Cancel] ")
+        if let Some(ref rt) = state.detail_reply_target {
+            format!(" Comments ({total}) [Replying to {}] ", rt.author)
+        } else {
+            format!(" Comments ({total}) [WRITING · Enter Post · Esc Cancel] ")
+        }
     } else if focused {
-        format!(" Comments ({total}) [Focused · j/k · Dbl-Click/Enter/r Replies · m Write] ")
+        format!(" Comments ({total}) · Reddit Tree [j/k · h/l Fold · r Reply] ")
     } else {
-        format!(" Comments ({total}) [Tab / Dbl-Click / m Write] ")
+        format!(" Comments ({total}) · Reddit Tree [Tab / r Reply / m New] ")
     };
 
     let blk = Block::default()
@@ -864,34 +1406,45 @@ fn render_comments_panel(
         }));
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
+    state
+        .detail_hitboxes
+        .push((area, DetailHit::FocusPane(2)));
 
-    if inner.width < 12 || inner.height < 6 {
+    if inner.width < 12 || inner.height < 7 {
         return;
     }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(3),
+        ])
         .split(inner);
 
     state.detail_comment_composer_rect = chunks[0];
 
-    // Top Interactive Comment Composer Box
+    // 1. Composer Box (Top-Level Comment OR Sub-Comment Reply)
     let comp_border = if state.detail_comment_composing {
         pal.accent
     } else {
         pal.border_idle
     };
     let comp_title = if state.detail_comment_composing {
-        " New Comment (Enter to post, Esc to cancel) "
+        if let Some(ref rt) = state.detail_reply_target {
+            format!(" Replying to {} (Enter Post · Esc Cancel) ", rt.author)
+        } else {
+            " New Comment (Enter Post · Esc Cancel) ".to_string()
+        }
     } else if state.auth_vault.active_account().is_some() {
-        " Add Comment [m] "
+        " [m] Comment · [r] Reply to Selected Node ".to_string()
     } else {
-        " Add Comment [m] (Saved locally · Sign in [L] for YouTube sync) "
+        " [m] Comment · [r] Reply (Saved locally · Sign in [L] to sync) ".to_string()
     };
     let comp_blk = Block::default()
         .title(Span::styled(
-            comp_title,
+            truncate_word_boundary(&comp_title, chunks[0].width.saturating_sub(2) as usize),
             Style::default()
                 .fg(if state.detail_comment_composing {
                     pal.accent
@@ -920,12 +1473,12 @@ fn render_comments_panel(
         };
         Line::from(vec![
             Span::styled(tail, Style::default().fg(pal.text)),
-            Span::styled("█", Style::default().fg(pal.accent)),
+            Span::styled("_", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
         ])
     } else {
         Line::from(Span::styled(
             truncate_word_boundary(
-                "Click or press [m] to comment · Double-click any comment to reveal replies...",
+                "Click or press [m] to comment · [r] replies to any thread or sub-comment",
                 comp_w,
             ),
             Style::default().fg(pal.text_dim),
@@ -933,8 +1486,57 @@ fn render_comments_panel(
     };
     frame.render_widget(Paragraph::new(comp_line), comp_inner);
 
-    // Body: Word-Safe Comment List
-    let list_area = chunks[1];
+    // 2. Sort & Telemetry Bar
+    let sort_area = chunks[1];
+    let top_active = state.detail_comment_sort == CommentSort::Top;
+    let top_lbl = "[ Top ]";
+    let new_lbl = "[ Newest ]";
+    let top_st = if top_active {
+        Style::default().fg(Color::Black).bg(pal.primary).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(pal.text_dim)
+    };
+    let new_st = if !top_active {
+        Style::default().fg(Color::Black).bg(pal.primary).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(pal.text_dim)
+    };
+    let top_w = top_lbl.chars().count() as u16;
+    let new_w = new_lbl.chars().count() as u16;
+    state.detail_hitboxes.push((
+        Rect::new(sort_area.x, sort_area.y, top_w.min(sort_area.width), 1),
+        DetailHit::SortComments(CommentSort::Top),
+    ));
+    let nx = sort_area.x + top_w + 1;
+    if nx < sort_area.x + sort_area.width {
+        state.detail_hitboxes.push((
+            Rect::new(
+                nx,
+                sort_area.y,
+                new_w.min((sort_area.x + sort_area.width).saturating_sub(nx)),
+                1,
+            ),
+            DetailHit::SortComments(CommentSort::Newest),
+        ));
+    }
+    let total_replies: usize = state
+        .detail_comments
+        .iter()
+        .map(|c| (c.reply_count as usize).max(c.replies.len()))
+        .sum();
+    let sort_line = Line::from(vec![
+        Span::styled(top_lbl, top_st),
+        Span::raw(" "),
+        Span::styled(new_lbl, new_st),
+        Span::styled(
+            format!("  ·  {total} threads · {total_replies} replies"),
+            Style::default().fg(pal.text_dim),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(sort_line), sort_area);
+
+    // 3. Flattened Multi-Depth Reddit Tree
+    let list_area = chunks[2];
     if state.detail_comments_loading && state.detail_comments.is_empty() {
         frame.render_widget(
             Paragraph::new("Fetching YouTube comments...")
@@ -947,7 +1549,7 @@ fn render_comments_panel(
 
     if state.detail_comments.is_empty() {
         frame.render_widget(
-            Paragraph::new("No comments returned for this video yet.\nPress [m] to post the first note/comment.")
+            Paragraph::new("No comments returned for this video yet.\nPress [m] to start the discussion.")
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: true })
                 .style(Style::default().fg(pal.text_dim)),
@@ -956,176 +1558,242 @@ fn render_comments_panel(
         return;
     }
 
-    let cur = state
-        .detail_comment_cursor
-        .min(state.detail_comments.len().saturating_sub(1));
-    let body_w = (list_area.width as usize).saturating_sub(5).max(14);
+    let flat_rows = state.build_comment_tree();
+    if flat_rows.is_empty() {
+        return;
+    }
+    let cur = state.detail_comment_cursor.min(flat_rows.len().saturating_sub(1));
+    let creator_low = video.display_uploader().trim().trim_start_matches('@').to_lowercase();
     let vis_h = list_area.height.max(1) as usize;
+
+    struct PendingNodeMeta {
+        s_line: usize,
+        e_line: usize,
+        flat_idx: usize,
+        node_id: String,
+        root_idx: usize,
+        fold_col_range: Option<(u16, u16)>,
+        reply_col_range: Option<(u16, u16)>,
+    }
 
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     let mut selected_start_line = 0usize;
     let mut selected_end_line = 0usize;
-    let mut per_comment_ranges: Vec<(usize, usize, usize)> =
-        Vec::with_capacity(state.detail_comments.len());
+    let mut node_metas: Vec<PendingNodeMeta> = Vec::with_capacity(flat_rows.len());
 
-    for (idx, c) in state.detail_comments.iter().enumerate() {
-        let c_start_line = all_lines.len();
-        let sel = idx == cur;
+    for (flat_idx, node) in flat_rows.iter().enumerate() {
+        let s_line = all_lines.len();
+        let sel = flat_idx == cur;
         if sel {
-            selected_start_line = c_start_line;
+            selected_start_line = s_line;
         }
-        let header_bg = if sel {
+        let row_bg = if sel {
             Color::Rgb(30, 36, 52)
         } else {
             Color::Reset
         };
-        let marker = if sel { "▸ " } else { "  " };
 
-        let mut hdr_spans = vec![
-            Span::styled(
+        let (mut hdr_spans, prefix_w) = build_node_rail_spans(node, pal, row_bg, true);
+        let mut cursor_x = prefix_w as u16;
+        let c = &node.comment;
+
+        if node.depth == 0 {
+            let marker = if sel && node.has_children && !node.collapsed {
+                "v "
+            } else if sel {
+                "> "
+            } else if node.has_children && !node.collapsed {
+                "v "
+            } else {
+                "  "
+            };
+            cursor_x += marker.chars().count() as u16;
+            hdr_spans.push(Span::styled(
                 marker,
                 Style::default()
                     .fg(if sel { pal.primary } else { pal.text_dim })
-                    .bg(header_bg)
+                    .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                c.author.clone(),
+            ));
+        }
+
+        let auth_norm = c.author.trim().trim_start_matches('@').to_lowercase();
+        let is_creator = !creator_low.is_empty() && auth_norm == creator_low;
+        let author_fg = if c.is_self {
+            Color::Cyan
+        } else if is_creator {
+            Color::Rgb(52, 211, 153)
+        } else {
+            pal.secondary
+        };
+        cursor_x += c.author.chars().count() as u16;
+        hdr_spans.push(Span::styled(
+            c.author.clone(),
+            Style::default()
+                .fg(author_fg)
+                .bg(row_bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+        if is_creator {
+            let tag = " [CREATOR]";
+            cursor_x += tag.chars().count() as u16;
+            hdr_spans.push(Span::styled(
+                tag,
                 Style::default()
-                    .fg(if c.is_self { Color::Cyan } else { pal.secondary })
-                    .bg(header_bg)
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(52, 211, 153))
                     .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if !c.published_text.is_empty() {
-            hdr_spans.push(Span::styled(
-                format!(" · {}", c.published_text),
-                Style::default().fg(pal.text_dim).bg(header_bg),
             ));
-        }
-        if !c.like_count_text.is_empty() && c.like_count_text != "0" {
+        } else if c.is_self {
+            let tag = " [YOU]";
+            cursor_x += tag.chars().count() as u16;
             hdr_spans.push(Span::styled(
-                format!(" · {} likes", c.like_count_text),
-                Style::default().fg(pal.accent).bg(header_bg),
-            ));
-        }
-        if c.reply_count > 0 || !c.replies.is_empty() || c.replies_continuation.is_some() {
-            let shown_cnt = c.reply_count.max(c.replies.len() as u32);
-            let toggle = if c.replies_expanded { "[-]" } else { "[+]" };
-            hdr_spans.push(Span::styled(
-                format!(" · {shown_cnt} replies {toggle}"),
-                Style::default().fg(pal.secondary).bg(header_bg),
-            ));
-        }
-        if c.is_self {
-            hdr_spans.push(Span::styled(
-                " [YOU]",
+                tag,
                 Style::default()
                     .fg(Color::Cyan)
-                    .bg(header_bg)
+                    .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
             ));
         } else if c.is_pinned {
+            let tag = " [PINNED]";
+            cursor_x += tag.chars().count() as u16;
             hdr_spans.push(Span::styled(
-                " [PINNED]",
+                tag,
                 Style::default()
                     .fg(Color::Rgb(52, 211, 153))
-                    .bg(header_bg)
+                    .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        all_lines.push(Line::from(hdr_spans));
 
-        for wrapped in wrap_words(&c.text, body_w) {
-            all_lines.push(Line::from(vec![
-                Span::styled("   ", Style::default().bg(header_bg)),
-                Span::styled(
-                    wrapped,
-                    Style::default()
-                        .fg(if sel { pal.text } else { Color::Rgb(205, 212, 224) })
-                        .bg(header_bg),
-                ),
-            ]));
+        if !c.published_text.is_empty() {
+            let pub_s = format!(" · {}", c.published_text);
+            cursor_x += pub_s.chars().count() as u16;
+            hdr_spans.push(Span::styled(
+                pub_s,
+                Style::default().fg(pal.text_dim).bg(row_bg),
+            ));
         }
 
-        if c.replies_expanded {
-            let reply_w = body_w.saturating_sub(4).max(12);
+        let clean_likes = c.like_count_text.trim();
+        if !clean_likes.is_empty() && clean_likes != "0" {
+            let lk = format!(" · {clean_likes} likes");
+            cursor_x += lk.chars().count() as u16;
+            hdr_spans.push(Span::styled(
+                lk,
+                Style::default().fg(pal.accent).bg(row_bg),
+            ));
+        }
+
+        let mut fold_col_range = None;
+        if node.has_children {
+            hdr_spans.push(Span::styled(" ", Style::default().bg(row_bg)));
+            cursor_x += 1;
+            let fold_lbl = if c.replies_loading {
+                "[Loading...]".to_string()
+            } else if node.collapsed {
+                format!("[+ {}]", node.child_count.max(1))
+            } else {
+                "[-]".to_string()
+            };
+            let fw = fold_lbl.chars().count() as u16;
+            fold_col_range = Some((cursor_x, fw));
+            cursor_x += fw;
+            hdr_spans.push(Span::styled(
+                fold_lbl,
+                Style::default()
+                    .fg(pal.secondary)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        let mut reply_col_range = None;
+        if sel {
+            hdr_spans.push(Span::styled(" ", Style::default().bg(row_bg)));
+            cursor_x += 1;
+            let rep_lbl = "[Reply r]";
+            let rw = rep_lbl.chars().count() as u16;
+            reply_col_range = Some((cursor_x, rw));
+            hdr_spans.push(Span::styled(
+                rep_lbl,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(pal.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        all_lines.push(Line::from(hdr_spans));
+
+        let (_, body_prefix_cols) = build_node_rail_spans(node, pal, row_bg, false);
+        let body_w = (list_area.width as usize)
+            .saturating_sub(body_prefix_cols + 1)
+            .max(12);
+        for wrapped in wrap_words(&c.text, body_w) {
+            let (mut body_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
+            body_spans.push(Span::styled(
+                wrapped,
+                Style::default()
+                    .fg(if sel {
+                        pal.text
+                    } else if node.depth == 0 {
+                        Color::Rgb(210, 216, 228)
+                    } else {
+                        Color::Rgb(192, 200, 214)
+                    })
+                    .bg(row_bg),
+            ));
+            all_lines.push(Line::from(body_spans));
+        }
+
+        if node.depth == 0 && !node.collapsed {
             if c.replies_loading && c.replies.is_empty() {
                 all_lines.push(Line::from(vec![
-                    Span::styled("   |- ", Style::default().fg(pal.accent)),
-                    Span::styled(
-                        "Loading reply thread...",
-                        Style::default().fg(pal.text_dim),
-                    ),
+                    Span::styled("+-- ", Style::default().fg(pal.accent)),
+                    Span::styled("Loading reply thread...", Style::default().fg(pal.text_dim)),
                 ]));
-            } else if c.replies.is_empty() {
+            } else if c.replies_loading {
                 all_lines.push(Line::from(vec![
-                    Span::styled("   |- ", Style::default().fg(pal.divider)),
+                    Span::styled("+-- ", Style::default().fg(pal.accent)),
+                    Span::styled("Loading more replies...", Style::default().fg(pal.text_dim)),
+                ]));
+            } else if c.replies_continuation.is_some() {
+                all_lines.push(Line::from(vec![
+                    Span::styled("+-- ", Style::default().fg(pal.accent)),
                     Span::styled(
-                        "No replies returned for this thread.",
+                        "Press [n] to load more replies",
                         Style::default().fg(pal.text_dim),
                     ),
                 ]));
-            } else {
-                for r in &c.replies {
-                    let mut r_hdr = vec![
-                        Span::styled("   |- ", Style::default().fg(pal.accent)),
-                        Span::styled(
-                            r.author.clone(),
-                            Style::default()
-                                .fg(if r.is_self { Color::Cyan } else { pal.secondary })
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    if !r.published_text.is_empty() {
-                        r_hdr.push(Span::styled(
-                            format!(" · {}", r.published_text),
-                            Style::default().fg(pal.text_dim),
-                        ));
-                    }
-                    if !r.like_count_text.is_empty() && r.like_count_text != "0" {
-                        r_hdr.push(Span::styled(
-                            format!(" · {} likes", r.like_count_text),
-                            Style::default().fg(pal.accent),
-                        ));
-                    }
-                    all_lines.push(Line::from(r_hdr));
-
-                    for rw in wrap_words(&r.text, reply_w) {
-                        all_lines.push(Line::from(vec![
-                            Span::styled("   |  ", Style::default().fg(pal.divider)),
-                            Span::styled(rw, Style::default().fg(Color::Rgb(195, 204, 218))),
-                        ]));
-                    }
-                }
-                if c.replies_loading {
-                    all_lines.push(Line::from(vec![
-                        Span::styled("   |- ", Style::default().fg(pal.accent)),
-                        Span::styled("Loading more replies...", Style::default().fg(pal.text_dim)),
-                    ]));
-                } else if c.replies_continuation.is_some() {
-                    all_lines.push(Line::from(vec![
-                        Span::styled("   |- ", Style::default().fg(pal.accent)),
-                        Span::styled(
-                            "Press [n] to load more replies",
-                            Style::default().fg(pal.text_dim),
-                        ),
-                    ]));
-                }
             }
         }
 
-        all_lines.push(Line::from(Span::styled(
-            "  ".to_string() + &"─".repeat(body_w.min(44)),
-            Style::default().fg(pal.divider),
-        )));
-
-        let c_end_line = all_lines.len().saturating_sub(1);
-        per_comment_ranges.push((c_start_line, c_end_line, idx));
-
-        if sel {
-            selected_end_line = c_end_line;
+        let next_is_new_root = flat_rows
+            .get(flat_idx + 1)
+            .map(|nr| nr.depth == 0)
+            .unwrap_or(true);
+        if next_is_new_root {
+            all_lines.push(Line::from(Span::styled(
+                "─".repeat((list_area.width as usize).saturating_sub(1).min(56)),
+                Style::default().fg(pal.divider),
+            )));
         }
+
+        let e_line = all_lines.len().saturating_sub(1);
+        if sel {
+            selected_end_line = e_line;
+        }
+        node_metas.push(PendingNodeMeta {
+            s_line,
+            e_line,
+            flat_idx,
+            node_id: c.id.clone(),
+            root_idx: node.root_idx,
+            fold_col_range,
+            reply_col_range,
+        });
     }
 
     let scroll_y = if selected_end_line >= vis_h {
@@ -1137,11 +1805,36 @@ fn render_comments_panel(
     } as u16;
 
     let sy = scroll_y as usize;
-    for (sl, el, idx) in per_comment_ranges {
-        if el >= sy && sl < sy + vis_h {
-            let y0 = list_area.y + sl.saturating_sub(sy) as u16;
-            let y1 = list_area.y + el.saturating_sub(sy).min(vis_h.saturating_sub(1)) as u16;
-            state.detail_comment_hitboxes.push((y0, y1, idx));
+    for m in node_metas {
+        if m.e_line >= sy && m.s_line < sy + vis_h {
+            let y0 = list_area.y + m.s_line.saturating_sub(sy) as u16;
+            let y1 = list_area.y + m.e_line.saturating_sub(sy).min(vis_h.saturating_sub(1)) as u16;
+            state.detail_comment_hitboxes.push((y0, y1, m.root_idx));
+
+            let fold_rect = m.fold_col_range.and_then(|(off_x, w)| {
+                let rx = list_area.x + off_x;
+                if rx < list_area.x + list_area.width {
+                    Some(Rect::new(rx, y0, w.min((list_area.x + list_area.width) - rx), 1))
+                } else {
+                    None
+                }
+            });
+            let reply_rect = m.reply_col_range.and_then(|(off_x, w)| {
+                let rx = list_area.x + off_x;
+                if rx < list_area.x + list_area.width {
+                    Some(Rect::new(rx, y0, w.min((list_area.x + list_area.width) - rx), 1))
+                } else {
+                    None
+                }
+            });
+            state.detail_comment_node_hitboxes.push(CommentNodeHitbox {
+                y0,
+                y1,
+                flat_idx: m.flat_idx,
+                node_id: m.node_id,
+                fold_rect,
+                reply_rect,
+            });
         }
     }
 
@@ -1149,10 +1842,10 @@ fn render_comments_panel(
 }
 
 fn render_footer_legend(frame: &mut Frame, area: Rect, state: &AppState, pal: &ThemePalette) {
-        let enter_hint = match state.detail_focus_pane {
+    let enter_hint = match state.detail_focus_pane {
         1 => "[Enter] Play Chapter",
-        2 => "[Dbl-Click/Enter/r] Replies · [m] Comment",
-        _ => "[Enter/Space] Play Video",
+        2 => "[r] Reply Node · [h/l] Fold · [m] New",
+        _ => "[Enter/Space] Play",
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1162,14 +1855,11 @@ fn render_footer_legend(frame: &mut Frame, area: Rect, state: &AppState, pal: &T
                     .fg(pal.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("· [Tab] Focus ", Style::default().fg(pal.secondary)),
-            Span::styled("· [j/k] Scroll ", Style::default().fg(pal.primary)),
-            Span::styled("· [m] Comment ", Style::default().fg(Color::Cyan)),
-            Span::styled("· [p] Options ", Style::default().fg(pal.text)),
-            Span::styled("· [c] Channel ", Style::default().fg(pal.text)),
-            Span::styled("· [a] +Queue ", Style::default().fg(Color::Cyan)),
-            Span::styled("· [w] +WL ", Style::default().fg(Color::Rgb(251, 191, 36))),
-            Span::styled("· [D] Offline · [Esc] Back", Style::default().fg(pal.text_dim)),
+            Span::styled("· [u/v] Vote ", Style::default().fg(Color::Rgb(52, 211, 153))),
+            Span::styled("· [c] Channel ", Style::default().fg(pal.secondary)),
+            Span::styled("· [Tab] Focus ", Style::default().fg(pal.primary)),
+            Span::styled("· [p] Studio ", Style::default().fg(pal.text)),
+            Span::styled("· [a] +Queue · [w] +WL · [Esc] Back", Style::default().fg(pal.text_dim)),
         ]))
         .alignment(Alignment::Center),
         area,
@@ -1212,28 +1902,39 @@ mod tests {
             ),
             ..Default::default()
         });
+        st.detail_video_vote = VideoVote::Liked;
         st.detail_comments = vec![VideoComment {
             id: "cmt1".to_string(),
             author: "@viewer_one".to_string(),
             published_text: "1 hour ago".to_string(),
             text: "This comment should wrap cleanly between whole words with zero concatenation issues anywhere.".to_string(),
             like_count_text: "42".to_string(),
-            reply_count: 1,
+            reply_count: 2,
             is_pinned: true,
             is_self: false,
             replies_expanded: true,
-            replies: vec![VideoComment {
-                id: "rep1".to_string(),
-                author: "@reply_author".to_string(),
-                published_text: "20m ago".to_string(),
-                text: "Here is a nested reply in the thread.".to_string(),
-                like_count_text: "5".to_string(),
-                ..Default::default()
-            }],
+            replies: vec![
+                VideoComment {
+                    id: "rep1".to_string(),
+                    author: "@reply_author".to_string(),
+                    published_text: "20m ago".to_string(),
+                    text: "Here is a nested reply in the thread.".to_string(),
+                    like_count_text: "5".to_string(),
+                    ..Default::default()
+                },
+                VideoComment {
+                    id: "rep2".to_string(),
+                    author: "@sub_replier".to_string(),
+                    published_text: "10m ago".to_string(),
+                    text: "@reply_author Replying directly to your sub-comment cleanly!".to_string(),
+                    like_count_text: "0".to_string(),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         }];
 
-        for (w, h) in [(140u16, 40u16), (96, 30)] {
+        for (w, h) in [(140u16, 42u16), (96, 30)] {
             let backend = TestBackend::new(w, h);
             let mut term = Terminal::new(backend).unwrap();
             term.draw(|f| render_detail_screen(f, &mut st, None)).unwrap();
@@ -1244,9 +1945,13 @@ mod tests {
             assert!(text.contains("Comments (1)"), "Expected Comments panel");
             assert!(text.contains("@viewer_one"), "Expected author inside Comments panel");
             assert!(text.contains("@reply_author"), "Expected nested reply author inside expanded thread");
-            assert!(!st.detail_comment_hitboxes.is_empty(), "Expected comment click hitboxes");
+            assert!(text.contains("@sub_replier"), "Expected level-2 sub-reply in Reddit tree");
+            assert!(!text.contains("·  likes"), "0-like sub-comment must not render blank likes label");
+            assert!(!st.detail_comment_node_hitboxes.is_empty(), "Expected tree node hitboxes");
+            assert!(st.detail_hitboxes.iter().any(|(_, h)| matches!(h, DetailHit::VoteLike)));
+            assert!(st.detail_hitboxes.iter().any(|(_, h)| matches!(h, DetailHit::OpenChannel(_))));
             assert!(!text.contains("concatenationissues"), "Words must never concatenate");
-            assert!(text.contains("27.5K views"), "Expected view count in detail telemetry");
+            assert!(text.contains("27.5K"), "Expected compact views/likes telemetry");
         }
     }
 }

@@ -428,6 +428,7 @@ fn render_shorts_filter_bar(frame: &mut Frame, bar_area: Rect, state: &AppState)
 }
 
 pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: Option<Rect>) {
+    state.home_channel_hitboxes.clear();
     let [top_area, hero_area, mut grid_area, footer_area] = home_layout(frame.area());
     render_top_bar(frame, top_area, state);
     render_hero_stage(frame, hero_area, state, modal_rect);
@@ -655,6 +656,7 @@ fn render_hero_stage(
         (None, None) => String::new(),
     };
 
+    let mut badge_offset_x: u16 = format!(" {active_cat_label} ").chars().count() as u16 + 1;
     let mut badges = vec![
         Span::styled(
             format!(" {active_cat_label} "),
@@ -674,9 +676,12 @@ fn render_hero_stage(
                 .add_modifier(Modifier::BOLD),
         ));
         badges.push(Span::raw(" "));
+        badge_offset_x += 6;
     }
+    let ch_pill = format!(" {} > ", video.display_uploader());
+    let ch_pill_w = ch_pill.chars().count() as u16;
     badges.push(Span::styled(
-        format!(" {} ", video.display_uploader()),
+        ch_pill,
         Style::default()
             .fg(Color::Black)
             .bg(pal.secondary)
@@ -734,7 +739,6 @@ fn render_hero_stage(
                 .to_string()
         });
     let max_desc_chars = (cols[1].width as usize).saturating_mul(2).clamp(48, 180);
-    let desc_snippet: String = desc_raw.chars().take(max_desc_chars).collect();
 
     let progress_line = if let Some((pos, dur)) = state.progress_map.get(&video.id) {
         let bar_w = (cols[1].width as usize).saturating_sub(28).clamp(12, 34);
@@ -768,6 +772,16 @@ fn render_hero_stage(
         cols[1].width.saturating_sub(2),
         cols[1].height,
     );
+    let ch_x = center_area.x.saturating_add(badge_offset_x);
+    let ch_max_w = (center_area.x + center_area.width).saturating_sub(ch_x);
+    if ch_max_w > 0 && ch_pill_w > 0 {
+        state.home_channel_hitboxes.push((
+            Rect::new(ch_x, center_area.y, ch_pill_w.min(ch_max_w), 1),
+            video.clone(),
+        ));
+    }
+    let desc_snippet =
+        crate::ui::detail::truncate_word_boundary(&desc_raw, max_desc_chars.min(center_area.width as usize * 2));
     let center_lines = vec![
         Line::from(badges),
         Line::from(Span::styled(
@@ -998,6 +1012,8 @@ fn render_continue_watching_deck(
                 .bg(row_bg),
         ));
 
+        let cw_up_label = format!("{} >", v.display_uploader());
+        let cw_up_w = cw_up_label.chars().count() as u16;
         let lines = vec![
             Line::from(vec![
                 Span::styled(prefix, Style::default().fg(pal.primary).bg(row_bg).add_modifier(Modifier::BOLD)),
@@ -1016,7 +1032,14 @@ fn render_continue_watching_deck(
             Line::from(vec![
                 Span::styled("        ", Style::default().bg(row_bg)),
                 Span::styled(
-                    format!("{}  ·  {}  ·  ", v.display_uploader(), v.display_duration()),
+                    cw_up_label,
+                    Style::default()
+                        .fg(pal.secondary)
+                        .bg(row_bg)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::styled(
+                    format!("  ·  {}  ·  ", v.display_duration()),
                     Style::default().fg(pal.text_dim).bg(row_bg),
                 ),
                 Span::styled(
@@ -1030,6 +1053,13 @@ fn render_continue_watching_deck(
         ];
 
         frame.render_widget(Paragraph::new(lines).style(Style::default().bg(row_bg)), slot_rect);
+        let cw_avail = slot_rect.width.saturating_sub(8);
+        if cw_avail > 0 && cw_up_w > 0 {
+            state.home_channel_hitboxes.push((
+                Rect::new(slot_rect.x + 8, slot_rect.y + 1, cw_up_w.min(cw_avail), 1),
+                v.clone(),
+            ));
+        }
     }
 
     // Scrollbar for Continue Watching list
@@ -1101,35 +1131,72 @@ fn render_continue_watching_deck(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "No description cached yet. Press [i] to fetch full details, subtitles, and SponsorBlock segments.".to_string());
 
-    let detail_lines = vec![
-        Line::from(Span::styled(
-            sel_vid.title.clone(),
-            Style::default().fg(pal.primary).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled(sel_vid.display_uploader(), Style::default().fg(pal.secondary)),
-            Span::styled(format!("  ·  {}", sel_vid.display_duration()), Style::default().fg(pal.text_dim)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            desc.chars().take(260).collect::<String>(),
-            Style::default().fg(pal.text_dim),
-        )),
-        Line::from(""),
-        Line::from(Span::styled("[Enter / Space] Play & Resume", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled("[x / d] Remove from Continue Watching", Style::default().fg(pal.primary))),
-        Line::from(Span::styled("[i] Open Full Detail & Chapters  ·  [w] +WatchLater", Style::default().fg(pal.text))),
-    ];
     let info_rect = Rect::new(
         r_chunks[1].x + 1,
         r_chunks[1].y,
         r_chunks[1].width.saturating_sub(2),
         r_chunks[1].height,
     );
-    frame.render_widget(
-        Paragraph::new(detail_lines).wrap(Wrap { trim: true }),
-        info_rect,
-    );
+    let info_w = info_rect.width.max(12) as usize;
+    let title_wrapped = crate::ui::detail::wrap_words(&sel_vid.title, info_w);
+    let creator_row_y = info_rect.y + title_wrapped.len() as u16;
+    let ch_badge = format!("[ {} > ]", sel_vid.display_uploader());
+    let ch_badge_w = ch_badge.chars().count() as u16;
+
+    let mut detail_lines: Vec<Line<'static>> = title_wrapped
+        .into_iter()
+        .map(|ln| {
+            Line::from(Span::styled(
+                ln,
+                Style::default().fg(pal.primary).add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
+    detail_lines.push(Line::from(vec![
+        Span::styled(
+            ch_badge,
+            Style::default()
+                .fg(pal.secondary)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
+        Span::styled(
+            format!("  ·  {}", sel_vid.display_duration()),
+            Style::default().fg(pal.text_dim),
+        ),
+    ]));
+    detail_lines.push(Line::from(""));
+    for dln in crate::ui::detail::wrap_words(&desc, info_w).into_iter().take(4) {
+        detail_lines.push(Line::from(Span::styled(
+            dln,
+            Style::default().fg(pal.text_dim),
+        )));
+    }
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(Span::styled(
+        "[Enter / Space] Play & Resume",
+        Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+    )));
+    detail_lines.push(Line::from(Span::styled(
+        "[x / d] Remove from Continue Watching",
+        Style::default().fg(pal.primary),
+    )));
+    detail_lines.push(Line::from(Span::styled(
+        "[i] Detail  ·  [w] +WatchLater  ·  Click Creator -> Channel",
+        Style::default().fg(pal.text),
+    )));
+
+    frame.render_widget(Paragraph::new(detail_lines), info_rect);
+    if creator_row_y < info_rect.y + info_rect.height && info_rect.width > 0 {
+        state.home_channel_hitboxes.push((
+            Rect::new(
+                info_rect.x,
+                creator_row_y,
+                ch_badge_w.min(info_rect.width),
+                1,
+            ),
+            sel_vid.clone(),
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1256,8 +1323,15 @@ fn render_video_grid(
 
         let dur_badge = v.display_duration();
         let is_live_card = v.is_live == Some(true) || dur_badge == "LIVE";
-        let uploader_w = inner_w.saturating_sub(dur_badge.chars().count() + 1).max(6);
-        let uploader_str: String = v.display_uploader().chars().take(uploader_w).collect();
+        let uploader_w = inner_w.saturating_sub(dur_badge.chars().count() + 2).max(6);
+        let uploader_str: String = format!("{} >", v.display_uploader())
+            .chars()
+            .take(uploader_w)
+            .collect();
+        let uploader_actual_w = uploader_str.chars().count();
+        let pad_between = inner_w
+            .saturating_sub(uploader_actual_w + dur_badge.chars().count())
+            .max(1);
 
         let (status_badge, status_color) = if let Some((pos, dur)) = state.progress_map.get(&v.id) {
             if *dur > 0.0 && *pos > 1.0 {
@@ -1288,10 +1362,12 @@ fn render_video_grid(
             )),
             Line::from(vec![
                 Span::styled(
-                    format!("{:<uploader_w$}", uploader_str),
-                    Style::default().fg(card_pal.text_dim),
+                    uploader_str,
+                    Style::default()
+                        .fg(card_pal.secondary)
+                        .add_modifier(Modifier::UNDERLINED),
                 ),
-                Span::raw(" "),
+                Span::raw(" ".repeat(pad_between)),
                 Span::styled(
                     dur_badge.clone(),
                     Style::default()
@@ -1367,6 +1443,17 @@ fn render_video_grid(
         }
 
         frame.render_widget(Paragraph::new(meta_lines), card_chunks[1]);
+        if card_chunks[1].height >= 2 && uploader_actual_w > 0 {
+            state.home_channel_hitboxes.push((
+                Rect::new(
+                    card_chunks[1].x,
+                    card_chunks[1].y + 1,
+                    (uploader_actual_w as u16).min(card_chunks[1].width),
+                    1,
+                ),
+                v.clone(),
+            ));
+        }
     }
 
     let total_rows = videos.len().div_ceil(cols);
@@ -1648,6 +1735,7 @@ mod tests {
         let backend = TestBackend::new(120, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render_home_screen(f, &mut st, None)).unwrap();
+        assert!(!st.home_channel_hitboxes.is_empty());
     }
 
     #[test]
@@ -1692,6 +1780,7 @@ mod tests {
         let backend = TestBackend::new(140, 42);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render_home_screen(f, &mut st, None)).unwrap();
+        assert!(st.home_channel_hitboxes.len() >= 2);
     }
 
     #[test]

@@ -79,7 +79,18 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             video_id TEXT NOT NULL,
             author TEXT NOT NULL,
             content TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            parent_comment_id TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    ensure_column_exists(pool, "user_video_comments", "parent_comment_id", "TEXT").await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_video_votes (
+            video_id TEXT PRIMARY KEY,
+            vote INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         )",
     )
     .execute(pool)

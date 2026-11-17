@@ -1,7 +1,7 @@
 //! Central Application State — single source of truth for screens, overlays, cache & playback.
 
 use crate::api::dislike::DislikeInfo;
-use crate::api::innertube::VideoComment;
+use crate::api::innertube::{VideoComment, VideoVote};
 use crate::api::player::{detect_dependencies, DependencyStatus};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
@@ -210,6 +210,7 @@ pub struct AppState {
     pub shorts_source: ShortsSource,
     pub shorts_suggested: Vec<VideoItem>,
     pub shorts_subscribed: Vec<VideoItem>,
+    pub home_channel_hitboxes: Vec<(Rect, VideoItem)>,
 
     // User library fast-lookup caches
     pub watched_ids: HashSet<String>,
@@ -231,8 +232,12 @@ pub struct AppState {
     pub detail_selected_sub_idx: usize,
     pub detail_sponsor_segments: Vec<SponsorSegment>,
     pub detail_dislikes: Option<DislikeInfo>,
+    pub detail_video_vote: VideoVote,
     pub detail_comments: Vec<VideoComment>,
     pub detail_comment_cursor: usize,
+    pub detail_comment_sort: CommentSort,
+    pub detail_comment_collapsed: HashSet<String>,
+    pub detail_reply_target: Option<ReplyTarget>,
     pub detail_comments_loading: bool,
     pub detail_create_comment_params: Option<String>,
     pub detail_comment_composing: bool,
@@ -240,13 +245,17 @@ pub struct AppState {
     pub detail_comments_panel_rect: Rect,
     pub detail_comment_composer_rect: Rect,
     pub detail_comment_hitboxes: Vec<(u16, u16, usize)>,
+    pub detail_comment_node_hitboxes: Vec<CommentNodeHitbox>,
     pub detail_comment_last_click: Option<(usize, Instant)>,
+    pub detail_last_node_click: Option<(String, Instant)>,
+    pub detail_hitboxes: Vec<(Rect, DetailHit)>,
 
     pub channel_title: String,
     pub channel_id: Option<String>,
     pub channel_videos: Vec<VideoItem>,
     pub channel_cursor: usize,
     pub is_loading_channel: bool,
+    pub channel_return_screen: Screen,
 
     // Search Studio + 120ms/350ms debounce + smart filters
     pub search_query: String,
@@ -378,6 +387,7 @@ impl AppState {
             shorts_source: ShortsSource::Suggested,
             shorts_suggested: Vec::new(),
             shorts_subscribed: Vec::new(),
+            home_channel_hitboxes: Vec::new(),
 
             watched_ids: HashSet::new(),
             progress_map: HashMap::new(),
@@ -397,8 +407,12 @@ impl AppState {
             detail_selected_sub_idx: 0,
             detail_sponsor_segments: Vec::new(),
             detail_dislikes: None,
+            detail_video_vote: VideoVote::None,
             detail_comments: Vec::new(),
             detail_comment_cursor: 0,
+            detail_comment_sort: CommentSort::Top,
+            detail_comment_collapsed: HashSet::new(),
+            detail_reply_target: None,
             detail_comments_loading: false,
             detail_create_comment_params: None,
             detail_comment_composing: false,
@@ -406,13 +420,17 @@ impl AppState {
             detail_comments_panel_rect: Rect::default(),
             detail_comment_composer_rect: Rect::default(),
             detail_comment_hitboxes: Vec::new(),
+            detail_comment_node_hitboxes: Vec::new(),
             detail_comment_last_click: None,
+            detail_last_node_click: None,
+            detail_hitboxes: Vec::new(),
 
             channel_title: String::new(),
             channel_id: None,
             channel_videos: Vec::new(),
             channel_cursor: 0,
             is_loading_channel: false,
+            channel_return_screen: Screen::Home,
 
             search_query: String::new(),
             search_results: Vec::new(),
@@ -810,6 +828,115 @@ impl AppState {
             }
         }
         out
+    }
+
+    pub fn same_creator_videos(&self, video: &VideoItem, limit: usize) -> Vec<VideoItem> {
+        let cur_id = video.clean_id();
+        let cur_uploader = video.display_uploader();
+        let mut seen = HashSet::new();
+        seen.insert(cur_id.to_string());
+        let mut out = Vec::new();
+        for v in self.all_known_videos() {
+            let same_cid = video.channel_id.is_some() && v.channel_id == video.channel_id;
+            let same_up = !cur_uploader.eq_ignore_ascii_case("Unknown")
+                && v.display_uploader().eq_ignore_ascii_case(cur_uploader);
+            if (same_cid || same_up) && seen.insert(v.clean_id().to_string()) {
+                out.push(v);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn detail_up_next_videos(&self, limit: usize) -> Vec<VideoItem> {
+        self.detail_related_entries()
+            .into_iter()
+            .map(|(_, v)| v)
+            .take(limit)
+            .collect()
+    }
+
+    pub fn build_comment_tree(&self) -> Vec<CommentTreeRow> {
+        if self.detail_comments.is_empty() {
+            return Vec::new();
+        }
+        let mut root_indices: Vec<usize> = (0..self.detail_comments.len()).collect();
+        if self.detail_comment_sort == CommentSort::Newest {
+            root_indices.sort_by_key(|&idx| {
+                let c = &self.detail_comments[idx];
+                (usize::from(!c.is_self), comment_age_rank(&c.published_text), idx)
+            });
+        }
+
+        let mut rows = Vec::new();
+        for r_idx in root_indices {
+            let root = &self.detail_comments[r_idx];
+            let has_root_children = !root.replies.is_empty()
+                || root.reply_count > 0
+                || root.replies_continuation.is_some();
+            let root_child_cnt = subtree_descendant_count(&root.replies, root.reply_count);
+            rows.push(CommentTreeRow {
+                comment: root.clone(),
+                depth: 0,
+                parent_id: None,
+                root_id: root.id.clone(),
+                root_idx: r_idx,
+                is_last_sibling: false,
+                rail_active: Vec::new(),
+                has_children: has_root_children,
+                child_count: root_child_cnt,
+                collapsed: !root.replies_expanded,
+            });
+            if !root.replies_expanded || root.replies.is_empty() {
+                continue;
+            }
+
+            let children_map = build_reply_adjacency(&root.replies);
+            let direct_children = &children_map.root_children;
+            for (pos, &child_i) in direct_children.iter().enumerate() {
+                let is_last = pos + 1 == direct_children.len();
+                push_reply_subtree(
+                    &root.replies,
+                    &children_map.by_reply,
+                    child_i,
+                    root.id.clone(),
+                    root.id.clone(),
+                    r_idx,
+                    1,
+                    is_last,
+                    Vec::new(),
+                    &self.detail_comment_collapsed,
+                    &mut rows,
+                );
+            }
+        }
+        rows
+    }
+
+    pub fn insert_comment_reply(
+        &mut self,
+        root_id: &str,
+        parent_id: &str,
+        mut reply: VideoComment,
+    ) -> bool {
+        reply.parent_id = Some(parent_id.to_string());
+        self.detail_comment_collapsed.remove(root_id);
+        self.detail_comment_collapsed.remove(parent_id);
+        if let Some(root) = self.detail_comments.iter_mut().find(|c| c.id == root_id) {
+            root.replies_expanded = true;
+            root.reply_count = root.reply_count.saturating_add(1);
+            if parent_id == root_id {
+                root.replies.insert(0, reply);
+            } else if let Some(pos) = root.replies.iter().position(|r| r.id == parent_id) {
+                root.replies.insert(pos + 1, reply);
+            } else {
+                root.replies.push(reply);
+            }
+            return true;
+        }
+        false
     }
 
     pub fn active_selected_video(&self) -> Option<VideoItem> {
@@ -1279,6 +1406,59 @@ impl SearchSortOrder {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentSort {
+    Top,
+    Newest,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplyTarget {
+    pub root_id: String,
+    pub parent_id: String,
+    pub author: String,
+    pub reply_params: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommentTreeRow {
+    pub comment: VideoComment,
+    pub depth: usize,
+    pub parent_id: Option<String>,
+    pub root_id: String,
+    pub root_idx: usize,
+    pub is_last_sibling: bool,
+    pub rail_active: Vec<bool>,
+    pub has_children: bool,
+    pub child_count: usize,
+    pub collapsed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommentNodeHitbox {
+    pub y0: u16,
+    pub y1: u16,
+    pub flat_idx: usize,
+    pub node_id: String,
+    pub fold_rect: Option<Rect>,
+    pub reply_rect: Option<Rect>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DetailHit {
+    Play,
+    VoteLike,
+    VoteDislike,
+    PinQueue,
+    WatchLater,
+    Download,
+    OpenChannel(VideoItem),
+    SelectUpNext(VideoItem),
+    SelectChapter(usize),
+    SortComments(CommentSort),
+    FocusPane(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchHit {
     ApplySuggestion(String),
@@ -1461,6 +1641,174 @@ pub fn occluded_by_modal(card_area: Rect, modal_rect: Option<Rect>) -> bool {
     x_overlap && y_overlap
 }
 
+struct ReplyAdjacency {
+    root_children: Vec<usize>,
+    by_reply: Vec<Vec<usize>>,
+}
+
+fn norm_handle(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('@')
+        .to_lowercase()
+}
+
+fn leading_mention_handle(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix('@')?;
+    let tok: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    if tok.len() >= 2 {
+        Some(tok.to_lowercase())
+    } else {
+        None
+    }
+}
+
+fn build_reply_adjacency(replies: &[VideoComment]) -> ReplyAdjacency {
+    let mut root_children = Vec::new();
+    let mut by_reply = vec![Vec::new(); replies.len()];
+    let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
+    let mut handle_to_idx: HashMap<String, usize> = HashMap::new();
+
+    for (idx, r) in replies.iter().enumerate() {
+        id_to_idx.insert(r.id.as_str(), idx);
+    }
+    for (idx, r) in replies.iter().enumerate() {
+        let mut attached = false;
+        if let Some(ref pid) = r.parent_id {
+            if let Some(&p_idx) = id_to_idx.get(pid.as_str()) {
+                if p_idx != idx {
+                    by_reply[p_idx].push(idx);
+                    attached = true;
+                }
+            }
+        }
+        if !attached {
+            if let Some(m_handle) = leading_mention_handle(&r.text) {
+                if m_handle != norm_handle(&r.author) {
+                    if let Some(&p_idx) = handle_to_idx.get(&m_handle) {
+                        if p_idx < idx {
+                            by_reply[p_idx].push(idx);
+                            attached = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !attached {
+            root_children.push(idx);
+        }
+        let h = norm_handle(&r.author);
+        if !h.is_empty() {
+            handle_to_idx.insert(h, idx);
+        }
+    }
+
+    ReplyAdjacency {
+        root_children,
+        by_reply,
+    }
+}
+
+fn count_tree_descendants(by_reply: &[Vec<usize>], idx: usize) -> usize {
+    let mut total = by_reply[idx].len();
+    for &c in &by_reply[idx] {
+        total += count_tree_descendants(by_reply, c);
+    }
+    total
+}
+
+fn subtree_descendant_count(replies: &[VideoComment], remote_cnt: u32) -> usize {
+    (remote_cnt as usize).max(replies.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_reply_subtree(
+    replies: &[VideoComment],
+    by_reply: &[Vec<usize>],
+    idx: usize,
+    parent_id: String,
+    root_id: String,
+    root_idx: usize,
+    depth: usize,
+    is_last_sibling: bool,
+    rail_active: Vec<bool>,
+    collapsed_ids: &HashSet<String>,
+    out: &mut Vec<CommentTreeRow>,
+) {
+    let r = &replies[idx];
+    let children = &by_reply[idx];
+    let has_children = !children.is_empty();
+    let collapsed = has_children && collapsed_ids.contains(&r.id);
+    let desc_count = count_tree_descendants(by_reply, idx);
+
+    out.push(CommentTreeRow {
+        comment: r.clone(),
+        depth: depth.min(6),
+        parent_id: Some(parent_id),
+        root_id: root_id.clone(),
+        root_idx,
+        is_last_sibling,
+        rail_active: rail_active.clone(),
+        has_children,
+        child_count: desc_count,
+        collapsed,
+    });
+
+    if collapsed || children.is_empty() {
+        return;
+    }
+
+    let mut next_rails = rail_active;
+    if depth < 6 {
+        next_rails.push(!is_last_sibling);
+    }
+    for (pos, &child_i) in children.iter().enumerate() {
+        let child_last = pos + 1 == children.len();
+        push_reply_subtree(
+            replies,
+            by_reply,
+            child_i,
+            r.id.clone(),
+            root_id.clone(),
+            root_idx,
+            (depth + 1).min(6),
+            child_last,
+            next_rails.clone(),
+            collapsed_ids,
+            out,
+        );
+    }
+}
+
+fn comment_age_rank(published: &str) -> (u8, u64) {
+    let low = published.trim().to_lowercase();
+    if low.is_empty() || low.contains("just now") {
+        return (0, 0);
+    }
+    let num = low
+        .split_whitespace()
+        .find_map(|w| w.parse::<u64>().ok())
+        .unwrap_or(1);
+    if low.contains("second") {
+        (1, num)
+    } else if low.contains("minute") {
+        (2, num)
+    } else if low.contains("hour") {
+        (3, num)
+    } else if low.contains("day") {
+        (4, num)
+    } else if low.contains("week") {
+        (5, num)
+    } else if low.contains("month") {
+        (6, num)
+    } else {
+        (7, num)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,5 +1929,77 @@ mod tests {
             .position(|(c, _)| *c == Category::Shorts)
             .unwrap();
         assert_eq!(st.current_filtered_videos().len(), 3);
+    }
+
+    #[test]
+    fn test_reddit_comment_tree_nesting_collapse_and_sub_reply() {
+        let mut st = AppState::new(Config::default());
+        st.detail_comments = vec![VideoComment {
+            id: "root_1".into(),
+            author: "@Stay_positive_Test_negative".into(),
+            published_text: "17 hours ago".into(),
+            text: "Truly a sad day to see Toyota go down this route".into(),
+            like_count_text: "168".into(),
+            reply_count: 3,
+            replies_expanded: true,
+            replies: vec![
+                VideoComment {
+                    id: "rep_1".into(),
+                    author: "@audreymiller3056".into(),
+                    published_text: "15 hours ago".into(),
+                    text: "yep, just buy another brand at this point".into(),
+                    like_count_text: "7".into(),
+                    ..Default::default()
+                },
+                VideoComment {
+                    id: "rep_2".into(),
+                    author: "@toddbender3463".into(),
+                    published_text: "13 hours ago".into(),
+                    text: "@audreymiller3056 it is still sitting at the top".into(),
+                    like_count_text: "6".into(),
+                    ..Default::default()
+                },
+                VideoComment {
+                    id: "rep_3".into(),
+                    author: "@chicagotypewriter2094".into(),
+                    published_text: "4 hours ago".into(),
+                    text: "@toddbender3463 nah, the gap is shrinking".into(),
+                    like_count_text: "0".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+
+        let rows = st.build_comment_tree();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[2].depth, 2);
+        assert_eq!(rows[3].depth, 3);
+
+        // Collapse middle sub-comment `rep_2`; hides `rep_3` while keeping `rep_1` & `rep_2`
+        st.detail_comment_collapsed.insert("rep_2".into());
+        let collapsed_rows = st.build_comment_tree();
+        assert_eq!(collapsed_rows.len(), 3);
+        assert!(collapsed_rows[2].collapsed);
+        assert_eq!(collapsed_rows[2].child_count, 1);
+
+        // Reply directly to nested `rep_2`; auto-expands `rep_2` and inserts beneath it
+        assert!(st.insert_comment_reply(
+            "root_1",
+            "rep_2",
+            VideoComment {
+                id: "local_sub_1".into(),
+                author: "@you".into(),
+                text: "@toddbender3463 fair point".into(),
+                is_self: true,
+                ..Default::default()
+            }
+        ));
+        let updated = st.build_comment_tree();
+        assert_eq!(updated.len(), 5);
+        assert_eq!(updated[3].comment.id, "local_sub_1");
+        assert_eq!(updated[3].depth, 3);
     }
 }
