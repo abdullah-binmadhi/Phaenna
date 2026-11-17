@@ -28,6 +28,7 @@ pub enum HubActionId {
     CastScan,
     GoogleAccountHub,
     UploadRadar,
+    AnalysisDashboard,
     CheckUpdates,
     AutoUpdateMode,
 }
@@ -172,6 +173,14 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             keywords: "calendar uploads schedule radar week",
             badge: "[ Open (c) ]".to_string(),
             description: "Open the local-timezone Mon-Sun upload schedule for subscriptions.",
+        },
+        HubItem {
+            id: HubActionId::AnalysisDashboard,
+            category: "ACCOUNT & TOOLS",
+            label: "Phaenna Analysis Dashboard",
+            keywords: "analysis analytics wrapped telemetry habits watch time budget",
+            badge: "[ Open (A) ]".to_string(),
+            description: "Inspect viewing hours, daily budget pace, finish rates, channels & habits.",
         },
         HubItem {
             id: HubActionId::CheckUpdates,

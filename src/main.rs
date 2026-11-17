@@ -43,13 +43,14 @@ use crate::db::sync::{
     SUBSCRIPTIONS, WATCH_LATER,
 };
 use crate::db::user::{
-    add_to_watch_later, clear_finished_continue_watching, compute_user_analytics,
-    get_all_progress_map, get_continue_watching, get_continue_watching_meta_map,
-    get_local_watch_history_videos, get_offline_videos, get_sponsorblock_segments,
-    get_user_video_comments, get_video_vote, get_watch_later_sources, get_watched_ids,
-    move_continue_watching_item, pin_to_continue_watching, remove_continue_watching,
-    remove_from_watch_later, save_sponsorblock_segments, save_user_video_comment, set_video_vote,
-    sync_youtube_watched_items, touch_watch_history, WatchLaterSource,
+    add_to_watch_later, backfill_session_video_metadata, clear_finished_continue_watching,
+    compute_user_analytics_with_options, get_all_progress_map, get_continue_watching,
+    get_continue_watching_meta_map, get_local_watch_history_videos, get_offline_videos,
+    get_sponsorblock_segments, get_user_video_comments, get_video_vote, get_watch_later_sources,
+    get_watched_ids, move_continue_watching_item, pin_to_continue_watching,
+    remove_continue_watching, remove_from_watch_later, save_sponsorblock_segments,
+    save_user_video_comment, set_video_vote, sort_channels_by, sync_youtube_watched_items,
+    touch_watch_history, upsert_watch_session, AnalysisTab, WatchLaterSource, WatchSessionWrite,
 };
 use crate::messages::AppMessage;
 use crate::services::auth::{
@@ -70,7 +71,7 @@ use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
 };
 use crate::state::{
-    ActiveOverlay, AppState, Category, CommentTranslation, ContentFilter, DetailHit,
+    ActiveOverlay, AnalysisHit, AppState, Category, CommentTranslation, ContentFilter, DetailHit,
     DetailViewMode, DownloadJobState, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen,
     SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter, ShortsSource, SortOrder,
 };
@@ -1501,6 +1502,14 @@ async fn handle_app_message(
             subtitles,
         } => {
             let _ = upsert_video(pool, &item, now_unix()).await;
+            let _ = backfill_session_video_metadata(
+                pool,
+                &video_id,
+                item.channel_id.as_deref(),
+                item.display_uploader(),
+                item.duration.unwrap_or(0) as f64,
+            )
+            .await;
             if state
                 .detail_video
                 .as_ref()
@@ -2454,7 +2463,7 @@ async fn start_nonblocking_playback(
     };
 
     match spawn_player(&opts) {
-        Ok(Some(_child)) => {
+        Ok(Some(mut child)) => {
             let ts = now_unix();
             let _ = touch_watch_history(pool, Some(video), &video.id, ts).await;
             state.mark_video_watched(video);
@@ -2545,10 +2554,61 @@ async fn start_nonblocking_playback(
                 spawn_mpv_ipc_monitor(IpcMonitorConfig {
                     session_id,
                     video_id: video.id.clone(),
+                    channel_id: video.channel_id.clone(),
+                    channel_name: video.display_uploader().to_string(),
+                    duration_hint_secs: video.duration.unwrap_or(0) as f64,
+                    initial_pos_secs: start_pos.unwrap_or(0.0),
                     sock_path,
                     pool: pool.clone(),
                     tx: tx.clone(),
                     skip_segments: sb_segs,
+                });
+            } else {
+                let p_ext = pool.clone();
+                let vid_ext = video.id.clone();
+                let cid_ext = video.channel_id.clone();
+                let cname_ext = video.display_uploader().to_string();
+                let dur_ext = video.duration.unwrap_or(0) as f64;
+                let start_ext = start_pos.unwrap_or(0.0);
+                let player_lbl = state.config.player.label().to_string();
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                    let ended = now_unix();
+                    let raw_elapsed = (ended - ts).max(0) as f64;
+                    let watched = if dur_ext > 0.0 {
+                        raw_elapsed.min(dur_ext)
+                    } else {
+                        raw_elapsed
+                    };
+                    if watched >= 5.0 {
+                        let done = dur_ext >= 60.0 && ((start_ext + watched) / dur_ext) >= 0.85;
+                        let _ = upsert_watch_session(
+                            &p_ext,
+                            &WatchSessionWrite {
+                                video_id: &vid_ext,
+                                channel_id: cid_ext.as_deref(),
+                                channel_name: &cname_ext,
+                                source: "local_external",
+                                started_at: ts,
+                                ended_at: ended,
+                                watched_secs: watched,
+                                media_secs: watched,
+                                start_pos_secs: start_ext,
+                                end_pos_secs: (start_ext + watched).min(if dur_ext > 0.0 {
+                                    dur_ext
+                                } else {
+                                    start_ext + watched
+                                }),
+                                video_duration_secs: dur_ext,
+                                playback_speed: 1.0,
+                                sb_skipped_secs: 0.0,
+                                sb_categories_json: "{}",
+                                player: &player_lbl,
+                                completed: done,
+                            },
+                        )
+                        .await;
+                    }
                 });
             }
         }
@@ -2877,11 +2937,101 @@ async fn toggle_watch_later(
 }
 
 async fn open_analytics(state: &mut AppState, pool: &SqlitePool) {
-    if let Ok(a) = compute_user_analytics(pool).await {
+    state.sync_calendar_tz(pool).await;
+    if let Ok(a) = compute_user_analytics_with_options(
+        pool,
+        state.analysis_range,
+        state.analysis_include_yt_sync,
+        state.config.analysis.daily_budget_mins,
+    )
+    .await
+    {
         state.analytics = a;
         state.analytics_loaded = true;
     }
     state.overlay = ActiveOverlay::Analytics;
+}
+
+fn open_selected_analysis_row(
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    match state.analysis_tab {
+        AnalysisTab::Overview | AnalysisTab::Channels => {
+            let sorted =
+                sort_channels_by(&state.analytics.top_channels, state.analysis_channel_sort);
+            if let Some(ch) = sorted.get(state.analysis_cursor) {
+                let stub = VideoItem {
+                    id: String::new(),
+                    title: ch.channel_name.clone(),
+                    uploader: Some(ch.channel_name.clone()),
+                    channel_id: ch.channel_id.clone(),
+                    ..VideoItem::default()
+                };
+                open_channel_for_video(&stub, state, tx, client);
+            }
+        }
+        AnalysisTab::Habits => {
+            if let Some(item) = state.analytics.recent_watch_log.get(state.analysis_cursor).cloned() {
+                let stub = VideoItem {
+                    id: item.video_id.clone(),
+                    title: item.title,
+                    uploader: Some(item.channel_name),
+                    channel_id: item.channel_id,
+                    duration: (item.video_duration_secs > 0.0)
+                        .then_some(item.video_duration_secs.round() as u64),
+                    webpage_url: Some(youtube_watch_url(&item.video_id)),
+                    ..VideoItem::default()
+                };
+                state.overlay = ActiveOverlay::None;
+                open_detail_for_video(stub, state, pool, tx, client);
+            }
+        }
+    }
+}
+
+async fn apply_analysis_hit(
+    hit: AnalysisHit,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    match hit {
+        AnalysisHit::SelectTab(tab) => {
+            state.analysis_tab = tab;
+            state.analysis_cursor = 0;
+        }
+        AnalysisHit::SelectRange(range) => {
+            state.analysis_range = range;
+            state.analysis_cursor = 0;
+            open_analytics(state, pool).await;
+        }
+        AnalysisHit::ToggleYtSync => {
+            state.analysis_include_yt_sync = !state.analysis_include_yt_sync;
+            state.analysis_cursor = 0;
+            open_analytics(state, pool).await;
+        }
+        AnalysisHit::CycleChannelSort => {
+            state.analysis_channel_sort = state.analysis_channel_sort.next();
+            state.analysis_cursor = 0;
+        }
+        AnalysisHit::BudgetDelta(delta) => {
+            let cur = state.config.analysis.daily_budget_mins as i32;
+            state.config.analysis.daily_budget_mins = (cur + delta).clamp(15, 480) as u32;
+            let _ = state.config.save();
+            open_analytics(state, pool).await;
+        }
+        AnalysisHit::SelectChannel(idx) | AnalysisHit::SelectSession(idx) => {
+            if state.analysis_cursor == idx {
+                open_selected_analysis_row(state, pool, tx, client);
+            } else {
+                state.analysis_cursor = idx;
+            }
+        }
+    }
 }
 
 fn spawn_translate_comment(
@@ -3079,6 +3229,9 @@ async fn execute_hub_action(
         HubActionId::UploadRadar => {
             state.sync_calendar_tz(pool).await;
             state.overlay = ActiveOverlay::Calendar;
+        }
+        HubActionId::AnalysisDashboard => {
+            open_analytics(state, pool).await;
         }
         HubActionId::CheckUpdates => {
             state.overlay = ActiveOverlay::Update;
@@ -3833,6 +3986,57 @@ async fn handle_mouse_event(
                         }
                     } else {
                         state.search_cursor = state.search_cursor.saturating_sub(1);
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+        if state.overlay == ActiveOverlay::Analytics {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some((_, hit)) = state
+                    .analysis_hitboxes
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| in_rect(*r))
+                    .copied()
+                {
+                    apply_analysis_hit(hit, state, pool, tx, client).await;
+                    return true;
+                }
+                if let Some(modal) =
+                    crate::state::active_modal_rect(frame_area, ActiveOverlay::Analytics)
+                {
+                    if !in_rect(modal) {
+                        state.overlay = ActiveOverlay::None;
+                        return true;
+                    }
+                }
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.overlay = ActiveOverlay::None;
+                return true;
+            }
+            if matches!(mouse.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+                let len = match state.analysis_tab {
+                    AnalysisTab::Overview | AnalysisTab::Channels => {
+                        state.analytics.top_channels.len()
+                    }
+                    AnalysisTab::Habits => state.analytics.recent_watch_log.len(),
+                };
+                if len > 0 {
+                    if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                        state.analysis_cursor = (state.analysis_cursor + 1).min(len - 1);
+                    } else {
+                        state.analysis_cursor = state.analysis_cursor.saturating_sub(1);
                     }
                     return true;
                 }
@@ -5152,7 +5356,69 @@ async fn handle_overlay_key(
             _ => {}
         },
         ActiveOverlay::Analytics => match code {
-            KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => state.overlay = ActiveOverlay::None,
+            KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => {
+                state.overlay = ActiveOverlay::None;
+            }
+            KeyCode::Char('1') => {
+                apply_analysis_hit(AnalysisHit::SelectTab(AnalysisTab::Overview), state, pool, tx, client).await;
+            }
+            KeyCode::Char('2') => {
+                apply_analysis_hit(AnalysisHit::SelectTab(AnalysisTab::Channels), state, pool, tx, client).await;
+            }
+            KeyCode::Char('3') => {
+                apply_analysis_hit(AnalysisHit::SelectTab(AnalysisTab::Habits), state, pool, tx, client).await;
+            }
+            KeyCode::Tab => {
+                let next = match state.analysis_tab {
+                    AnalysisTab::Overview => AnalysisTab::Channels,
+                    AnalysisTab::Channels => AnalysisTab::Habits,
+                    AnalysisTab::Habits => AnalysisTab::Overview,
+                };
+                apply_analysis_hit(AnalysisHit::SelectTab(next), state, pool, tx, client).await;
+            }
+            KeyCode::BackTab => {
+                let prev = match state.analysis_tab {
+                    AnalysisTab::Overview => AnalysisTab::Habits,
+                    AnalysisTab::Channels => AnalysisTab::Overview,
+                    AnalysisTab::Habits => AnalysisTab::Channels,
+                };
+                apply_analysis_hit(AnalysisHit::SelectTab(prev), state, pool, tx, client).await;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                let r = state.analysis_range.prev();
+                apply_analysis_hit(AnalysisHit::SelectRange(r), state, pool, tx, client).await;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let r = state.analysis_range.next();
+                apply_analysis_hit(AnalysisHit::SelectRange(r), state, pool, tx, client).await;
+            }
+            KeyCode::Char('o') => {
+                apply_analysis_hit(AnalysisHit::ToggleYtSync, state, pool, tx, client).await;
+            }
+            KeyCode::Char('s') => {
+                apply_analysis_hit(AnalysisHit::CycleChannelSort, state, pool, tx, client).await;
+            }
+            KeyCode::Char('b') => {
+                apply_analysis_hit(AnalysisHit::BudgetDelta(-15), state, pool, tx, client).await;
+            }
+            KeyCode::Char('B') => {
+                apply_analysis_hit(AnalysisHit::BudgetDelta(15), state, pool, tx, client).await;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.analysis_cursor = state.analysis_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = match state.analysis_tab {
+                    AnalysisTab::Overview | AnalysisTab::Channels => {
+                        state.analytics.top_channels.len()
+                    }
+                    AnalysisTab::Habits => state.analytics.recent_watch_log.len(),
+                };
+                if len > 0 {
+                    state.analysis_cursor = (state.analysis_cursor + 1).min(len - 1);
+                }
+            }
+            KeyCode::Enter => open_selected_analysis_row(state, pool, tx, client),
             KeyCode::Char('r') => open_analytics(state, pool).await,
             _ => {}
         },

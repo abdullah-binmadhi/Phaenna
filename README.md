@@ -91,7 +91,7 @@ Finding the exact video is instant, accurate, and interactive from the first key
 - **Infinite Scroll & Continue Watching Deck**: Seamlessly browse deeper feeds and pin favorites (`a` / `+`) to your persistent Continue Watching deck.
 - **Effortless Google Sign-In (`L`)**: Split-window SSO, Chrome sign-in, QR Device Code, or in-app verification kept safely on your machine.
 - **More Crafted Experiences**:
-  - `[A]` **Phaenna Wrapped Analytics**: Visual watch habits, circadian rhythm, 26-week thermal heatmap, and SponsorBlock time saved.
+  - `[A]` **Phaenna Analysis**: Daily watch budget monitor, finish-rate diagnostics, 24h circadian habits, 12-week consistency grid, and SponsorBlock category savings.
   - `[t]` **Comment Translator** (Detail Deck): Translate comments or full threads into any language (`g` to pick/type any language).
   - `[m]` **Mobile LAN Remote** via instant QR code, `[C]` **AirPlay 2 & Smart TV Cast**, `[D]` **Offline Vault**, `[s]` **Fuzzy Command Hub**, and `[U]` **Updater**.
 
@@ -191,7 +191,7 @@ foreach ($id in @("wez.wezterm","Microsoft.WindowsTerminal","shinchiro.mpv","Vid
 | **Discovery & Hubs** | `/` | Search Studio (Live Suggestions `Tab`, `Ctrl+t/d/u/s/w/g` Filters & Sort, `Ctrl+p` Play, `Ctrl+a` Queue) |
 | | `c` | 7-Day Upload Radar with live `16:9` preview (`h`/`l` Day, `[`/`]` Week, `Space` Play, `a` +CW, `w` WL) |
 | | `f` / `r` | Filter (`All` / `Longform` / `Shorts`) & Sort / Force refresh feeds |
-| | `A` | Phaenna Wrapped Analytics |
+| | `A` | Phaenna Analysis (Daily Budget, Finish Rate, Channels & Session Ledger) |
 | | `s` / `,` | Fuzzy Command Hub (includes one-click `FSRCNNX` 4K CNN pack install) |
 | | `L` / `T` | Google Account & Identity Hub / Cycle 6 Themes |
 | | `m` / `C` | Mobile LAN Remote QR / AirPlay & DLNA TV Cast |

@@ -648,6 +648,24 @@ impl MotionMode {
 /// Persistent application configuration for Phaenna (`config.toml`).
 /// Root user configuration persisted to `<config_dir>/config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalysisConfig {
+    #[serde(default = "default_daily_budget_mins")]
+    pub daily_budget_mins: u32,
+}
+
+fn default_daily_budget_mins() -> u32 {
+    60
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            daily_budget_mins: default_daily_budget_mins(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub quality: Quality,
@@ -692,6 +710,8 @@ pub struct Config {
     #[serde(default)]
     pub update: UpdateConfig,
     #[serde(default)]
+    pub analysis: AnalysisConfig,
+    #[serde(default)]
     pub subtitle_style: crate::services::substyler::SubtitleStyleConfig,
 }
 
@@ -719,6 +739,7 @@ impl Default for Config {
             remote: RemoteConfig::default(),
             cast: CastConfig::default(),
             update: UpdateConfig::default(),
+            analysis: AnalysisConfig::default(),
             subtitle_style: crate::services::substyler::SubtitleStyleConfig::default(),
         }
     }

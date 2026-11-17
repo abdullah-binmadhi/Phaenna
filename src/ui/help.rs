@@ -82,7 +82,7 @@ pub fn render_help_modal(frame: &mut Frame, state: &AppState) {
             vec![
                 Line::from(vec![Span::styled(" / (^a Queue) ", key), Span::styled("Debounced Live Search", desc)]),
                 Line::from(vec![Span::styled(" f            ", key), Span::styled("Filter (Shorts/Long) & Sort", desc)]),
-                Line::from(vec![Span::styled(" A            ", key), Span::styled("Phaenna Wrapped Analytics", desc)]),
+                Line::from(vec![Span::styled(" A            ", key), Span::styled("Phaenna Analysis Dashboard", desc)]),
                 Line::from(vec![Span::styled(" c            ", key), Span::styled("7-Day Upload Radar", desc)]),
             ],
         ),

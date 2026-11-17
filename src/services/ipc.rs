@@ -10,7 +10,7 @@ use crate::messages::AppMessage;
 use crate::services::shaders::{prepare_video_shaders_for, VideoMasteringProfile};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::path::Path;
 use std::time::Duration;
@@ -51,6 +51,10 @@ async fn connect_ipc(sock_path: &str) -> Option<IpcStream> {
 pub struct IpcMonitorConfig {
     pub session_id: u64,
     pub video_id: String,
+    pub channel_id: Option<String>,
+    pub channel_name: String,
+    pub duration_hint_secs: f64,
+    pub initial_pos_secs: f64,
     pub sock_path: String,
     pub pool: SqlitePool,
     pub tx: Sender<AppMessage>,
@@ -532,10 +536,72 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             let _ = writer.write_all(msg.as_bytes()).await;
         }
 
+        struct SessionTracker {
+            started_at: i64,
+            watched_wall_secs: f64,
+            watched_media_secs: f64,
+            current_speed: f64,
+            is_paused: bool,
+            sb_skipped_session: f64,
+            sb_cats: HashMap<String, f64>,
+        }
+
+        impl SessionTracker {
+            async fn flush(
+                &self,
+                config: &IpcMonitorConfig,
+                last_pos: f64,
+                last_dur: f64,
+                completed: bool,
+            ) {
+                if self.watched_wall_secs < 4.0 && !completed {
+                    return;
+                }
+                let cats_json = if self.sb_cats.is_empty() {
+                    "{}".to_string()
+                } else {
+                    serde_json::to_string(&self.sb_cats).unwrap_or_else(|_| "{}".into())
+                };
+                let _ = db::user::upsert_watch_session(
+                    &config.pool,
+                    &db::user::WatchSessionWrite {
+                        video_id: &config.video_id,
+                        channel_id: config.channel_id.as_deref(),
+                        channel_name: &config.channel_name,
+                        source: "local_ipc",
+                        started_at: self.started_at,
+                        ended_at: now_unix().max(self.started_at),
+                        watched_secs: self.watched_wall_secs,
+                        media_secs: self.watched_media_secs,
+                        start_pos_secs: config.initial_pos_secs,
+                        end_pos_secs: last_pos,
+                        video_duration_secs: last_dur,
+                        playback_speed: self.current_speed,
+                        sb_skipped_secs: self.sb_skipped_session,
+                        sb_categories_json: &cats_json,
+                        player: "mpv",
+                        completed,
+                    },
+                )
+                .await;
+            }
+        }
+
         let mut lines = BufReader::new(reader).lines();
-        let mut last_pos = 0.0f64;
-        let mut last_dur = 0.0f64;
+        let mut last_pos = config.initial_pos_secs;
+        let mut prev_pos = config.initial_pos_secs;
+        let mut last_dur = config.duration_hint_secs;
+        let mut tracker = SessionTracker {
+            started_at: now_unix(),
+            watched_wall_secs: 0.0,
+            watched_media_secs: 0.0,
+            current_speed: 1.0,
+            is_paused: false,
+            sb_skipped_session: 0.0,
+            sb_cats: HashMap::new(),
+        };
         let mut last_save = std::time::Instant::now();
+        let mut last_session_save = std::time::Instant::now();
         let mut last_ui_tick = std::time::Instant::now();
         let mut skipped_uuids: HashSet<String> = HashSet::new();
         let mut marked_watched = false;
@@ -568,6 +634,15 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                 }
                             }
                             "time-pos" => {
+                                if !tracker.is_paused && prev_pos > 0.0 {
+                                    let dt = val - prev_pos;
+                                    if dt > 0.0 && dt <= 6.0 {
+                                        tracker.watched_media_secs += dt;
+                                        tracker.watched_wall_secs +=
+                                            dt / tracker.current_speed.clamp(0.25, 4.0);
+                                    }
+                                }
+                                prev_pos = val;
                                 last_pos = val;
 
                                 if let Some(seg) = check_skip_interval_with_duration(
@@ -588,6 +663,9 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                     );
                                     if writer.write_all(seek_cmd.as_bytes()).await.is_ok() {
                                         let saved = (target_end - seg.start_time).max(0.0);
+                                        tracker.sb_skipped_session += saved;
+                                        *tracker.sb_cats.entry(seg.category.clone()).or_insert(0.0) +=
+                                            saved;
                                         let _ = db::user::add_sponsorblock_saved_secs(&config.pool, saved).await;
                                         let _ = config
                                             .tx
@@ -602,6 +680,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
 
                                 if !marked_watched && is_completion_threshold_reached(last_pos, last_dur) {
                                     marked_watched = true;
+                                    tracker.flush(&config, last_pos, last_dur, true).await;
                                     let _ = db::user::record_watched(
                                         &config.pool,
                                         None,
@@ -640,12 +719,24 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                     )
                                     .await;
                                 }
+
+                                if last_session_save.elapsed() >= Duration::from_secs(10) {
+                                    last_session_save = std::time::Instant::now();
+                                    tracker
+                                        .flush(&config, last_pos, last_dur, marked_watched)
+                                        .await;
+                                }
                             }
                             _ => {}
                         }
                     }
 
                     if let Some(ev) = parse_live_ipc_event(&line) {
+                        match ev {
+                            LiveIpcEvent::Paused(p) => tracker.is_paused = p,
+                            LiveIpcEvent::Speed(s) => tracker.current_speed = s.clamp(0.25, 4.0),
+                            _ => {}
+                        }
                         let _ = config
                             .tx
                             .send(AppMessage::PlaybackTelemetryUpdated {
@@ -658,7 +749,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             }
         }
 
-        // Persist final position when mpv closes
+        // Persist final position and session telemetry when mpv closes
         if last_pos > 3.0 {
             let _ = db::user::save_playback_progress(
                 &config.pool,
@@ -669,6 +760,14 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             )
             .await;
         }
+        tracker
+            .flush(
+                &config,
+                last_pos,
+                last_dur,
+                marked_watched || is_completion_threshold_reached(last_pos, last_dur),
+            )
+            .await;
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(&config.sock_path);

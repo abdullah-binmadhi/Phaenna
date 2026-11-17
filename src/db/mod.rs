@@ -42,6 +42,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     for schema in [
         include_str!("../../migrations/001_initial.sql"),
         include_str!("../../migrations/002_google_auth.sql"),
+        include_str!("../../migrations/003_analysis_sessions.sql"),
     ] {
         for stmt in schema.split(';') {
             let trimmed = stmt.trim();
@@ -73,6 +74,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .await?;
     ensure_column_exists(pool, "videos", "published_text", "TEXT").await?;
+    ensure_column_exists(
+        pool,
+        "watch_history",
+        "origin",
+        "TEXT NOT NULL DEFAULT 'youtube_sync'",
+    )
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS user_video_comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,6 +232,7 @@ mod tests {
             "videos",
             "watch_history",
             "watch_later",
+            "watch_sessions",
         ] {
             assert!(
                 names.contains(&expected.to_string()),

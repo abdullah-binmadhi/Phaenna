@@ -299,9 +299,9 @@ pub fn footer_action_at(footer_area: Rect, col: u16, row: u16) -> Option<HomeFoo
             Some(HomeFooterAction::Search)
         } else if rel_col < 28 {
             Some(HomeFooterAction::Calendar)
-        } else if rel_col < 42 {
+        } else if rel_col < 43 {
             Some(HomeFooterAction::Analytics)
-        } else if rel_col < 55 {
+        } else if rel_col < 56 {
             Some(HomeFooterAction::Remote)
         } else {
             Some(HomeFooterAction::Cast)
@@ -1542,7 +1542,7 @@ fn render_footer_dock(frame: &mut Frame, area: Rect, state: &AppState) {
     let row1 = Line::from(vec![
         Span::styled(" / ", key), Span::styled(" Search   ", txt),
         Span::styled(" c ", sec), Span::styled(" Calendar   ", txt),
-        Span::styled(" A ", sec), Span::styled(" Wrapped   ", txt),
+        Span::styled(" A ", sec), Span::styled(" Analysis  ", txt),
         Span::styled(" m ", key), Span::styled(" Remote   ", txt),
         Span::styled(" C ", sec), Span::styled(" TV Cast ", txt),
         Span::styled("  ·  ", Style::default().fg(theme.divider)),

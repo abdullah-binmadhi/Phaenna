@@ -11,7 +11,10 @@ use crate::db::cache::VideoItem;
 use crate::db::sync::{
     HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED, SUBSCRIPTIONS, WATCH_LATER,
 };
-use crate::db::user::{ContinueWatchingMeta, UserAnalytics, WatchLaterSource};
+use crate::db::user::{
+    AnalysisChannelSort, AnalysisRange, AnalysisTab, ContinueWatchingMeta, UserAnalytics,
+    WatchLaterSource,
+};
 use crate::services::auth::{AuthVault, LoginUiState};
 use crate::services::calendar::{compute_week_bounds, local_tz_offset_secs, CalendarFilter, WeekBounds};
 use crate::services::cast::CastDevice;
@@ -24,6 +27,17 @@ use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisHit {
+    SelectTab(AnalysisTab),
+    SelectRange(AnalysisRange),
+    ToggleYtSync,
+    CycleChannelSort,
+    BudgetDelta(i32),
+    SelectChannel(usize),
+    SelectSession(usize),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -314,6 +328,12 @@ pub struct AppState {
     // Intelligence & Services
     pub analytics: UserAnalytics,
     pub analytics_loaded: bool,
+    pub analysis_tab: AnalysisTab,
+    pub analysis_range: AnalysisRange,
+    pub analysis_include_yt_sync: bool,
+    pub analysis_channel_sort: AnalysisChannelSort,
+    pub analysis_cursor: usize,
+    pub analysis_hitboxes: Vec<(Rect, AnalysisHit)>,
     pub calendar_bounds: WeekBounds,
     pub calendar_day_cursor: usize,
     pub calendar_item_cursor: usize,
@@ -481,6 +501,12 @@ impl AppState {
 
             analytics: UserAnalytics::default(),
             analytics_loaded: false,
+            analysis_tab: AnalysisTab::Overview,
+            analysis_range: AnalysisRange::Days7,
+            analysis_include_yt_sync: false,
+            analysis_channel_sort: AnalysisChannelSort::Hours,
+            analysis_cursor: 0,
+            analysis_hitboxes: Vec::new(),
             calendar_bounds: compute_week_bounds(now_unix, 0, 0),
             calendar_day_cursor: 0,
             calendar_item_cursor: 0,
@@ -1614,7 +1640,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::PlayOptions => (92, 80),
         ActiveOverlay::Settings => (82, 74),
         ActiveOverlay::Help => (80, 74),
-        ActiveOverlay::Analytics => (92, 88),
+        ActiveOverlay::Analytics => (94, 90),
         ActiveOverlay::Calendar => (90, 84),
         ActiveOverlay::Remote => (64, 78),
         ActiveOverlay::Cast => (68, 60),
