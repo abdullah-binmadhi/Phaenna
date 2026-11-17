@@ -92,6 +92,13 @@ pub enum AppMessage {
         parent_comment_id: Option<String>,
         synced_remote: bool,
     },
+    CommentTranslated {
+        comment_id: String,
+        target_lang: String,
+        source_lang: Option<String>,
+        translated_text: Option<String>,
+        error: Option<String>,
+    },
 
     // Thumbnail Pipeline
     ThumbnailReady {

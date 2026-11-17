@@ -28,7 +28,6 @@ pub enum HubActionId {
     CastScan,
     GoogleAccountHub,
     UploadRadar,
-    SystemDoctor,
     CheckUpdates,
     AutoUpdateMode,
 }
@@ -173,14 +172,6 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             keywords: "calendar uploads schedule radar week",
             badge: "[ Open (c) ]".to_string(),
             description: "Open the local-timezone Mon-Sun upload schedule for subscriptions.",
-        },
-        HubItem {
-            id: HubActionId::SystemDoctor,
-            category: "ACCOUNT & TOOLS",
-            label: "System Doctor Diagnostics",
-            keywords: "doctor setup check yt-dlp mpv ffmpeg dependencies",
-            badge: "[ Inspect (!) ]".to_string(),
-            description: "Verify runtime binary installation health and platform telemetry.",
         },
         HubItem {
             id: HubActionId::CheckUpdates,

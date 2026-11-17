@@ -12,8 +12,6 @@ pub mod play_options;
 pub mod remote;
 pub mod search;
 pub mod settings;
-pub mod setup;
-pub mod tailored;
 pub mod theme;
 pub mod update_modal;
 
@@ -37,11 +35,7 @@ pub fn render_app(frame: &mut Frame, state: &mut AppState) {
         ActiveOverlay::PlayOptions => play_options::render_play_options_modal(frame, state),
         ActiveOverlay::Settings => settings::render_settings_modal(frame, state),
         ActiveOverlay::Help => help::render_help_modal(frame, state),
-        ActiveOverlay::Setup => setup::render_setup_modal(frame, state),
         ActiveOverlay::Analytics => analytics::render_analytics_modal(frame, state),
-        ActiveOverlay::TailoredWizard => tailored::render_tailored_wizard(frame, state),
-        ActiveOverlay::TailoredSummary => tailored::render_tailored_summary(frame, state),
-        ActiveOverlay::TailoredResults => tailored::render_tailored_results(frame, state),
         ActiveOverlay::Calendar => calendar::render_calendar_modal(frame, state),
         ActiveOverlay::Remote => remote::render_remote_modal(frame, state),
         ActiveOverlay::Cast => cast::render_cast_modal(frame, state),

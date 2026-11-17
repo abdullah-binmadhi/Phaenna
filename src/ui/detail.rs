@@ -1372,18 +1372,20 @@ fn render_comments_panel(
 ) {
     state.detail_comments_panel_rect = area;
 
-    let focused = state.detail_focus_pane == 2 || state.detail_comment_composing;
+    let focused = state.detail_focus_pane == 2
+        || state.detail_comment_composing
+        || state.detail_translate_editing;
     let total = state.detail_comments.len();
-    let title = if state.detail_comment_composing {
+    let title = if state.detail_translate_editing {
+        format!(" Comments ({total}) [Translate Language] ")
+    } else if state.detail_comment_composing {
         if let Some(ref rt) = state.detail_reply_target {
             format!(" Comments ({total}) [Replying to {}] ", rt.author)
         } else {
             format!(" Comments ({total}) [WRITING · Enter Post · Esc Cancel] ")
         }
-    } else if focused {
-        format!(" Comments ({total}) · Reddit Tree [j/k · h/l Fold · r Reply] ")
     } else {
-        format!(" Comments ({total}) · Reddit Tree [Tab / r Reply / m New] ")
+        format!(" Comments ({total}) ")
     };
 
     let blk = Block::default()
@@ -1425,28 +1427,34 @@ fn render_comments_panel(
 
     state.detail_comment_composer_rect = chunks[0];
 
-    // 1. Composer Box (Top-Level Comment OR Sub-Comment Reply)
-    let comp_border = if state.detail_comment_composing {
+    // 1. Composer Box OR Inline Translation Target Language Picker
+    let comp_border = if state.detail_translate_editing {
+        pal.secondary
+    } else if state.detail_comment_composing {
         pal.accent
     } else {
         pal.border_idle
     };
-    let comp_title = if state.detail_comment_composing {
+    let comp_title = if state.detail_translate_editing {
+        " Translate To Any Language (e.g. Arabic, Japanese, es, fr, ko + Enter) ".to_string()
+    } else if state.detail_comment_composing {
         if let Some(ref rt) = state.detail_reply_target {
             format!(" Replying to {} (Enter Post · Esc Cancel) ", rt.author)
         } else {
             " New Comment (Enter Post · Esc Cancel) ".to_string()
         }
     } else if state.auth_vault.active_account().is_some() {
-        " [m] Comment · [r] Reply to Selected Node ".to_string()
+        " [m] Comment · [r] Reply · [t] Translate ".to_string()
     } else {
-        " [m] Comment · [r] Reply (Saved locally · Sign in [L] to sync) ".to_string()
+        " [m] Comment · [r] Reply · [t] Translate (Local save) ".to_string()
     };
     let comp_blk = Block::default()
         .title(Span::styled(
             truncate_word_boundary(&comp_title, chunks[0].width.saturating_sub(2) as usize),
             Style::default()
-                .fg(if state.detail_comment_composing {
+                .fg(if state.detail_translate_editing {
+                    pal.secondary
+                } else if state.detail_comment_composing {
                     pal.accent
                 } else {
                     pal.text_dim
@@ -1460,7 +1468,23 @@ fn render_comments_panel(
     frame.render_widget(comp_blk, chunks[0]);
 
     let comp_w = comp_inner.width.saturating_sub(2).max(10) as usize;
-    let comp_line = if state.detail_comment_composing {
+    let comp_line = if state.detail_translate_editing {
+        let total_chars = state.detail_translate_input.chars().count();
+        let tail: String = if total_chars > comp_w {
+            state
+                .detail_translate_input
+                .chars()
+                .skip(total_chars - comp_w)
+                .collect()
+        } else {
+            state.detail_translate_input.clone()
+        };
+        Line::from(vec![
+            Span::styled("Target: ", Style::default().fg(pal.secondary).add_modifier(Modifier::BOLD)),
+            Span::styled(tail, Style::default().fg(pal.text)),
+            Span::styled("_", Style::default().fg(pal.secondary).add_modifier(Modifier::BOLD)),
+        ])
+    } else if state.detail_comment_composing {
         let total_chars = state.detail_comment_input.chars().count();
         let tail: String = if total_chars > comp_w {
             state
@@ -1478,7 +1502,7 @@ fn render_comments_panel(
     } else {
         Line::from(Span::styled(
             truncate_word_boundary(
-                "Click or press [m] to comment · [r] replies to any thread or sub-comment",
+                "Click or press [m] to comment · [r] reply · [t] translate · [g] pick any language",
                 comp_w,
             ),
             Style::default().fg(pal.text_dim),
@@ -1486,11 +1510,15 @@ fn render_comments_panel(
     };
     frame.render_widget(Paragraph::new(comp_line), comp_inner);
 
-    // 2. Sort & Telemetry Bar
+    // 2. Sort & Translate Language Strip
     let sort_area = chunks[1];
     let top_active = state.detail_comment_sort == CommentSort::Top;
     let top_lbl = "[ Top ]";
     let new_lbl = "[ Newest ]";
+    let lang_badge = crate::api::translate::lang_badge(&state.detail_translate_lang);
+    let lang_pill = format!("[ Lang: {lang_badge} > ]");
+    let tr_sel_lbl = "[ t Translate ]";
+
     let top_st = if top_active {
         Style::default().fg(Color::Black).bg(pal.primary).add_modifier(Modifier::BOLD)
     } else {
@@ -1524,16 +1552,60 @@ fn render_comments_panel(
         .iter()
         .map(|c| (c.reply_count as usize).max(c.replies.len()))
         .sum();
-    let sort_line = Line::from(vec![
+    let count_seg = format!("  {total}·{total_replies}");
+    let left_used = top_w + 1 + new_w + count_seg.chars().count() as u16;
+    let lang_w = lang_pill.chars().count() as u16;
+    let tr_w = tr_sel_lbl.chars().count() as u16;
+
+    let mut sort_spans = vec![
         Span::styled(top_lbl, top_st),
         Span::raw(" "),
         Span::styled(new_lbl, new_st),
-        Span::styled(
-            format!("  ·  {total} threads · {total_replies} replies"),
-            Style::default().fg(pal.text_dim),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(sort_line), sort_area);
+        Span::styled(count_seg, Style::default().fg(pal.text_dim)),
+    ];
+
+    if left_used + lang_w + tr_w + 2 <= sort_area.width {
+        let pad = sort_area.width.saturating_sub(left_used + lang_w + tr_w + 1);
+        sort_spans.push(Span::raw(" ".repeat(pad as usize)));
+        let tr_x = sort_area.x + left_used + pad;
+        state.detail_hitboxes.push((
+            Rect::new(tr_x, sort_area.y, tr_w, 1),
+            DetailHit::TranslateNode(state.detail_comment_cursor),
+        ));
+        let lx = tr_x + tr_w + 1;
+        state.detail_hitboxes.push((
+            Rect::new(lx, sort_area.y, lang_w, 1),
+            DetailHit::EditTranslateLang,
+        ));
+        sort_spans.push(Span::styled(
+            tr_sel_lbl,
+            Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD),
+        ));
+        sort_spans.push(Span::raw(" "));
+        sort_spans.push(Span::styled(
+            lang_pill,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(56, 189, 248))
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if left_used + lang_w < sort_area.width {
+        let pad = sort_area.width.saturating_sub(left_used + lang_w);
+        sort_spans.push(Span::raw(" ".repeat(pad as usize)));
+        let lx = sort_area.x + left_used + pad;
+        state.detail_hitboxes.push((
+            Rect::new(lx, sort_area.y, lang_w, 1),
+            DetailHit::EditTranslateLang,
+        ));
+        sort_spans.push(Span::styled(
+            lang_pill,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(56, 189, 248))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(sort_spans)), sort_area);
 
     // 3. Flattened Multi-Depth Reddit Tree
     let list_area = chunks[2];
@@ -1574,6 +1646,7 @@ fn render_comments_panel(
         root_idx: usize,
         fold_col_range: Option<(u16, u16)>,
         reply_col_range: Option<(u16, u16)>,
+        translate_col_range: Option<(u16, u16)>,
     }
 
     let mut all_lines: Vec<Line<'static>> = Vec::new();
@@ -1710,17 +1783,33 @@ fn render_comments_panel(
         }
 
         let mut reply_col_range = None;
+        let mut translate_col_range = None;
         if sel {
             hdr_spans.push(Span::styled(" ", Style::default().bg(row_bg)));
             cursor_x += 1;
             let rep_lbl = "[Reply r]";
             let rw = rep_lbl.chars().count() as u16;
             reply_col_range = Some((cursor_x, rw));
+            cursor_x += rw;
             hdr_spans.push(Span::styled(
                 rep_lbl,
                 Style::default()
                     .fg(Color::Black)
                     .bg(pal.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+            hdr_spans.push(Span::styled(" ", Style::default().bg(row_bg)));
+            cursor_x += 1;
+            let is_translated = state.detail_comment_translations.contains_key(&c.id);
+            let tr_lbl = if is_translated { "[Orig t]" } else { "[Translate t]" };
+            let tw = tr_lbl.chars().count() as u16;
+            translate_col_range = Some((cursor_x, tw));
+            hdr_spans.push(Span::styled(
+                tr_lbl,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(56, 189, 248))
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -1731,21 +1820,72 @@ fn render_comments_panel(
         let body_w = (list_area.width as usize)
             .saturating_sub(body_prefix_cols + 1)
             .max(12);
-        for wrapped in wrap_words(&c.text, body_w) {
-            let (mut body_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
-            body_spans.push(Span::styled(
-                wrapped,
+        if state.detail_comment_translating.contains(&c.id) {
+            for wrapped in wrap_words(&c.text, body_w) {
+                let (mut body_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
+                body_spans.push(Span::styled(
+                    wrapped,
+                    Style::default().fg(pal.text_dim).bg(row_bg),
+                ));
+                all_lines.push(Line::from(body_spans));
+            }
+            let (mut tr_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
+            tr_spans.push(Span::styled(
+                format!(
+                    "[Translating to {}...]",
+                    crate::api::translate::lang_badge(&state.detail_translate_lang)
+                ),
                 Style::default()
-                    .fg(if sel {
-                        pal.text
-                    } else if node.depth == 0 {
-                        Color::Rgb(210, 216, 228)
-                    } else {
-                        Color::Rgb(192, 200, 214)
-                    })
-                    .bg(row_bg),
+                    .fg(Color::Rgb(56, 189, 248))
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
             ));
-            all_lines.push(Line::from(body_spans));
+            all_lines.push(Line::from(tr_spans));
+        } else if let Some(tr) = state.detail_comment_translations.get(&c.id) {
+            let src_tag = tr
+                .source_lang
+                .as_deref()
+                .map(crate::api::translate::lang_badge)
+                .map(|s| format!(" <- {s}"))
+                .unwrap_or_default();
+            let tgt_tag = crate::api::translate::lang_badge(&tr.target_lang);
+            let header_tag = format!("[{tgt_tag}{src_tag}]");
+            let (mut tag_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
+            tag_spans.push(Span::styled(
+                header_tag,
+                Style::default()
+                    .fg(Color::Rgb(56, 189, 248))
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            all_lines.push(Line::from(tag_spans));
+            for wrapped in wrap_words(&tr.text, body_w) {
+                let (mut body_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
+                body_spans.push(Span::styled(
+                    wrapped,
+                    Style::default()
+                        .fg(if sel { pal.text } else { Color::Rgb(218, 232, 248) })
+                        .bg(row_bg),
+                ));
+                all_lines.push(Line::from(body_spans));
+            }
+        } else {
+            for wrapped in wrap_words(&c.text, body_w) {
+                let (mut body_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
+                body_spans.push(Span::styled(
+                    wrapped,
+                    Style::default()
+                        .fg(if sel {
+                            pal.text
+                        } else if node.depth == 0 {
+                            Color::Rgb(210, 216, 228)
+                        } else {
+                            Color::Rgb(192, 200, 214)
+                        })
+                        .bg(row_bg),
+                ));
+                all_lines.push(Line::from(body_spans));
+            }
         }
 
         if node.depth == 0 && !node.collapsed {
@@ -1793,6 +1933,7 @@ fn render_comments_panel(
             root_idx: node.root_idx,
             fold_col_range,
             reply_col_range,
+            translate_col_range,
         });
     }
 
@@ -1827,6 +1968,14 @@ fn render_comments_panel(
                     None
                 }
             });
+            let translate_rect = m.translate_col_range.and_then(|(off_x, w)| {
+                let rx = list_area.x + off_x;
+                if rx < list_area.x + list_area.width {
+                    Some(Rect::new(rx, y0, w.min((list_area.x + list_area.width) - rx), 1))
+                } else {
+                    None
+                }
+            });
             state.detail_comment_node_hitboxes.push(CommentNodeHitbox {
                 y0,
                 y1,
@@ -1834,6 +1983,7 @@ fn render_comments_panel(
                 node_id: m.node_id,
                 fold_rect,
                 reply_rect,
+                translate_rect,
             });
         }
     }
@@ -1844,7 +1994,7 @@ fn render_comments_panel(
 fn render_footer_legend(frame: &mut Frame, area: Rect, state: &AppState, pal: &ThemePalette) {
     let enter_hint = match state.detail_focus_pane {
         1 => "[Enter] Play Chapter",
-        2 => "[r] Reply Node · [h/l] Fold · [m] New",
+        2 => "[r] Reply · [t] Translate · [g] Lang · [h/l] Fold",
         _ => "[Enter/Space] Play",
     };
     frame.render_widget(
@@ -1943,6 +2093,7 @@ mod tests {
             let text: String = buf.content().iter().map(|c| c.symbol()).collect();
             assert!(text.contains("Chapters (4)"), "Expected 4 parsed chapters in left column");
             assert!(text.contains("Comments (1)"), "Expected Comments panel");
+            assert!(!text.contains("Reddit Tree"), "Header must not show Reddit Tree label");
             assert!(text.contains("@viewer_one"), "Expected author inside Comments panel");
             assert!(text.contains("@reply_author"), "Expected nested reply author inside expanded thread");
             assert!(text.contains("@sub_replier"), "Expected level-2 sub-reply in Reddit tree");

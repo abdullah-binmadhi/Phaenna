@@ -53,14 +53,12 @@ const CW_ROW_HEIGHT: u16 = 3;
 pub enum HomeFooterAction {
     Search,
     Calendar,
-    Tailored,
     Analytics,
     Remote,
     Cast,
     Filter,
     Settings,
     Help,
-    Setup,
     Quit,
 }
 
@@ -297,15 +295,13 @@ pub fn footer_action_at(footer_area: Rect, col: u16, row: u16) -> Option<HomeFoo
     let rel_row = row - footer_area.y;
     let rel_col = col.saturating_sub(footer_area.x);
     if rel_row == 1 {
-        if rel_col < 14 {
+        if rel_col < 13 {
             Some(HomeFooterAction::Search)
-        } else if rel_col < 29 {
+        } else if rel_col < 28 {
             Some(HomeFooterAction::Calendar)
-        } else if rel_col < 45 {
-            Some(HomeFooterAction::Tailored)
-        } else if rel_col < 61 {
+        } else if rel_col < 42 {
             Some(HomeFooterAction::Analytics)
-        } else if rel_col < 76 {
+        } else if rel_col < 55 {
             Some(HomeFooterAction::Remote)
         } else {
             Some(HomeFooterAction::Cast)
@@ -313,11 +309,9 @@ pub fn footer_action_at(footer_area: Rect, col: u16, row: u16) -> Option<HomeFoo
     } else if rel_row == 2 {
         if rel_col < 19 {
             Some(HomeFooterAction::Filter)
-        } else if rel_col < 35 {
+        } else if rel_col < 34 {
             Some(HomeFooterAction::Settings)
-        } else if rel_col < 50 {
-            Some(HomeFooterAction::Setup)
-        } else if rel_col < 64 {
+        } else if rel_col < 47 {
             Some(HomeFooterAction::Help)
         } else {
             Some(HomeFooterAction::Quit)
@@ -1548,7 +1542,6 @@ fn render_footer_dock(frame: &mut Frame, area: Rect, state: &AppState) {
     let row1 = Line::from(vec![
         Span::styled(" / ", key), Span::styled(" Search   ", txt),
         Span::styled(" c ", sec), Span::styled(" Calendar   ", txt),
-        Span::styled(" t ", key), Span::styled(" Discover   ", txt),
         Span::styled(" A ", sec), Span::styled(" Wrapped   ", txt),
         Span::styled(" m ", key), Span::styled(" Remote   ", txt),
         Span::styled(" C ", sec), Span::styled(" TV Cast ", txt),
@@ -1558,7 +1551,6 @@ fn render_footer_dock(frame: &mut Frame, area: Rect, state: &AppState) {
     let row2 = Line::from(vec![
         Span::styled(" f ", sec), Span::styled(format!(" {} ", state.content_filter.label()), txt),
         Span::styled(" s ", key), Span::styled(" Fuzzy Hub  ", txt),
-        Span::styled(" ! ", sec), Span::styled(" Doctor    ", txt),
         Span::styled(" ? ", key), Span::styled(" Matrix   ", txt),
         Span::styled(" q ", sec), Span::styled(" Quit     ", txt),
         Span::styled("  ·  ", Style::default().fg(theme.divider)),

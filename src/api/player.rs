@@ -18,8 +18,6 @@ pub struct DependencyStatus {
     pub has_iina: bool,
     pub has_vlc: bool,
     pub has_ffmpeg: bool,
-    pub ytdlp_path: Option<PathBuf>,
-    pub mpv_path: Option<PathBuf>,
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -87,8 +85,8 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 }
 
 pub fn detect_dependencies() -> DependencyStatus {
-    let ytdlp_path = find_binary("yt-dlp");
-    let mpv_path = find_binary("mpv");
+    let has_ytdlp = find_binary("yt-dlp").is_some();
+    let has_mpv = find_binary("mpv").is_some();
     let has_iina = find_binary("iina-cli").is_some()
         || find_binary("iina").is_some()
         || Path::new("/Applications/IINA.app").exists();
@@ -97,13 +95,11 @@ pub fn detect_dependencies() -> DependencyStatus {
     let has_ffmpeg = find_binary("ffmpeg").is_some();
 
     DependencyStatus {
-        has_ytdlp: ytdlp_path.is_some(),
-        has_mpv: mpv_path.is_some(),
+        has_ytdlp,
+        has_mpv,
         has_iina,
         has_vlc,
         has_ffmpeg,
-        ytdlp_path,
-        mpv_path,
     }
 }
 
@@ -488,7 +484,7 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
         Player::Mpv => {
             let bin = find_binary("mpv").ok_or_else(|| {
                 AppError::Player(
-                    "mpv was not found in PATH. Install mpv or switch player with [!] Setup."
+                    "mpv was not found in PATH. Install mpv or switch player in [p] Playback Studio."
                         .to_string(),
                 )
             })?;

@@ -1,4 +1,4 @@
-//! Phaenna v1.0.0 — Zero-Lag Native Rust Terminal Video Theatre & Discovery Crucible.
+//! Phaenna v1.0.0 — Zero-Lag Native Rust Terminal Video Theatre.
 
 mod api;
 mod config;
@@ -19,6 +19,9 @@ use crate::api::innertube::{
 };
 use crate::api::player::{
     detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
+};
+use crate::api::translate::{
+    next_preset_lang, normalize_target_lang, prev_preset_lang, translate_text,
 };
 use crate::api::sponsorblock::{
     fetch_sponsor_segments, filter_segments_for_mode_with_outro, from_db_rows, to_db_rows,
@@ -63,14 +66,13 @@ use crate::services::ipc::{
 };
 use crate::services::remote::start_remote_server;
 use crate::services::shaders::{download_neural_shader_pack, VideoMasteringProfile};
-use crate::services::tailored::{build_questions, score_discovery_pool};
 use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
 };
 use crate::state::{
-    ActiveOverlay, AppState, Category, ContentFilter, DetailHit, DetailViewMode,
-    DownloadJobState, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen, SearchHit, SearchScope,
-    SearchSortOrder, SearchTypeFilter, ShortsSource, SortOrder,
+    ActiveOverlay, AppState, Category, CommentTranslation, ContentFilter, DetailHit,
+    DetailViewMode, DownloadJobState, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen,
+    SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter, ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::help::confirm_quit_button_rects;
@@ -1641,6 +1643,27 @@ async fn handle_app_message(
                 state.show_toast("Comment posted to YouTube!");
             }
         }
+        AppMessage::CommentTranslated {
+            comment_id,
+            target_lang,
+            source_lang,
+            translated_text,
+            error,
+        } => {
+            state.detail_comment_translating.remove(&comment_id);
+            if let Some(text) = translated_text {
+                state.detail_comment_translations.insert(
+                    comment_id,
+                    CommentTranslation {
+                        target_lang,
+                        source_lang,
+                        text,
+                    },
+                );
+            } else if let Some(err) = error {
+                state.show_toast(format!("Translate failed: {err}"));
+            }
+        }
         AppMessage::ThumbnailReady {
             video_id, image, ..
         } => {
@@ -2252,6 +2275,10 @@ fn open_detail_for_video(
     state.detail_comment_last_click = None;
     state.detail_last_node_click = None;
     state.detail_hitboxes.clear();
+    state.detail_translate_editing = false;
+    state.detail_translate_input.clear();
+    state.detail_comment_translations.clear();
+    state.detail_comment_translating.clear();
     state.overlay = ActiveOverlay::None;
     state.screen = Screen::Detail;
 
@@ -2857,11 +2884,86 @@ async fn open_analytics(state: &mut AppState, pool: &SqlitePool) {
     state.overlay = ActiveOverlay::Analytics;
 }
 
-fn recompute_tailored_pool(state: &mut AppState) {
-    let pool_videos = state.all_known_videos();
-    state.tailored_matches =
-        score_discovery_pool(&pool_videos, &state.config.tailored_answers, &state.live_tuner);
-    state.tailored_cursor = 0;
+fn spawn_translate_comment(
+    comment_id: String,
+    text: String,
+    target_lang: String,
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    if state.detail_comment_translating.contains(&comment_id) {
+        return;
+    }
+    state.detail_comment_translating.insert(comment_id.clone());
+    let c_tr = client.clone();
+    let tx_tr = tx.clone();
+    tokio::spawn(async move {
+        let msg = match translate_text(&c_tr, &text, &target_lang).await {
+            Ok((translated, src)) => AppMessage::CommentTranslated {
+                comment_id,
+                target_lang,
+                source_lang: src,
+                translated_text: Some(translated),
+                error: None,
+            },
+            Err(e) => AppMessage::CommentTranslated {
+                comment_id,
+                target_lang,
+                source_lang: None,
+                translated_text: None,
+                error: Some(e.to_string()),
+            },
+        };
+        let _ = tx_tr.send(msg).await;
+    });
+}
+
+fn toggle_translate_comment_node(
+    flat_idx: usize,
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let flat = state.build_comment_tree();
+    let Some(node) = flat.get(flat_idx) else {
+        return;
+    };
+    let cid = node.comment.id.clone();
+    let target = state.detail_translate_lang.clone();
+    if let Some(existing) = state.detail_comment_translations.get(&cid) {
+        if existing.target_lang.eq_ignore_ascii_case(&target) {
+            state.detail_comment_translations.remove(&cid);
+            return;
+        }
+    }
+    let body = node.comment.text.clone();
+    spawn_translate_comment(cid, body, target, state, tx, client);
+}
+
+fn translate_focused_thread(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let flat = state.build_comment_tree();
+    let Some(cur_node) = flat.get(state.detail_comment_cursor) else {
+        return;
+    };
+    let root_id = cur_node.root_id.clone();
+    let target = state.detail_translate_lang.clone();
+    let nodes: Vec<(String, String)> = flat
+        .into_iter()
+        .filter(|n| n.root_id == root_id)
+        .map(|n| (n.comment.id, n.comment.text))
+        .collect();
+    for (cid, body) in nodes {
+        spawn_translate_comment(cid, body, target.clone(), state, tx, client);
+    }
+    state.show_toast(format!(
+        "Translating thread to {}...",
+        crate::api::translate::lang_badge(&state.detail_translate_lang)
+    ));
 }
 
 fn spawn_offline_download(video: &VideoItem, state: &mut AppState, pool: &SqlitePool, tx: &mpsc::Sender<AppMessage>) {
@@ -2977,10 +3079,6 @@ async fn execute_hub_action(
         HubActionId::UploadRadar => {
             state.sync_calendar_tz(pool).await;
             state.overlay = ActiveOverlay::Calendar;
-        }
-        HubActionId::SystemDoctor => {
-            state.deps = detect_dependencies();
-            state.overlay = ActiveOverlay::Setup;
         }
         HubActionId::CheckUpdates => {
             state.overlay = ActiveOverlay::Update;
@@ -3827,6 +3925,17 @@ async fn handle_mouse_event(
                                 state.detail_comment_sort = sort;
                                 state.detail_comment_cursor = 0;
                             }
+                            DetailHit::EditTranslateLang => {
+                                state.detail_focus_pane = 2;
+                                state.detail_comment_composing = false;
+                                state.detail_translate_editing = true;
+                                state.detail_translate_input.clear();
+                            }
+                            DetailHit::TranslateNode(idx) => {
+                                state.detail_focus_pane = 2;
+                                state.detail_comment_cursor = idx;
+                                toggle_translate_comment_node(idx, state, tx, client);
+                            }
                             DetailHit::FocusPane(_) => {}
                         }
                         return true;
@@ -3836,12 +3945,14 @@ async fn handle_mouse_event(
                         state.detail_reply_target = None;
                         state.detail_comment_input.clear();
                         state.detail_comment_composing = true;
+                        state.detail_translate_editing = false;
                         state.detail_last_node_click = None;
                         return true;
                     }
                     if in_rect(state.detail_comments_panel_rect) {
                         state.detail_focus_pane = 2;
                         state.detail_comment_composing = false;
+                        state.detail_translate_editing = false;
                         if let Some(nh) = state
                             .detail_comment_node_hitboxes
                             .iter()
@@ -3852,6 +3963,11 @@ async fn handle_mouse_event(
                             if nh.reply_rect.map(&in_rect).unwrap_or(false) {
                                 state.detail_last_node_click = None;
                                 begin_reply_to_selected_node(state);
+                                return true;
+                            }
+                            if nh.translate_rect.map(&in_rect).unwrap_or(false) {
+                                state.detail_last_node_click = None;
+                                toggle_translate_comment_node(nh.flat_idx, state, tx, client);
                                 return true;
                             }
                             if nh.fold_rect.map(&in_rect).unwrap_or(false) {
@@ -4004,13 +4120,11 @@ async fn handle_mouse_event(
                         state.sync_calendar_tz(pool).await;
                         state.overlay = ActiveOverlay::Calendar;
                     }
-                    HomeFooterAction::Tailored => state.overlay = ActiveOverlay::TailoredWizard,
                     HomeFooterAction::Analytics => open_analytics(state, pool).await,
                     HomeFooterAction::Remote => state.overlay = ActiveOverlay::Remote,
                     HomeFooterAction::Cast => execute_hub_action(HubActionId::CastScan, state, pool, tx, client).await,
                     HomeFooterAction::Filter => state.overlay = ActiveOverlay::Filter,
                     HomeFooterAction::Settings => state.overlay = ActiveOverlay::Settings,
-                    HomeFooterAction::Setup => state.overlay = ActiveOverlay::Setup,
                     HomeFooterAction::Help => state.overlay = ActiveOverlay::Help,
                     HomeFooterAction::Quit => open_confirm_quit(state),
                 }
@@ -4210,6 +4324,60 @@ async fn handle_key_event(
                 return false;
             }
 
+            if state.detail_translate_editing {
+                match code {
+                    KeyCode::Esc => {
+                        state.detail_translate_editing = false;
+                        state.detail_translate_input.clear();
+                    }
+                    KeyCode::Left => {
+                        state.detail_translate_lang =
+                            prev_preset_lang(&state.detail_translate_lang);
+                        state.detail_comment_translations.clear();
+                        state.show_toast(format!(
+                            "Translate target -> {}",
+                            crate::api::translate::lang_badge(&state.detail_translate_lang)
+                        ));
+                    }
+                    KeyCode::Right => {
+                        state.detail_translate_lang =
+                            next_preset_lang(&state.detail_translate_lang);
+                        state.detail_comment_translations.clear();
+                        state.show_toast(format!(
+                            "Translate target -> {}",
+                            crate::api::translate::lang_badge(&state.detail_translate_lang)
+                        ));
+                    }
+                    KeyCode::Backspace => {
+                        state.detail_translate_input.pop();
+                    }
+                    KeyCode::Enter => {
+                        let typed = state.detail_translate_input.trim().to_string();
+                        if !typed.is_empty() {
+                            state.detail_translate_lang = normalize_target_lang(&typed);
+                            state.detail_comment_translations.clear();
+                            state.show_toast(format!(
+                                "Translate target -> {}",
+                                crate::api::translate::lang_badge(&state.detail_translate_lang)
+                            ));
+                            toggle_translate_comment_node(
+                                state.detail_comment_cursor,
+                                state,
+                                tx,
+                                client,
+                            );
+                        }
+                        state.detail_translate_editing = false;
+                        state.detail_translate_input.clear();
+                    }
+                    KeyCode::Char(c) if state.detail_translate_input.len() < 24 => {
+                        state.detail_translate_input.push(c);
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+
             match code {
                 KeyCode::Esc | KeyCode::Backspace => {
                     if let Some(prev) = state.detail_history.pop() {
@@ -4239,6 +4407,21 @@ async fn handle_key_event(
                     state.detail_reply_target = None;
                     state.detail_comment_input.clear();
                     state.detail_comment_composing = true;
+                    state.detail_translate_editing = false;
+                }
+                KeyCode::Char('t') => {
+                    state.detail_focus_pane = 2;
+                    toggle_translate_comment_node(state.detail_comment_cursor, state, tx, client);
+                }
+                KeyCode::Char('T') => {
+                    state.detail_focus_pane = 2;
+                    translate_focused_thread(state, tx, client);
+                }
+                KeyCode::Char('g') => {
+                    state.detail_focus_pane = 2;
+                    state.detail_comment_composing = false;
+                    state.detail_translate_editing = true;
+                    state.detail_translate_input.clear();
                 }
                 KeyCode::Char('u') => {
                     toggle_video_vote(VideoVote::Liked, state, pool, tx, client).await;
@@ -4413,10 +4596,6 @@ async fn handle_key_event(
             state.login_ui.error_banner = None;
             state.overlay = ActiveOverlay::Login;
         }
-        KeyCode::Char('!') => {
-            state.deps = detect_dependencies();
-            state.overlay = ActiveOverlay::Setup;
-        }
         KeyCode::Char('f') => state.overlay = ActiveOverlay::Filter,
         KeyCode::Char('p') => state.overlay = ActiveOverlay::PlayOptions,
         KeyCode::Char('A') => open_analytics(state, pool).await,
@@ -4424,10 +4603,6 @@ async fn handle_key_event(
             if let Some(v) = state.current_home_video() {
                 pin_video_to_continue_watching(&v, state, pool).await;
             }
-        }
-        KeyCode::Char('t') => {
-            recompute_tailored_pool(state);
-            state.overlay = ActiveOverlay::TailoredWizard;
         }
         KeyCode::Char('c') => {
             state.sync_calendar_tz(pool).await;
@@ -4643,19 +4818,6 @@ async fn handle_overlay_key(
                 state.overlay = ActiveOverlay::Settings;
             }
         }
-        ActiveOverlay::Setup => match code {
-            KeyCode::Esc | KeyCode::Char('!') => state.overlay = ActiveOverlay::None,
-            KeyCode::Char('r') => {
-                state.deps = detect_dependencies();
-                state.show_toast("Re-scanned runtime binaries");
-            }
-            KeyCode::Char('L') => {
-            state.login_ui.step = LoginStep::Hub;
-            state.login_ui.error_banner = None;
-            state.overlay = ActiveOverlay::Login;
-        }
-            _ => {}
-        },
         ActiveOverlay::Login => {
             handle_login_overlay_key(code, modifiers, state, pool, tx, client).await;
         }
@@ -4992,100 +5154,6 @@ async fn handle_overlay_key(
         ActiveOverlay::Analytics => match code {
             KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => state.overlay = ActiveOverlay::None,
             KeyCode::Char('r') => open_analytics(state, pool).await,
-            _ => {}
-        },
-        ActiveOverlay::TailoredWizard => {
-            let questions = build_questions();
-            let step = state.wizard_step.min(questions.len() - 1);
-            let q = &questions[step];
-            match code {
-                KeyCode::Esc => state.overlay = ActiveOverlay::None,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    state.wizard_cursor = state.wizard_cursor.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    state.wizard_cursor = (state.wizard_cursor + 1).min(q.options.len() - 1);
-                }
-                KeyCode::Char(' ') if q.is_multi_select => {
-                    if state.config.tailored_answers.deal_breakers.contains(&state.wizard_cursor) {
-                        state.config.tailored_answers.deal_breakers.remove(&state.wizard_cursor);
-                    } else {
-                        state.config.tailored_answers.deal_breakers.insert(state.wizard_cursor);
-                    }
-                    let _ = state.config.save();
-                }
-                KeyCode::Char('s') => {
-                    recompute_tailored_pool(state);
-                    state.overlay = ActiveOverlay::TailoredResults;
-                }
-                KeyCode::Enter => {
-                    if !q.is_multi_select && step < 5 {
-                        state.config.tailored_answers.choices[step] = state.wizard_cursor;
-                        let _ = state.config.save();
-                    }
-                    if step + 1 < questions.len() {
-                        state.wizard_step += 1;
-                        state.wizard_cursor = 0;
-                    } else {
-                        recompute_tailored_pool(state);
-                        state.overlay = ActiveOverlay::TailoredSummary;
-                    }
-                }
-                _ => {}
-            }
-        }
-        ActiveOverlay::TailoredSummary => match code {
-            KeyCode::Esc => state.overlay = ActiveOverlay::None,
-            KeyCode::Char('r') => {
-                state.wizard_step = 0;
-                state.wizard_cursor = 0;
-                state.overlay = ActiveOverlay::TailoredWizard;
-            }
-            KeyCode::Enter => {
-                recompute_tailored_pool(state);
-                state.overlay = ActiveOverlay::TailoredResults;
-            }
-            _ => {}
-        },
-        ActiveOverlay::TailoredResults => match code {
-            KeyCode::Esc | KeyCode::Char('t') => state.overlay = ActiveOverlay::None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                state.tailored_cursor = state.tailored_cursor.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !state.tailored_matches.is_empty() {
-                    state.tailored_cursor =
-                        (state.tailored_cursor + 1).min(state.tailored_matches.len() - 1);
-                }
-            }
-            KeyCode::Char('v') => {
-                state.live_tuner.cycle_tier();
-                recompute_tailored_pool(state);
-            }
-            KeyCode::Char('s') => {
-                state.live_tuner.exclude_shorts = !state.live_tuner.exclude_shorts;
-                recompute_tailored_pool(state);
-            }
-            KeyCode::Char('x') => {
-                if let Some(m) = state.tailored_matches.get(state.tailored_cursor) {
-                    state.live_tuner.dismissed_ids.insert(m.video.id.clone());
-                    recompute_tailored_pool(state);
-                }
-            }
-            KeyCode::Char('0') => {
-                state.live_tuner.clear_adjustments();
-                recompute_tailored_pool(state);
-            }
-            KeyCode::Char('z') => {
-                state.wizard_step = 0;
-                state.wizard_cursor = 0;
-                state.overlay = ActiveOverlay::TailoredWizard;
-            }
-            KeyCode::Enter => {
-                if let Some(m) = state.tailored_matches.get(state.tailored_cursor).cloned() {
-                    open_detail_for_video(m.video, state, pool, tx, client);
-                }
-            }
             _ => {}
         },
         ActiveOverlay::Calendar => match code {

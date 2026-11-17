@@ -693,8 +693,6 @@ pub struct Config {
     pub update: UpdateConfig,
     #[serde(default)]
     pub subtitle_style: crate::services::substyler::SubtitleStyleConfig,
-    #[serde(default)]
-    pub tailored_answers: crate::services::tailored::TailoredAnswers,
 }
 
 impl Default for Config {
@@ -722,7 +720,6 @@ impl Default for Config {
             cast: CastConfig::default(),
             update: UpdateConfig::default(),
             subtitle_style: crate::services::substyler::SubtitleStyleConfig::default(),
-            tailored_answers: crate::services::tailored::TailoredAnswers::default(),
         }
     }
 }

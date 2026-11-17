@@ -92,8 +92,8 @@ Finding the exact video is instant, accurate, and interactive from the first key
 - **Effortless Google Sign-In (`L`)**: Split-window SSO, Chrome sign-in, QR Device Code, or in-app verification kept safely on your machine.
 - **More Crafted Experiences**:
   - `[A]` **Phaenna Wrapped Analytics**: Visual watch habits, circadian rhythm, 26-week thermal heatmap, and SponsorBlock time saved.
-  - `[t]` **Discovery Crucible**: Interactive taste tuner tailored to your mood.
-  - `[m]` **Mobile LAN Remote** via instant QR code, `[C]` **AirPlay 2 & Smart TV Cast**, `[D]` **Offline Vault**, `[s]` **Fuzzy Command Hub**, `[!]` **System Doctor**, and `[U]` **Updater**.
+  - `[t]` **Comment Translator** (Detail Deck): Translate comments or full threads into any language (`g` to pick/type any language).
+  - `[m]` **Mobile LAN Remote** via instant QR code, `[C]` **AirPlay 2 & Smart TV Cast**, `[D]` **Offline Vault**, `[s]` **Fuzzy Command Hub**, and `[U]` **Updater**.
 
 ---
 
@@ -186,16 +186,16 @@ foreach ($id in @("wez.wezterm","Microsoft.WindowsTerminal","shinchiro.mpv","Vid
 | | `X` / `v` | Clear finished items / toggle Deck vs. Grid layout |
 | **Playback & Mastering** | `Space` | Play immediately in active player (`mpv` / `IINA` / `VLC`) with YouTube keybindings |
 | | `p` | Playback Studio (`d` Dubbed/Original, `m` Performance Mode, `t` 120Hz Motion, `s` 4K Shaders) |
-| | `Enter` / `i` | Open Bento Detail Command Deck (`Tab` switches Chapters / Up Next, `c` drills into Channel) |
+| | `Enter` / `i` | Open Bento Detail Command Deck (`Tab` Chapters, `t`/`T` Translate comment/thread, `g` Pick language, `c` Channel) |
 | | `w` / `D` | Toggle Watch Later / Download to Offline Vault |
 | **Discovery & Hubs** | `/` | Search Studio (Live Suggestions `Tab`, `Ctrl+t/d/u/s/w/g` Filters & Sort, `Ctrl+p` Play, `Ctrl+a` Queue) |
 | | `c` | 7-Day Upload Radar with live `16:9` preview (`h`/`l` Day, `[`/`]` Week, `Space` Play, `a` +CW, `w` WL) |
 | | `f` / `r` | Filter (`All` / `Longform` / `Shorts`) & Sort / Force refresh feeds |
-| | `A` / `t` | Phaenna Wrapped Analytics / Discovery Crucible (`Tailored`) |
+| | `A` | Phaenna Wrapped Analytics |
 | | `s` / `,` | Fuzzy Command Hub (includes one-click `FSRCNNX` 4K CNN pack install) |
 | | `L` / `T` | Google Account & Identity Hub / Cycle 6 Themes |
 | | `m` / `C` | Mobile LAN Remote QR / AirPlay & DLNA TV Cast |
-| | `!` / `U` / `?` / `q` | System Doctor / Updater / Help Matrix / Quit |
+| | `U` / `?` / `q` | Updater / Help Matrix / Quit |
 
 ---
 

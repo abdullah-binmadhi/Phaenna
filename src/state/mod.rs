@@ -2,7 +2,6 @@
 
 use crate::api::dislike::DislikeInfo;
 use crate::api::innertube::{VideoComment, VideoVote};
-use crate::api::player::{detect_dependencies, DependencyStatus};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::config::{
@@ -18,7 +17,6 @@ use crate::services::calendar::{compute_week_bounds, local_tz_offset_secs, Calen
 use crate::services::cast::CastDevice;
 use crate::services::ipc::{LiveIpcEvent, LiveMediaTrack, PlayerCommand};
 use crate::services::remote::RemoteServerHandle;
-use crate::services::tailored::{LiveTunerConfig, TailoredMatch};
 use crate::services::updater::UpdateInfo;
 use crate::ui::theme::{self, extract_ambilight_palette, ThemePalette};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -49,11 +47,7 @@ pub enum ActiveOverlay {
     PlayOptions,
     Settings,
     Help,
-    Setup,
     Analytics,
-    TailoredWizard,
-    TailoredSummary,
-    TailoredResults,
     Calendar,
     Remote,
     Cast,
@@ -238,6 +232,11 @@ pub struct AppState {
     pub detail_comment_sort: CommentSort,
     pub detail_comment_collapsed: HashSet<String>,
     pub detail_reply_target: Option<ReplyTarget>,
+    pub detail_translate_lang: String,
+    pub detail_translate_editing: bool,
+    pub detail_translate_input: String,
+    pub detail_comment_translations: HashMap<String, CommentTranslation>,
+    pub detail_comment_translating: HashSet<String>,
     pub detail_comments_loading: bool,
     pub detail_create_comment_params: Option<String>,
     pub detail_comment_composing: bool,
@@ -312,22 +311,15 @@ pub struct AppState {
     pub sponsor_skips_session: u32,
     pub live_playback: LivePlaybackControlState,
 
-    // Intelligence dashboards
+    // Intelligence & Services
     pub analytics: UserAnalytics,
     pub analytics_loaded: bool,
-    pub wizard_step: usize,
-    pub wizard_cursor: usize,
-    pub tailored_matches: Vec<TailoredMatch>,
-    pub tailored_cursor: usize,
-    pub live_tuner: LiveTunerConfig,
     pub calendar_bounds: WeekBounds,
     pub calendar_day_cursor: usize,
     pub calendar_item_cursor: usize,
     pub calendar_filter: CalendarFilter,
     pub calendar_tz_offset: i64,
 
-    // System Doctor & Services
-    pub deps: DependencyStatus,
     pub remote_handle: Option<RemoteServerHandle>,
     pub cast_devices: Vec<CastDevice>,
     pub cast_cursor: usize,
@@ -413,6 +405,11 @@ impl AppState {
             detail_comment_sort: CommentSort::Top,
             detail_comment_collapsed: HashSet::new(),
             detail_reply_target: None,
+            detail_translate_lang: "en".to_string(),
+            detail_translate_editing: false,
+            detail_translate_input: String::new(),
+            detail_comment_translations: HashMap::new(),
+            detail_comment_translating: HashSet::new(),
             detail_comments_loading: false,
             detail_create_comment_params: None,
             detail_comment_composing: false,
@@ -484,21 +481,12 @@ impl AppState {
 
             analytics: UserAnalytics::default(),
             analytics_loaded: false,
-            wizard_step: 0,
-            wizard_cursor: 0,
-            tailored_matches: Vec::new(),
-            tailored_cursor: 0,
-            live_tuner: LiveTunerConfig {
-                exclude_shorts: true,
-                ..Default::default()
-            },
             calendar_bounds: compute_week_bounds(now_unix, 0, 0),
             calendar_day_cursor: 0,
             calendar_item_cursor: 0,
             calendar_filter: CalendarFilter::All,
             calendar_tz_offset: 0,
 
-            deps: detect_dependencies(),
             remote_handle: None,
             cast_devices: Vec::new(),
             cast_cursor: 0,
@@ -1435,6 +1423,13 @@ pub struct CommentTreeRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct CommentTranslation {
+    pub target_lang: String,
+    pub source_lang: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CommentNodeHitbox {
     pub y0: u16,
     pub y1: u16,
@@ -1442,6 +1437,7 @@ pub struct CommentNodeHitbox {
     pub node_id: String,
     pub fold_rect: Option<Rect>,
     pub reply_rect: Option<Rect>,
+    pub translate_rect: Option<Rect>,
 }
 
 #[derive(Debug, Clone)]
@@ -1456,6 +1452,8 @@ pub enum DetailHit {
     SelectUpNext(VideoItem),
     SelectChapter(usize),
     SortComments(CommentSort),
+    EditTranslateLang,
+    TranslateNode(usize),
     FocusPane(usize),
 }
 
@@ -1616,11 +1614,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::PlayOptions => (92, 80),
         ActiveOverlay::Settings => (82, 74),
         ActiveOverlay::Help => (80, 74),
-        ActiveOverlay::Setup => (74, 68),
         ActiveOverlay::Analytics => (92, 88),
-        ActiveOverlay::TailoredWizard => (78, 72),
-        ActiveOverlay::TailoredSummary => (84, 78),
-        ActiveOverlay::TailoredResults => (88, 84),
         ActiveOverlay::Calendar => (90, 84),
         ActiveOverlay::Remote => (64, 78),
         ActiveOverlay::Cast => (68, 60),

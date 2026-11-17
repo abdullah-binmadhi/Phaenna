@@ -7,5 +7,4 @@ pub mod remote;
 pub mod shaders;
 pub mod substyler;
 pub mod subsync;
-pub mod tailored;
 pub mod updater;
