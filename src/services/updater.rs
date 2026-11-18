@@ -276,6 +276,224 @@ pub async fn check_for_updates(client: &reqwest::Client) -> Result<Option<Update
     ))
 }
 
+pub fn build_download_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(AppError::Network)
+}
+
+fn range_header_value(downloaded: u64) -> Option<String> {
+    (downloaded > 0).then(|| format!("bytes={downloaded}-"))
+}
+
+fn compute_progress_pct(downloaded: u64, expected_total: u64) -> f32 {
+    if expected_total > 0 {
+        ((downloaded as f32 / expected_total as f32) * 100.0).clamp(1.0, 95.0)
+    } else {
+        15.0
+    }
+}
+
+async fn open_download_file(tmp_path: &Path, resume_offset: u64) -> Result<tokio::fs::File> {
+    if resume_offset > 0 {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tmp_path)
+            .await
+            .map_err(AppError::Io)
+    } else {
+        tokio::fs::File::create(tmp_path).await.map_err(AppError::Io)
+    }
+}
+
+async fn download_binary_with_resume(
+    dl_client: &reqwest::Client,
+    meta_client: &reqwest::Client,
+    info: &UpdateInfo,
+    tmp_path: &Path,
+    tx: &Sender<AppMessage>,
+) -> Result<u64> {
+    const MAX_ATTEMPTS: usize = 4;
+    let mut current_url = info.download_url.clone();
+    let mut downloaded = 0u64;
+    let mut expected_total = 0u64;
+    let mut last_emit = Instant::now();
+    let start_time = Instant::now();
+    let mut last_err: Option<AppError> = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let mut req = dl_client
+            .get(&current_url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "application/octet-stream");
+        if let Some(range_hdr) = range_header_value(downloaded) {
+            req = req.header(reqwest::header::RANGE, range_hdr);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(AppError::Network(e));
+                if attempt < MAX_ATTEMPTS {
+                    let pct = compute_progress_pct(downloaded, expected_total);
+                    let _ = tx
+                        .send(AppMessage::UpdateProgress(
+                            pct,
+                            format!(
+                                "Network hiccup at {:.0}% — resuming (attempt {}/{})...",
+                                pct,
+                                attempt + 1,
+                                MAX_ATTEMPTS
+                            ),
+                        ))
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+            || status.is_server_error()
+        {
+            if let Ok(Some(fresh)) = check_for_updates(meta_client).await {
+                current_url = fresh.download_url;
+            }
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+                || status == reqwest::StatusCode::NOT_FOUND
+            {
+                downloaded = 0;
+                expected_total = 0;
+            }
+            last_err = Some(AppError::Http(format!("Download HTTP {status}")));
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await;
+                continue;
+            }
+            break;
+        }
+
+        let mut resp = match resp.error_for_status() {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(AppError::Http(format!("Download failed: {e}")));
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            if expected_total == 0 {
+                if let Some(rem) = resp.content_length() {
+                    expected_total = downloaded + rem;
+                }
+            }
+        } else {
+            // Server returned full 200 OK instead of 206 Partial Content; reset partial file cleanly.
+            downloaded = 0;
+            expected_total = resp.content_length().unwrap_or(0);
+        }
+
+        let mut file = open_download_file(tmp_path, downloaded).await?;
+        let mut stream_err: Option<AppError> = None;
+
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), resp.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+                    downloaded += chunk.len() as u64;
+
+                    if last_emit.elapsed() >= Duration::from_millis(120) {
+                        let pct = compute_progress_pct(downloaded, expected_total);
+                        let elapsed_secs = start_time.elapsed().as_secs_f64().max(0.001);
+                        let speed_mb = (downloaded as f64 / 1_048_576.0) / elapsed_secs;
+                        let _ = tx
+                            .send(AppMessage::UpdateProgress(
+                                pct,
+                                format!("Downloading {} ({:.1} MB/s)...", info.asset_name, speed_mb),
+                            ))
+                            .await;
+                        last_emit = Instant::now();
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
+                    stream_err = Some(AppError::Network(e));
+                    break;
+                }
+                Err(_) => {
+                    stream_err = Some(AppError::Http("Download stream stalled (30s timeout)".into()));
+                    break;
+                }
+            }
+        }
+
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        drop(file);
+
+        if let Some(err) = stream_err {
+            last_err = Some(err);
+            if attempt < MAX_ATTEMPTS {
+                let pct = compute_progress_pct(downloaded, expected_total);
+                let _ = tx
+                    .send(AppMessage::UpdateProgress(
+                        pct,
+                        format!(
+                            "Network hiccup at {:.0}% — resuming (attempt {}/{})...",
+                            pct,
+                            attempt + 1,
+                            MAX_ATTEMPTS
+                        ),
+                    ))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await;
+                continue;
+            }
+            break;
+        }
+
+        if expected_total > 0 && downloaded < expected_total {
+            last_err = Some(AppError::Http(format!(
+                "Incomplete download ({downloaded}/{expected_total} bytes)"
+            )));
+            if attempt < MAX_ATTEMPTS {
+                let pct = compute_progress_pct(downloaded, expected_total);
+                let _ = tx
+                    .send(AppMessage::UpdateProgress(
+                        pct,
+                        format!(
+                            "Incomplete stream at {:.0}% — resuming (attempt {}/{})...",
+                            pct,
+                            attempt + 1,
+                            MAX_ATTEMPTS
+                        ),
+                    ))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await;
+                continue;
+            }
+            break;
+        }
+
+        return Ok(downloaded);
+    }
+
+    let _ = std::fs::remove_file(tmp_path);
+    Err(last_err.unwrap_or_else(|| AppError::Http("Update download failed".into())))
+}
+
 async fn download_and_install_inner(
     client: &reqwest::Client,
     info: &UpdateInfo,
@@ -294,45 +512,9 @@ async fn download_and_install_inner(
         .ok_or_else(|| AppError::Player("Unable to resolve binary parent directory".to_string()))?;
 
     let tmp_path = parent_dir.join(format!(".phaenna-update-{}.tmp", std::process::id()));
-
-    let mut resp = client
-        .get(&info.download_url)
-        .header("User-Agent", USER_AGENT)
-        .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| AppError::Http(format!("Download failed: {e}")))?;
-
-    let total_size = resp.content_length().unwrap_or(0);
-    let mut downloaded = 0u64;
-    let mut last_emit = Instant::now();
-    let start_time = Instant::now();
-
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
-    while let Some(chunk) = resp.chunk().await? {
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-        downloaded += chunk.len() as u64;
-
-        if last_emit.elapsed() >= Duration::from_millis(120) {
-            let pct = if total_size > 0 {
-                (downloaded as f32 / total_size as f32) * 100.0
-            } else {
-                15.0
-            };
-            let elapsed_secs = start_time.elapsed().as_secs_f64().max(0.001);
-            let speed_mb = (downloaded as f64 / 1_048_576.0) / elapsed_secs;
-            let _ = tx
-                .send(AppMessage::UpdateProgress(
-                    pct.clamp(1.0, 95.0),
-                    format!("Downloading {} ({:.1} MB/s)...", info.asset_name, speed_mb),
-                ))
-                .await;
-            last_emit = Instant::now();
-        }
-    }
-
-    tokio::io::AsyncWriteExt::flush(&mut file).await?;
-    drop(file);
+    let dl_client = build_download_client().unwrap_or_else(|_| client.clone());
+    let downloaded =
+        download_binary_with_resume(&dl_client, client, info, &tmp_path, tx).await?;
 
     if downloaded < MIN_BINARY_BYTES {
         let _ = std::fs::remove_file(&tmp_path);
@@ -519,5 +701,9 @@ mod tests {
         }];
         assert!(evaluate_release_update(only_checksums, "1.0.0", "unknown", 0).is_none());
         assert!(!has_valid_native_magic(b"f659"));
+        assert!(build_download_client().is_ok());
+        assert_eq!(range_header_value(0), None);
+        assert_eq!(range_header_value(4096).as_deref(), Some("bytes=4096-"));
+        assert!((compute_progress_pct(8_000_000, 16_000_000) - 50.0).abs() < 0.01);
     }
 }
