@@ -40,6 +40,18 @@ pub enum AnalysisHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpHit {
+    OpenSettings,
+    OpenSearch,
+    OpenStudio,
+    OpenAnalytics,
+    OpenCalendar,
+    OpenLogin,
+    CycleTheme,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Home,
     Detail,
@@ -334,6 +346,7 @@ pub struct AppState {
     pub analysis_channel_sort: AnalysisChannelSort,
     pub analysis_cursor: usize,
     pub analysis_hitboxes: Vec<(Rect, AnalysisHit)>,
+    pub help_hitboxes: Vec<(Rect, HelpHit)>,
     pub calendar_bounds: WeekBounds,
     pub calendar_day_cursor: usize,
     pub calendar_item_cursor: usize,
@@ -507,6 +520,7 @@ impl AppState {
             analysis_channel_sort: AnalysisChannelSort::Hours,
             analysis_cursor: 0,
             analysis_hitboxes: Vec::new(),
+            help_hitboxes: Vec::new(),
             calendar_bounds: compute_week_bounds(now_unix, 0, 0),
             calendar_day_cursor: 0,
             calendar_item_cursor: 0,
@@ -1663,6 +1677,24 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+/// Content-fitted centered bounding box for the Command Matrix (`?`) modal so large terminals
+/// never stretch cards into dead vertical or horizontal void (exact 116x28 content budget).
+pub fn help_modal_rect(frame_area: Rect) -> Rect {
+    let target_w = frame_area
+        .width
+        .saturating_sub(4)
+        .min(116)
+        .max(frame_area.width.min(76));
+    let target_h = frame_area
+        .height
+        .saturating_sub(2)
+        .min(28)
+        .max(frame_area.height.min(20));
+    let x = frame_area.x + frame_area.width.saturating_sub(target_w) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(target_h) / 2;
+    Rect::new(x, y, target_w, target_h)
+}
+
 /// Exact bounds of active modal overlay so underlying native Kitty thumbnails aren't drawn over it.
 pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rect> {
     let (px, py) = match overlay {
@@ -1672,7 +1704,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::Filter => (64, 66),
         ActiveOverlay::PlayOptions => (92, 80),
         ActiveOverlay::Settings => (82, 74),
-        ActiveOverlay::Help => (80, 74),
+        ActiveOverlay::Help => return Some(help_modal_rect(frame_area)),
         ActiveOverlay::Analytics => (94, 90),
         ActiveOverlay::Calendar => (90, 84),
         ActiveOverlay::Remote => (64, 78),

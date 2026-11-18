@@ -72,7 +72,7 @@ use crate::services::updater::{
 };
 use crate::state::{
     ActiveOverlay, AnalysisHit, AppState, Category, CommentTranslation, ContentFilter, DetailHit,
-    DetailViewMode, DownloadJobState, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen,
+    DetailViewMode, DownloadJobState, HelpHit, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen,
     SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter, ShortsSource, SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
@@ -3072,6 +3072,34 @@ fn open_selected_analysis_row(
     }
 }
 
+async fn apply_help_hit(hit: HelpHit, state: &mut AppState, pool: &SqlitePool) {
+    match hit {
+        HelpHit::Close => state.overlay = ActiveOverlay::None,
+        HelpHit::OpenSettings => {
+            state.settings_query.clear();
+            state.settings_cursor = 0;
+            state.overlay = ActiveOverlay::Settings;
+        }
+        HelpHit::OpenSearch => open_search_overlay(state, pool).await,
+        HelpHit::OpenStudio => state.overlay = ActiveOverlay::PlayOptions,
+        HelpHit::OpenAnalytics => open_analytics(state, pool).await,
+        HelpHit::OpenCalendar => {
+            state.sync_calendar_tz(pool).await;
+            state.overlay = ActiveOverlay::Calendar;
+        }
+        HelpHit::OpenLogin => {
+            state.login_ui.step = LoginStep::Hub;
+            state.login_ui.error_banner = None;
+            state.overlay = ActiveOverlay::Login;
+        }
+        HelpHit::CycleTheme => {
+            state.config.theme_index = (state.config.theme_index + 1) % ui::theme::THEMES.len();
+            let _ = state.config.save();
+            state.show_toast(format!("Theme: {}", state.base_theme().name));
+        }
+    }
+}
+
 async fn apply_analysis_hit(
     hit: AnalysisHit,
     state: &mut AppState,
@@ -4212,6 +4240,41 @@ async fn handle_mouse_event(
             }
             return false;
         }
+        if state.overlay == ActiveOverlay::Help {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some((_, hit)) = state
+                    .help_hitboxes
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| in_rect(*r))
+                    .copied()
+                {
+                    apply_help_hit(hit, state, pool).await;
+                    return true;
+                }
+                if let Some(modal) =
+                    crate::state::active_modal_rect(frame_area, ActiveOverlay::Help)
+                {
+                    if !in_rect(modal) {
+                        state.overlay = ActiveOverlay::None;
+                        return true;
+                    }
+                }
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.overlay = ActiveOverlay::None;
+                return true;
+            }
+            return false;
+        }
         if state.overlay == ActiveOverlay::None && state.screen == Screen::Detail {
             let in_rect = |r: ratatui::layout::Rect| -> bool {
                 r.width > 0
@@ -5226,13 +5289,22 @@ async fn handle_overlay_key(
 ) {
     match state.overlay {
         ActiveOverlay::None => {}
-        ActiveOverlay::Help => {
-            if matches!(code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
-                state.overlay = ActiveOverlay::None;
-            } else if code == KeyCode::Char('s') {
-                state.overlay = ActiveOverlay::Settings;
+        ActiveOverlay::Help => match code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                apply_help_hit(HelpHit::Close, state, pool).await;
             }
-        }
+            KeyCode::Char('s') | KeyCode::Char(',') => {
+                apply_help_hit(HelpHit::OpenSettings, state, pool).await;
+            }
+            KeyCode::Char('/') => apply_help_hit(HelpHit::OpenSearch, state, pool).await,
+            KeyCode::Char('p') => apply_help_hit(HelpHit::OpenStudio, state, pool).await,
+            KeyCode::Char('A') => apply_help_hit(HelpHit::OpenAnalytics, state, pool).await,
+            KeyCode::Char('c') => apply_help_hit(HelpHit::OpenCalendar, state, pool).await,
+            KeyCode::Char('L') => apply_help_hit(HelpHit::OpenLogin, state, pool).await,
+            KeyCode::Char('T') => apply_help_hit(HelpHit::CycleTheme, state, pool).await,
+            KeyCode::Char('U') => state.overlay = ActiveOverlay::Update,
+            _ => {}
+        },
         ActiveOverlay::Login => {
             handle_login_overlay_key(code, modifiers, state, pool, tx, client).await;
         }
