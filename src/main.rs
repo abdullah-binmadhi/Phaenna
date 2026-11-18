@@ -31,7 +31,8 @@ use crate::api::ytdlp::{
     search_youtube,
 };
 use crate::config::{
-    next_dub_lang, Config, MotionMode, PerformanceMode, Player, Quality, VideoShaderMode,
+    next_dub_lang, Config, ManualMasteringConfig, MotionMode, PerformanceMode, Player, Quality,
+    VideoShaderMode,
 };
 use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
@@ -72,8 +73,9 @@ use crate::services::updater::{
 };
 use crate::state::{
     ActiveOverlay, AnalysisHit, AppState, Category, CommentTranslation, ContentFilter, DetailHit,
-    DetailViewMode, DownloadJobState, HelpHit, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen,
-    SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter, ShortsSource, SortOrder,
+    DetailViewMode, DownloadJobState, HelpHit, ManualToggle, NowPlayingHit, PlayOptionsHit,
+    ReplyTarget, Screen, SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter, ShortsSource,
+    SortOrder,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::help::confirm_quit_button_rects;
@@ -2474,6 +2476,7 @@ async fn start_nonblocking_playback_with_live_opts(
         let _ = state.auth_vault.sync_isolated_cookie_jar(cpath);
     }
 
+    let eff_master = state.config.effective_mastering();
     let ytdl_format = if is_live {
         eff_quality.ytdl_format_for_live(
             state.config.live_mode,
@@ -2481,13 +2484,14 @@ async fn start_nonblocking_playback_with_live_opts(
             &state.config.dub_lang,
         )
     } else {
-        eff_quality.ytdl_format_with_dub(
+        eff_quality.ytdl_format_with_dub_and_codec(
             state.config.dub_preference,
             &state.config.dub_lang,
             state
                 .config
                 .performance_mode
                 .loads_multistreams(state.config.audio_multistreams),
+            eff_master.codec_priority,
         )
     };
     let opts = PlayOptions {
@@ -2510,6 +2514,7 @@ async fn start_nonblocking_playback_with_live_opts(
         shader_mode: state.config.shader_mode,
         mastering_profile: VideoMasteringProfile::from_metadata(video.duration, &video.title),
         performance_mode: state.config.performance_mode,
+        manual_mastering: eff_master,
         motion_mode: state.config.motion_mode,
         dub_preference: state.config.dub_preference,
         dub_lang: state.config.dub_lang.clone(),
@@ -3284,16 +3289,7 @@ async fn execute_hub_action(
             apply_performance_mode(state, next);
         }
         HubActionId::InstallNeuralShaders => {
-            state.show_toast("Downloading FSRCNNX 4K neural CNN shader pack...");
-            let c_s = client.clone();
-            let tx_s = tx.clone();
-            tokio::spawn(async move {
-                let msg = match download_neural_shader_pack(&c_s).await {
-                    Ok(path) => format!("FSRCNNX Neural Cinema 4K installed ({})", path.display()),
-                    Err(e) => format!("Neural shader download failed: {}", e),
-                };
-                let _ = tx_s.send(AppMessage::ShowToast(msg)).await;
-            });
+            spawn_neural_shader_download(state, tx, client);
         }
         HubActionId::SubtitlesEnabled => {
             state.config.subtitles_enabled = !state.config.subtitles_enabled;
@@ -3469,19 +3465,48 @@ async fn relaunch_live_video_from_pos(
     }
 }
 
+fn active_mastering_profile(state: &AppState) -> VideoMasteringProfile {
+    state
+        .active_selected_video()
+        .map(|v| VideoMasteringProfile::from_metadata(v.duration, &v.title))
+        .unwrap_or(VideoMasteringProfile::StandardHd)
+}
+
+fn spawn_neural_shader_download(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    state.show_toast("Downloading FSRCNNX 4K neural CNN shader pack...");
+    let c_s = client.clone();
+    let tx_s = tx.clone();
+    tokio::spawn(async move {
+        let msg = match download_neural_shader_pack(&c_s).await {
+            Ok(path) => format!("FSRCNNX Neural Cinema 4K installed ({})", path.display()),
+            Err(e) => format!("Neural shader download failed: {}", e),
+        };
+        let _ = tx_s.send(AppMessage::ShowToast(msg)).await;
+    });
+}
+
 fn apply_shader_mode(state: &mut AppState, mode: VideoShaderMode) {
     state.config.shader_mode = mode;
     let _ = state.config.save();
     if state.has_live_ipc() {
-        let prof = state
-            .active_selected_video()
-            .map(|v| VideoMasteringProfile::from_metadata(v.duration, &v.title))
-            .unwrap_or(VideoMasteringProfile::StandardHd);
-        state.send_player_cmd(PlayerCommand::SetShaderMode(
-            mode,
-            prof,
-            state.config.performance_mode,
-        ));
+        let prof = active_mastering_profile(state);
+        if state.config.performance_mode == PerformanceMode::Manual {
+            state.send_player_cmd(PlayerCommand::ApplyManualMastering(
+                state.config.manual_mastering,
+                mode,
+                prof,
+            ));
+        } else {
+            state.send_player_cmd(PlayerCommand::SetShaderMode(
+                mode,
+                prof,
+                state.config.performance_mode,
+            ));
+        }
         state.show_toast(format!("Live 4K Shader: {}", mode.short_label()));
     } else {
         state.show_toast(format!("4K Shader: {}", mode.short_label()));
@@ -3492,18 +3517,116 @@ fn apply_performance_mode(state: &mut AppState, mode: PerformanceMode) {
     state.config.performance_mode = mode;
     let _ = state.config.save();
     if state.has_live_ipc() {
-        let prof = state
-            .active_selected_video()
-            .map(|v| VideoMasteringProfile::from_metadata(v.duration, &v.title))
-            .unwrap_or(VideoMasteringProfile::StandardHd);
-        state.send_player_cmd(PlayerCommand::SetPerformanceMode(
-            mode,
-            state.config.shader_mode,
-            prof,
-        ));
+        let prof = active_mastering_profile(state);
+        if mode == PerformanceMode::Manual {
+            state.send_player_cmd(PlayerCommand::ApplyManualMastering(
+                state.config.manual_mastering,
+                state.config.shader_mode,
+                prof,
+            ));
+        } else {
+            state.send_player_cmd(PlayerCommand::SetPerformanceMode(
+                mode,
+                state.config.shader_mode,
+                prof,
+            ));
+        }
         state.show_toast(format!("Live Mode: {} ({})", mode.label(), mode.summary()));
     } else {
         state.show_toast(format!("Performance Mode: {} ({})", mode.label(), mode.summary()));
+    }
+}
+
+fn seed_manual_from(state: &mut AppState, preset: PerformanceMode) {
+    state.config.manual_mastering = ManualMasteringConfig::from_preset(preset);
+    state.config.performance_mode = PerformanceMode::Manual;
+    let _ = state.config.save();
+    if state.has_live_ipc() {
+        let prof = active_mastering_profile(state);
+        state.send_player_cmd(PlayerCommand::ApplyManualMastering(
+            state.config.manual_mastering,
+            state.config.shader_mode,
+            prof,
+        ));
+    }
+    state.show_toast(format!(
+        "Manual Mode seeded from {} (live GPU settings updated)",
+        preset.label()
+    ));
+}
+
+fn apply_manual_toggle(state: &mut AppState, toggle: ManualToggle) {
+    if toggle == ManualToggle::Motion {
+        let next = state.config.motion_mode.next();
+        apply_motion_mode(state, next);
+        return;
+    }
+
+    if state.config.performance_mode != PerformanceMode::Manual {
+        state.config.manual_mastering =
+            ManualMasteringConfig::from_preset(state.config.performance_mode);
+        state.config.performance_mode = PerformanceMode::Manual;
+    }
+
+    let m = &mut state.config.manual_mastering;
+    let desc = match toggle {
+        ManualToggle::SuperRes => {
+            m.super_res = m.super_res.next();
+            format!("5K 2x Upscale: {}", m.super_res.label())
+        }
+        ManualToggle::CodecPriority => {
+            m.codec_priority = m.codec_priority.next();
+            format!("Codec Priority: {}", m.codec_priority.label())
+        }
+        ManualToggle::Hwdec => {
+            m.hwdec = m.hwdec.next();
+            format!("Hardware Decode: {}", m.hwdec.label())
+        }
+        ManualToggle::HdrComputePeak => {
+            m.hdr_compute_peak = !m.hdr_compute_peak;
+            format!(
+                "HDR Peak Compute: {}",
+                if m.hdr_compute_peak { "ON (Dynamic)" } else { "OFF (Static Cool)" }
+            )
+        }
+        ManualToggle::ToneMap => {
+            m.tone_map = m.tone_map.next();
+            format!("HDR Tone Map: {}", m.tone_map.label())
+        }
+        ManualToggle::GlslStage => {
+            m.glsl_stage = m.glsl_stage.next();
+            format!("4:4:4 & Deblock: {}", m.glsl_stage.label())
+        }
+        ManualToggle::Deband => {
+            m.deband = m.deband.next();
+            format!("Deband Filter: {}", m.deband.label())
+        }
+        ManualToggle::GpuScaler => {
+            m.gpu_scaler = m.gpu_scaler.next();
+            format!("GPU Scaler: {}", m.gpu_scaler.label())
+        }
+        ManualToggle::DemuxerCache => {
+            m.demuxer_cache = m.demuxer_cache.next();
+            format!("Demuxer Cache: {}", m.demuxer_cache.label())
+        }
+        ManualToggle::Motion => unreachable!(),
+    };
+    let _ = state.config.save();
+
+    if state.has_live_ipc() {
+        let prof = active_mastering_profile(state);
+        state.send_player_cmd(PlayerCommand::ApplyManualMastering(
+            state.config.manual_mastering,
+            state.config.shader_mode,
+            prof,
+        ));
+        if toggle == ManualToggle::CodecPriority {
+            state.show_toast(format!("Manual | {desc} (press Enter to reload codec)"));
+        } else {
+            state.show_toast(format!("Manual Live | {desc}"));
+        }
+    } else {
+        state.show_toast(format!("Manual Mode | {desc}"));
     }
 }
 
@@ -3622,9 +3745,14 @@ async fn apply_play_options_hit(
         PlayOptionsHit::SetPerformanceMode(mode) => {
             apply_performance_mode(state, mode);
         }
-        PlayOptionsHit::CycleMotion => {
-            let next = state.config.motion_mode.next();
-            apply_motion_mode(state, next);
+        PlayOptionsHit::ToggleManual(toggle) => {
+            apply_manual_toggle(state, toggle);
+        }
+        PlayOptionsHit::SeedManualFrom(preset) => {
+            seed_manual_from(state, preset);
+        }
+        PlayOptionsHit::DownloadNeuralShaders => {
+            spawn_neural_shader_download(state, tx, client);
         }
         PlayOptionsHit::ScrollAudioTracks(delta) => {
             let total = state.live_playback.audio_tracks.len();
@@ -5356,14 +5484,10 @@ async fn handle_overlay_key(
         ActiveOverlay::PlayOptions => match code {
             KeyCode::Esc | KeyCode::Char('p') => state.overlay = ActiveOverlay::None,
             KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
-                state.play_modal_section = if state.play_modal_section == 0 {
-                    4
-                } else {
-                    state.play_modal_section - 1
-                };
+                state.play_modal_section = (state.play_modal_section + 5) % 6;
             }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-                state.play_modal_section = (state.play_modal_section + 1) % 5;
+                state.play_modal_section = (state.play_modal_section + 1) % 6;
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
                 let down = matches!(code, KeyCode::Down | KeyCode::Char('j'));
@@ -5395,6 +5519,15 @@ async fn handle_overlay_key(
                         apply_shader_mode(state, next);
                         return;
                     }
+                    4 => {
+                        let n = ManualToggle::ALL.len();
+                        state.manual_mastering_cursor = if down {
+                            (state.manual_mastering_cursor + 1) % n
+                        } else {
+                            (state.manual_mastering_cursor + n - 1) % n
+                        };
+                        return;
+                    }
                     _ => {
                         let delta = if down { -5 } else { 5 };
                         state.live_playback.volume =
@@ -5405,6 +5538,7 @@ async fn handle_overlay_key(
                 }
                 let _ = state.config.save();
             }
+            KeyCode::Char('a') => state.play_modal_section = 4,
             KeyCode::Char('d') => toggle_dub_live_or_config(state, pool, tx, client).await,
             KeyCode::Char('L') => {
                 state.config.dub_lang = next_dub_lang(&state.config.dub_lang);
@@ -5453,7 +5587,11 @@ async fn handle_overlay_key(
                 apply_motion_mode(state, next);
             }
             KeyCode::Char(' ') => {
-                if state.has_live_ipc() {
+                if state.play_modal_section == 4 {
+                    if let Some(&toggle) = ManualToggle::ALL.get(state.manual_mastering_cursor) {
+                        apply_manual_toggle(state, toggle);
+                    }
+                } else if state.has_live_ipc() {
                     state.live_playback.paused = !state.live_playback.paused;
                     state.send_player_cmd(PlayerCommand::TogglePause);
                 } else {

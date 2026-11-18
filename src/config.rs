@@ -90,13 +90,26 @@ impl Quality {
     }
 
     pub fn video_selectors(self) -> &'static [&'static str] {
+        self.video_selectors_for_codec(CodecPriority::Av1First)
+    }
+
+    pub fn video_selectors_for_codec(self, codec: CodecPriority) -> &'static [&'static str] {
         match self {
-            Quality::Best => &[
-                "bestvideo[height<=?4320][vcodec^=av01]",
-                "bestvideo[height<=?4320][vcodec^=vp9]",
-                "bestvideo[height<=?4320]",
-                "bestvideo",
-            ],
+            Quality::Best => match codec {
+                CodecPriority::Vp9HwFirst => &[
+                    "bestvideo[height<=?4320][vcodec^=vp9]",
+                    "bestvideo[height<=?4320][vcodec^=hev]",
+                    "bestvideo[height<=?4320][vcodec^=avc]",
+                    "bestvideo[height<=?4320]",
+                    "bestvideo",
+                ],
+                CodecPriority::Av1First => &[
+                    "bestvideo[height<=?4320][vcodec^=av01]",
+                    "bestvideo[height<=?4320][vcodec^=vp9]",
+                    "bestvideo[height<=?4320]",
+                    "bestvideo",
+                ],
+            },
             Quality::P2160 => &["bestvideo[height<=?2160][fps>=?50]", "bestvideo[height<=?2160]"],
             Quality::P1440 => &["bestvideo[height<=?1440][fps>=?50]", "bestvideo[height<=?1440]"],
             Quality::P1080 => &["bestvideo[height<=?1080][fps>=?50]", "bestvideo[height<=?1080]"],
@@ -113,6 +126,17 @@ impl Quality {
         dub: DubPreference,
         dub_lang: &str,
         multistreams: bool,
+    ) -> String {
+        self.ytdl_format_with_dub_and_codec(dub, dub_lang, multistreams, CodecPriority::Av1First)
+    }
+
+    /// Build a `yt-dlp` format selector honoring audio dubs, multi-stream loading, and codec priority.
+    pub fn ytdl_format_with_dub_and_codec(
+        self,
+        dub: DubPreference,
+        dub_lang: &str,
+        multistreams: bool,
+        codec: CodecPriority,
     ) -> String {
         let lang: String = dub_lang
             .trim()
@@ -148,7 +172,7 @@ impl Quality {
             };
         }
 
-        let vs = self.video_selectors();
+        let vs = self.video_selectors_for_codec(codec);
         let video_chain = format!("({})", vs.join("/"));
         let mut branches: Vec<String> = Vec::new();
         if multistreams {
@@ -581,7 +605,7 @@ fn default_theme_index() -> usize {
     2 // Phaenna
 }
 
-/// Resource / GPU mastering trade-off preset (`Efficient`, `Balanced`, `Quality`).
+/// Resource / GPU mastering trade-off preset (`Efficient`, `Balanced`, `Quality`, `Manual`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PerformanceMode {
@@ -589,17 +613,19 @@ pub enum PerformanceMode {
     #[default]
     Balanced,
     Quality,
+    Manual,
 }
 
 #[allow(dead_code)]
 impl PerformanceMode {
-    pub const ALL: [Self; 3] = [Self::Efficient, Self::Balanced, Self::Quality];
+    pub const ALL: [Self; 4] = [Self::Efficient, Self::Balanced, Self::Quality, Self::Manual];
 
     pub const fn next(self) -> Self {
         match self {
             Self::Efficient => Self::Balanced,
             Self::Balanced => Self::Quality,
-            Self::Quality => Self::Efficient,
+            Self::Quality => Self::Manual,
+            Self::Manual => Self::Efficient,
         }
     }
 
@@ -608,6 +634,7 @@ impl PerformanceMode {
             Self::Efficient => "Efficient",
             Self::Balanced => "Balanced",
             Self::Quality => "Quality",
+            Self::Manual => "Manual",
         }
     }
 
@@ -616,37 +643,369 @@ impl PerformanceMode {
             Self::Efficient => "ECO",
             Self::Balanced => "BAL",
             Self::Quality => "MAX",
+            Self::Manual => "MAN",
         }
     }
 
     pub const fn summary(self) -> &'static str {
         match self {
             Self::Efficient => "~350MB RAM | 48M buf | Light Luma CAS",
-            Self::Balanced => "~650MB RAM | 160M buf | Deblock + 4:4:4",
+            Self::Balanced => "~650MB RAM | Cool HW VP9 | 1x 4:4:4 + Deblock",
             Self::Quality => "~1.4GB RAM | 512M buf | Full 4K 2x Master",
+            Self::Manual => "Custom Manual GPU / Thermal / Codec Profile",
         }
     }
 
     pub const fn demuxer_limits(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Efficient => ("48MiB", "16MiB"),
-            Self::Balanced => ("160MiB", "48MiB"),
-            Self::Quality => ("512MiB", "128MiB"),
-        }
+        ManualMasteringConfig::from_preset(self).demuxer_cache.limits()
     }
 
     pub const fn demuxer_max_bytes_num(self) -> u64 {
-        match self {
-            Self::Efficient => 48 * 1024 * 1024,
-            Self::Balanced => 160 * 1024 * 1024,
-            Self::Quality => 512 * 1024 * 1024,
-        }
+        ManualMasteringConfig::from_preset(self).demuxer_cache.max_bytes_num()
     }
 
     pub const fn loads_multistreams(self, config_multi: bool) -> bool {
         match self {
             Self::Efficient => false,
-            Self::Balanced | Self::Quality => config_multi,
+            Self::Balanced | Self::Quality | Self::Manual => config_multi,
+        }
+    }
+}
+
+/// 2x Super-Resolution framebuffer scaling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuperResMode {
+    #[default]
+    Off,
+    Auto1080p,
+    Always2x,
+}
+
+impl SuperResMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Auto1080p,
+            Self::Auto1080p => Self::Always2x,
+            Self::Always2x => Self::Off,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF (1x Native)",
+            Self::Auto1080p => "<=1080p Only (2x)",
+            Self::Always2x => "ON (Always 2x 5K)",
+        }
+    }
+}
+
+/// Hardware-friendly VP9/HEVC priority vs. maximum-compression AV1 priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodecPriority {
+    #[default]
+    Vp9HwFirst,
+    Av1First,
+}
+
+impl CodecPriority {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Vp9HwFirst => Self::Av1First,
+            Self::Av1First => Self::Vp9HwFirst,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Vp9HwFirst => "VP9/HEVC HW (Cool)",
+            Self::Av1First => "AV1 First (Max Comp)",
+        }
+    }
+
+    pub const fn format_sort_vcodec(self) -> &'static str {
+        match self {
+            Self::Vp9HwFirst => "vp9.2:vp9:h264:av01",
+            Self::Av1First => "av01:vp9.2:vp9",
+        }
+    }
+}
+
+/// `mpv` hardware video decoder selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HwdecMode {
+    #[default]
+    VideoToolbox,
+    AutoSafe,
+    Off,
+}
+
+impl HwdecMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::VideoToolbox => Self::AutoSafe,
+            Self::AutoSafe => Self::Off,
+            Self::Off => Self::VideoToolbox,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::VideoToolbox => "VideoToolbox HW",
+            Self::AutoSafe => "Auto-Safe HW",
+            Self::Off => "OFF (Software CPU)",
+        }
+    }
+
+    pub const fn mpv_value(self) -> &'static str {
+        match self {
+            Self::VideoToolbox => {
+                if cfg!(target_os = "macos") {
+                    "videotoolbox"
+                } else {
+                    "auto-safe"
+                }
+            }
+            Self::AutoSafe => "auto-safe",
+            Self::Off => "no",
+        }
+    }
+}
+
+/// HDR tone-mapping curve in `vo=gpu-next`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToneMapMode {
+    #[default]
+    Spline,
+    Bt2446a,
+    St2094_40,
+}
+
+impl ToneMapMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Spline => Self::Bt2446a,
+            Self::Bt2446a => Self::St2094_40,
+            Self::St2094_40 => Self::Spline,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Spline => "Spline (Balanced)",
+            Self::Bt2446a => "BT.2446a (Broadcast)",
+            Self::St2094_40 => "ST2094-40 (Dynamic)",
+        }
+    }
+
+    pub const fn mpv_value(self) -> &'static str {
+        match self {
+            Self::Spline => "spline",
+            Self::Bt2446a => "bt.2446a",
+            Self::St2094_40 => "st2094-40",
+        }
+    }
+}
+
+/// Active GLSL post-processing stage chain depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GlslStageMode {
+    Off,
+    LightCas,
+    #[default]
+    Guided444,
+    FullMastering,
+}
+
+impl GlslStageMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::LightCas,
+            Self::LightCas => Self::Guided444,
+            Self::Guided444 => Self::FullMastering,
+            Self::FullMastering => Self::Off,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF (Raw Stream)",
+            Self::LightCas => "Light Luma CAS",
+            Self::Guided444 => "Fast Guided 4:4:4",
+            Self::FullMastering => "Full 4K Pipeline",
+        }
+    }
+}
+
+/// Gradient debanding pass count and temporal dithering budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DebandTier {
+    Off,
+    #[default]
+    OnePassCool,
+    ThreePassStudio,
+}
+
+impl DebandTier {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::OnePassCool,
+            Self::OnePassCool => Self::ThreePassStudio,
+            Self::ThreePassStudio => Self::Off,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF (Zero GPU)",
+            Self::OnePassCool => "1-Pass (Cool)",
+            Self::ThreePassStudio => "3-Pass (Studio)",
+        }
+    }
+}
+
+/// GPU luma/chroma scaler kernel preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuScalerMode {
+    #[default]
+    Spline36,
+    EwaLanczos,
+    EwaLanczosSharp,
+}
+
+impl GpuScalerMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Spline36 => Self::EwaLanczos,
+            Self::EwaLanczos => Self::EwaLanczosSharp,
+            Self::EwaLanczosSharp => Self::Spline36,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Spline36 => "Spline36 + Mitchell",
+            Self::EwaLanczos => "EWA Lanczos",
+            Self::EwaLanczosSharp => "EWA LanczosSharp",
+        }
+    }
+}
+
+/// Demuxer forward/back RAM buffer capacity preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DemuxerCachePreset {
+    Small48M,
+    #[default]
+    Medium160M,
+    Large512M,
+}
+
+impl DemuxerCachePreset {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Small48M => Self::Medium160M,
+            Self::Medium160M => Self::Large512M,
+            Self::Large512M => Self::Small48M,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Small48M => "48 MiB / 16 MiB",
+            Self::Medium160M => "160 MiB / 48 MiB",
+            Self::Large512M => "512 MiB / 128 MiB",
+        }
+    }
+
+    pub const fn limits(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Small48M => ("48MiB", "16MiB"),
+            Self::Medium160M => ("160MiB", "48MiB"),
+            Self::Large512M => ("512MiB", "128MiB"),
+        }
+    }
+
+    pub const fn max_bytes_num(self) -> u64 {
+        match self {
+            Self::Small48M => 48 * 1024 * 1024,
+            Self::Medium160M => 160 * 1024 * 1024,
+            Self::Large512M => 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// Granular per-stage GPU, HDR, codec, and buffer configuration for `PerformanceMode::Manual`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualMasteringConfig {
+    #[serde(default)]
+    pub super_res: SuperResMode,
+    #[serde(default)]
+    pub codec_priority: CodecPriority,
+    #[serde(default)]
+    pub hwdec: HwdecMode,
+    #[serde(default)]
+    pub hdr_compute_peak: bool,
+    #[serde(default)]
+    pub tone_map: ToneMapMode,
+    #[serde(default)]
+    pub glsl_stage: GlslStageMode,
+    #[serde(default)]
+    pub deband: DebandTier,
+    #[serde(default)]
+    pub gpu_scaler: GpuScalerMode,
+    #[serde(default)]
+    pub demuxer_cache: DemuxerCachePreset,
+}
+
+impl Default for ManualMasteringConfig {
+    fn default() -> Self {
+        Self::from_preset(PerformanceMode::Balanced)
+    }
+}
+
+impl ManualMasteringConfig {
+    pub const fn from_preset(mode: PerformanceMode) -> Self {
+        match mode {
+            PerformanceMode::Efficient => Self {
+                super_res: SuperResMode::Off,
+                codec_priority: CodecPriority::Vp9HwFirst,
+                hwdec: HwdecMode::VideoToolbox,
+                hdr_compute_peak: false,
+                tone_map: ToneMapMode::Spline,
+                glsl_stage: GlslStageMode::LightCas,
+                deband: DebandTier::Off,
+                gpu_scaler: GpuScalerMode::Spline36,
+                demuxer_cache: DemuxerCachePreset::Small48M,
+            },
+            PerformanceMode::Balanced | PerformanceMode::Manual => Self {
+                super_res: SuperResMode::Off,
+                codec_priority: CodecPriority::Vp9HwFirst,
+                hwdec: HwdecMode::VideoToolbox,
+                hdr_compute_peak: false,
+                tone_map: ToneMapMode::Spline,
+                glsl_stage: GlslStageMode::Guided444,
+                deband: DebandTier::OnePassCool,
+                gpu_scaler: GpuScalerMode::Spline36,
+                demuxer_cache: DemuxerCachePreset::Medium160M,
+            },
+            PerformanceMode::Quality => Self {
+                super_res: SuperResMode::Always2x,
+                codec_priority: CodecPriority::Av1First,
+                hwdec: HwdecMode::AutoSafe,
+                hdr_compute_peak: true,
+                tone_map: ToneMapMode::Spline,
+                glsl_stage: GlslStageMode::FullMastering,
+                deband: DebandTier::ThreePassStudio,
+                gpu_scaler: GpuScalerMode::EwaLanczosSharp,
+                demuxer_cache: DemuxerCachePreset::Large512M,
+            },
         }
     }
 }
@@ -814,6 +1173,8 @@ pub struct Config {
     #[serde(default)]
     pub performance_mode: PerformanceMode,
     #[serde(default)]
+    pub manual_mastering: ManualMasteringConfig,
+    #[serde(default)]
     pub motion_mode: MotionMode,
     #[serde(default)]
     pub live_mode: LiveStreamMode,
@@ -856,6 +1217,7 @@ impl Default for Config {
             skip_outro: false,
             shader_mode: VideoShaderMode::default(),
             performance_mode: PerformanceMode::default(),
+            manual_mastering: ManualMasteringConfig::default(),
             motion_mode: MotionMode::default(),
             live_mode: LiveStreamMode::default(),
             live_auto_catchup: true,
@@ -875,6 +1237,18 @@ impl Default for Config {
 
 #[allow(dead_code)]
 impl Config {
+    pub fn effective_mastering(&self) -> ManualMasteringConfig {
+        if self.performance_mode == PerformanceMode::Manual {
+            self.manual_mastering
+        } else {
+            ManualMasteringConfig::from_preset(self.performance_mode)
+        }
+    }
+
+    pub fn effective_demuxer_max_bytes_num(&self) -> u64 {
+        self.effective_mastering().demuxer_cache.max_bytes_num()
+    }
+
     pub fn config_dir() -> Result<PathBuf> {
         let proj = ProjectDirs::from("", "", "phaenna")
             .ok_or_else(|| AppError::Config("Could not determine config directory".into()))?;
@@ -1053,5 +1427,49 @@ mod tests {
             "en",
         );
         assert!(radio.contains("bestaudio"));
+    }
+
+    #[test]
+    fn test_manual_mastering_presets_and_cool_balanced() {
+        assert_eq!(PerformanceMode::Quality.next(), PerformanceMode::Manual);
+        assert_eq!(PerformanceMode::Manual.next(), PerformanceMode::Efficient);
+        assert_eq!(PerformanceMode::Manual.short_badge(), "MAN");
+
+        // Balanced preset is tuned cool for fanless Apple Silicon
+        let bal = ManualMasteringConfig::from_preset(PerformanceMode::Balanced);
+        assert_eq!(bal.super_res, SuperResMode::Off);
+        assert_eq!(bal.codec_priority, CodecPriority::Vp9HwFirst);
+        assert_eq!(bal.hwdec, HwdecMode::VideoToolbox);
+        assert!(!bal.hdr_compute_peak);
+        assert_eq!(bal.glsl_stage, GlslStageMode::Guided444);
+        assert_eq!(bal.deband, DebandTier::OnePassCool);
+        assert_eq!(bal.gpu_scaler, GpuScalerMode::Spline36);
+
+        // Quality preset stays unchanged at full mastering Fidelity
+        let qual = ManualMasteringConfig::from_preset(PerformanceMode::Quality);
+        assert_eq!(qual.super_res, SuperResMode::Always2x);
+        assert_eq!(qual.codec_priority, CodecPriority::Av1First);
+        assert!(qual.hdr_compute_peak);
+        assert_eq!(qual.glsl_stage, GlslStageMode::FullMastering);
+        assert_eq!(qual.deband, DebandTier::ThreePassStudio);
+        assert_eq!(qual.gpu_scaler, GpuScalerMode::EwaLanczosSharp);
+
+        let vp9_fmt = Quality::Best.ytdl_format_with_dub_and_codec(
+            DubPreference::OriginalOnly,
+            "en",
+            true,
+            CodecPriority::Vp9HwFirst,
+        );
+        assert!(vp9_fmt.contains("[vcodec^=vp9]"));
+        assert!(!vp9_fmt.contains("[vcodec^=av01]"));
+
+        let mut cfg = Config {
+            performance_mode: PerformanceMode::Manual,
+            ..Default::default()
+        };
+        cfg.manual_mastering.super_res = SuperResMode::Auto1080p;
+        cfg.manual_mastering.demuxer_cache = DemuxerCachePreset::Large512M;
+        assert_eq!(cfg.effective_mastering().super_res, SuperResMode::Auto1080p);
+        assert_eq!(cfg.effective_demuxer_max_bytes_num(), 512 * 1024 * 1024);
     }
 }

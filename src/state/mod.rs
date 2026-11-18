@@ -304,9 +304,10 @@ pub struct AppState {
     pub search_pending_remote: bool,
     pub is_searching_remote: bool,
 
-    // Play options modal
-    pub play_modal_section: usize, // 0: Quality, 1: Player, 2: SponsorBlock, 3: Subtitles
+    // Play options modal (6 balanced zones: 0 Stream, 1 Audio, 2 Captions/Live, 3 Mode/Shaders, 4 Manual, 5 Transport)
+    pub play_modal_section: usize,
     pub play_quality_idx: usize,
+    pub manual_mastering_cursor: usize,
 
     // Filter modal
     pub filter_modal_section: usize,
@@ -485,6 +486,7 @@ impl AppState {
 
             play_modal_section: 0,
             play_quality_idx,
+            manual_mastering_cursor: 0,
 
             filter_modal_section: 0,
             filter_modal_option: 0,
@@ -1525,6 +1527,35 @@ pub enum SearchHit {
     LoadMore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualToggle {
+    SuperRes,
+    CodecPriority,
+    Hwdec,
+    HdrComputePeak,
+    ToneMap,
+    GlslStage,
+    Deband,
+    GpuScaler,
+    Motion,
+    DemuxerCache,
+}
+
+impl ManualToggle {
+    pub const ALL: [Self; 10] = [
+        Self::SuperRes,
+        Self::CodecPriority,
+        Self::Hwdec,
+        Self::HdrComputePeak,
+        Self::ToneMap,
+        Self::GlslStage,
+        Self::Deband,
+        Self::GpuScaler,
+        Self::Motion,
+        Self::DemuxerCache,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayOptionsHit {
     FocusSection(usize),
@@ -1544,7 +1575,9 @@ pub enum PlayOptionsHit {
     ToggleSkipOutro,
     SelectShader(VideoShaderMode),
     SetPerformanceMode(PerformanceMode),
-    CycleMotion,
+    ToggleManual(ManualToggle),
+    SeedManualFrom(PerformanceMode),
+    DownloadNeuralShaders,
     CycleLiveMode,
     ToggleLiveCatchup,
     JumpToLiveEdge,
@@ -1677,22 +1710,39 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Content-fitted centered bounding box for the Command Matrix (`?`) modal so large terminals
-/// never stretch cards into dead vertical or horizontal void (exact 116x28 content budget).
-pub fn help_modal_rect(frame_area: Rect) -> Rect {
+fn clamped_centered_rect(
+    frame_area: Rect,
+    margin_x: u16,
+    margin_y: u16,
+    min_w: u16,
+    max_w: u16,
+    min_h: u16,
+    max_h: u16,
+) -> Rect {
     let target_w = frame_area
         .width
-        .saturating_sub(4)
-        .min(116)
-        .max(frame_area.width.min(76));
+        .saturating_sub(margin_x)
+        .min(max_w)
+        .max(frame_area.width.min(min_w));
     let target_h = frame_area
         .height
-        .saturating_sub(2)
-        .min(28)
-        .max(frame_area.height.min(20));
+        .saturating_sub(margin_y)
+        .min(max_h)
+        .max(frame_area.height.min(min_h));
     let x = frame_area.x + frame_area.width.saturating_sub(target_w) / 2;
     let y = frame_area.y + frame_area.height.saturating_sub(target_h) / 2;
     Rect::new(x, y, target_w, target_h)
+}
+
+/// Content-fitted centered bounding box for the Command Matrix (`?`) modal so large terminals
+/// never stretch cards into dead vertical or horizontal void (exact 116x28 content budget).
+pub fn help_modal_rect(frame_area: Rect) -> Rect {
+    clamped_centered_rect(frame_area, 4, 2, 76, 116, 20, 28)
+}
+
+/// Content-fitted enlarged bounding box for the 6-Zone Playback Studio (`p`) modal (up to 146x33).
+pub fn play_options_modal_rect(frame_area: Rect) -> Rect {
+    clamped_centered_rect(frame_area, 2, 2, 96, 146, 24, 33)
 }
 
 /// Exact bounds of active modal overlay so underlying native Kitty thumbnails aren't drawn over it.
@@ -1702,7 +1752,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::Search => (90, 86),
         ActiveOverlay::Login => (84, 78),
         ActiveOverlay::Filter => (64, 66),
-        ActiveOverlay::PlayOptions => (92, 80),
+        ActiveOverlay::PlayOptions => return Some(play_options_modal_rect(frame_area)),
         ActiveOverlay::Settings => (82, 74),
         ActiveOverlay::Help => return Some(help_modal_rect(frame_area)),
         ActiveOverlay::Analytics => (94, 90),

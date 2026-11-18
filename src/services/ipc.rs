@@ -4,10 +4,12 @@
 
 use crate::api::player::LOUDNORM_FILTER;
 use crate::api::sponsorblock::{category_label, SponsorSegment};
-use crate::config::{MotionMode, PerformanceMode, VideoShaderMode};
+use crate::config::{
+    DebandTier, GpuScalerMode, ManualMasteringConfig, MotionMode, PerformanceMode, VideoShaderMode,
+};
 use crate::db;
 use crate::messages::AppMessage;
-use crate::services::shaders::{prepare_video_shaders_for, VideoMasteringProfile};
+use crate::services::shaders::{prepare_video_shaders_with_mastering, VideoMasteringProfile};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
@@ -160,6 +162,7 @@ pub enum PlayerCommand {
     SetLoudnorm(bool),
     SetShaderMode(VideoShaderMode, VideoMasteringProfile, PerformanceMode),
     SetPerformanceMode(PerformanceMode, VideoShaderMode, VideoMasteringProfile),
+    ApplyManualMastering(ManualMasteringConfig, VideoShaderMode, VideoMasteringProfile),
     SetMotionMode(MotionMode),
     SetPictureProp { prop: &'static str, value: i64 },
     ResetPicture,
@@ -167,6 +170,68 @@ pub enum PlayerCommand {
     SetLoop(bool),
     JumpToLiveEdge,
     Stop,
+}
+
+fn mastering_ipc_commands(
+    perf: PerformanceMode,
+    shader: VideoShaderMode,
+    manual: ManualMasteringConfig,
+) -> Vec<String> {
+    let eff = if perf == PerformanceMode::Manual {
+        manual
+    } else {
+        ManualMasteringConfig::from_preset(perf)
+    };
+    let (max_b, back_b) = eff.demuxer_cache.limits();
+    let mut cmds = vec![
+        json!({"command": ["set_property", "demuxer-max-bytes", max_b]}).to_string(),
+        json!({"command": ["set_property", "demuxer-max-back-bytes", back_b]}).to_string(),
+        json!({"command": ["set_property", "tone-mapping", eff.tone_map.mpv_value()]}).to_string(),
+        json!({"command": ["set_property", "hdr-compute-peak", if eff.hdr_compute_peak { "yes" } else { "no" }]}).to_string(),
+        json!({"command": ["set_property", "hwdec", eff.hwdec.mpv_value()]}).to_string(),
+    ];
+
+    if perf == PerformanceMode::Efficient {
+        cmds.extend([
+            json!({"command": ["set_property", "scale", "spline36"]}).to_string(),
+            json!({"command": ["set_property", "cscale", "bilinear"]}).to_string(),
+            json!({"command": ["set_property", "deband", "no"]}).to_string(),
+            json!({"command": ["set_property", "temporal-dither", "no"]}).to_string(),
+            json!({"command": ["set_property", "vd-lavc-fast", "yes"]}).to_string(),
+        ]);
+    } else {
+        let (scale, cscale) = match eff.gpu_scaler {
+            GpuScalerMode::Spline36 => ("spline36", "mitchell"),
+            GpuScalerMode::EwaLanczos => ("ewa_lanczos", "ewa_lanczos"),
+            GpuScalerMode::EwaLanczosSharp => ("ewa_lanczossharp", "ewa_lanczossharp"),
+        };
+        cmds.push(json!({"command": ["set_property", "scale", scale]}).to_string());
+        cmds.push(json!({"command": ["set_property", "cscale", cscale]}).to_string());
+        match eff.deband {
+            DebandTier::Off => {
+                cmds.push(json!({"command": ["set_property", "deband", "no"]}).to_string());
+                cmds.push(json!({"command": ["set_property", "temporal-dither", "no"]}).to_string());
+            }
+            DebandTier::OnePassCool => {
+                cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
+                cmds.push(json!({"command": ["set_property", "deband-iterations", 1]}).to_string());
+                cmds.push(json!({"command": ["set_property", "temporal-dither", "no"]}).to_string());
+            }
+            DebandTier::ThreePassStudio => {
+                cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
+                cmds.push(json!({"command": ["set_property", "deband-iterations", 3]}).to_string());
+                cmds.push(json!({"command": ["set_property", "temporal-dither", "yes"]}).to_string());
+            }
+        }
+        cmds.push(json!({"command": ["set_property", "vd-lavc-fast", "no"]}).to_string());
+    }
+
+    if let Some(shaders) = prepare_video_shaders_with_mastering(shader, perf, Some(eff)) {
+        cmds.push(json!({"command": ["change-list", "glsl-shaders", "set", shaders]}).to_string());
+    } else {
+        cmds.push(json!({"command": ["change-list", "glsl-shaders", "clr", ""]}).to_string());
+    }
+    cmds
 }
 
 impl PlayerCommand {
@@ -213,15 +278,16 @@ impl PlayerCommand {
             }
             Self::SetShaderMode(mode, _profile, perf) => {
                 let mut cmds = Vec::new();
-                if let Some(shaders) = prepare_video_shaders_for(*mode, *perf) {
+                if let Some(shaders) = prepare_video_shaders_with_mastering(*mode, *perf, None) {
                     cmds.push(
                         json!({"command": ["change-list", "glsl-shaders", "set", shaders]})
                             .to_string(),
                     );
                     if *perf != PerformanceMode::Efficient {
+                        let eff = ManualMasteringConfig::from_preset(*perf);
                         cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
                         cmds.push(
-                            json!({"command": ["set_property", "tone-mapping", "spline"]}).to_string(),
+                            json!({"command": ["set_property", "tone-mapping", eff.tone_map.mpv_value()]}).to_string(),
                         );
                     }
                 } else {
@@ -234,48 +300,10 @@ impl PlayerCommand {
                 cmds
             }
             Self::SetPerformanceMode(perf, shader, _profile) => {
-                let (max_b, back_b) = perf.demuxer_limits();
-                let mut cmds = vec![
-                    json!({"command": ["set_property", "demuxer-max-bytes", max_b]}).to_string(),
-                    json!({"command": ["set_property", "demuxer-max-back-bytes", back_b]}).to_string(),
-                ];
-                match perf {
-                    PerformanceMode::Efficient => {
-                        cmds.push(json!({"command": ["set_property", "scale", "spline36"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "cscale", "bilinear"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "deband", "no"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "temporal-dither", "no"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "vd-lavc-fast", "yes"]}).to_string());
-                    }
-                    PerformanceMode::Balanced => {
-                        cmds.push(json!({"command": ["set_property", "scale", "ewa_lanczos"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "cscale", "ewa_lanczos"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "deband-iterations", 1]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "temporal-dither", "no"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "vd-lavc-fast", "no"]}).to_string());
-                    }
-                    PerformanceMode::Quality => {
-                        cmds.push(json!({"command": ["set_property", "scale", "ewa_lanczossharp"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "cscale", "ewa_lanczossharp"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "deband-iterations", 3]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "temporal-dither", "yes"]}).to_string());
-                        cmds.push(json!({"command": ["set_property", "vd-lavc-fast", "no"]}).to_string());
-                    }
-                }
-                if let Some(shaders) = prepare_video_shaders_for(*shader, *perf) {
-                    cmds.push(
-                        json!({"command": ["change-list", "glsl-shaders", "set", shaders]})
-                            .to_string(),
-                    );
-                } else {
-                    cmds.push(
-                        json!({"command": ["change-list", "glsl-shaders", "clr", ""]})
-                            .to_string(),
-                    );
-                }
-                cmds
+                mastering_ipc_commands(*perf, *shader, ManualMasteringConfig::from_preset(*perf))
+            }
+            Self::ApplyManualMastering(manual, shader, _profile) => {
+                mastering_ipc_commands(PerformanceMode::Manual, *shader, *manual)
             }
             Self::SetMotionMode(motion) => match motion {
                 MotionMode::Off => vec![
@@ -900,6 +928,18 @@ mod tests {
         .to_mpv_json_commands();
         assert!(eco_cmds.iter().any(|c| c.contains("\"48MiB\"")));
         assert!(eco_cmds.iter().any(|c| c.contains("00_light_cas.glsl")));
+
+        let mut custom = ManualMasteringConfig::from_preset(PerformanceMode::Balanced);
+        custom.hdr_compute_peak = false;
+        custom.tone_map = crate::config::ToneMapMode::St2094_40;
+        let man_cmds = PlayerCommand::ApplyManualMastering(
+            custom,
+            VideoShaderMode::Reference4K,
+            VideoMasteringProfile::StandardHd,
+        )
+        .to_mpv_json_commands();
+        assert!(man_cmds.iter().any(|c| c.contains("\"st2094-40\"")));
+        assert!(man_cmds.iter().any(|c| c.contains("\"hdr-compute-peak\",\"no\"")));
 
         let cache_line = r#"{"event":"property-change","id":19,"name":"demuxer-cache-state","data":{"fw-bytes":52428800,"cache-duration":6.25,"seekable-ranges":[{"start":120.0,"end":485.5}]}}"#;
         assert!(matches!(parse_live_ipc_event(cache_line), Some(LiveIpcEvent::CacheBytes(52428800))));

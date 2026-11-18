@@ -1,11 +1,12 @@
 //! Cross-platform binary detector & non-blocking external video player launcher.
 
 use crate::config::{
-    Config, DubPreference, LiveStreamMode, MotionMode, PerformanceMode, Player, VideoShaderMode,
+    Config, DubPreference, LiveStreamMode, ManualMasteringConfig, MotionMode, PerformanceMode,
+    Player, VideoShaderMode,
 };
 use crate::error::{AppError, Result};
 use crate::services::shaders::{
-    mpv_mastering_flags_for, prepare_video_shaders_for, VideoMasteringProfile,
+    mpv_mastering_flags_with_manual, prepare_video_shaders_with_mastering, VideoMasteringProfile,
 };
 use crate::services::substyler::SubtitleStyleConfig;
 use std::env;
@@ -123,6 +124,7 @@ pub struct PlayOptions {
     pub shader_mode: VideoShaderMode,
     pub mastering_profile: VideoMasteringProfile,
     pub performance_mode: PerformanceMode,
+    pub manual_mastering: ManualMasteringConfig,
     pub motion_mode: MotionMode,
     pub dub_preference: DubPreference,
     pub dub_lang: String,
@@ -373,13 +375,30 @@ pub fn youtube_watch_url(video_id: &str) -> String {
 
 fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     let use_live_pipeline = opts.is_live && opts.live_mode != LiveStreamMode::Off;
+    let eff_master = if opts.performance_mode == PerformanceMode::Manual {
+        opts.manual_mastering
+    } else {
+        ManualMasteringConfig::from_preset(opts.performance_mode)
+    };
     let (max_buf, back_buf) = if use_live_pipeline {
         opts.live_mode.demuxer_limits()
     } else {
-        opts.performance_mode.demuxer_limits()
+        eff_master.demuxer_cache.limits()
+    };
+    let hwdec_val = if opts.performance_mode == PerformanceMode::Manual {
+        eff_master.hwdec.mpv_value()
+    } else if matches!(
+        eff_master.hwdec,
+        crate::config::HwdecMode::VideoToolbox
+    ) && cfg!(target_os = "macos")
+        && opts.performance_mode == PerformanceMode::Balanced
+    {
+        "videotoolbox"
+    } else {
+        "auto-safe"
     };
     let mut flags = vec![
-        "hwdec=auto-safe".to_string(),
+        format!("hwdec={hwdec_val}"),
         "vo=gpu-next".to_string(),
         "gpu-api=auto".to_string(),
         "cache=yes".to_string(),
@@ -474,11 +493,12 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
 
     if opts.local_file.is_none() {
         flags.push(format!("ytdl-format={}", opts.quality_format));
+        let vcodec_order = eff_master.codec_priority.format_sort_vcodec();
         let sort_spec = match opts.dub_preference {
             // Keep `lang` ahead of `abr` so YouTube's `language_preference=10` (Original)
             // never loses to slightly higher-bitrate AI-dubbed audio tracks.
-            DubPreference::OriginalOnly => "lang,res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr",
-            DubPreference::PreferDubbed => "res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr",
+            DubPreference::OriginalOnly => format!("lang,res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr"),
+            DubPreference::PreferDubbed => format!("res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr"),
         };
         flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
         if !use_live_pipeline && opts.performance_mode.loads_multistreams(opts.audio_multistreams) {
@@ -538,10 +558,19 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     let allow_shaders =
         !use_live_pipeline || opts.live_mode == LiveStreamMode::SmoothDvr;
     if allow_shaders {
-        if let Some(shaders) = prepare_video_shaders_for(opts.shader_mode, opts.performance_mode) {
+        if let Some(shaders) = prepare_video_shaders_with_mastering(
+            opts.shader_mode,
+            opts.performance_mode,
+            Some(eff_master),
+        ) {
             flags.push(format!("glsl-shaders={}", shaders));
         }
-        for flag in mpv_mastering_flags_for(opts.shader_mode, opts.mastering_profile, opts.performance_mode) {
+        for flag in mpv_mastering_flags_with_manual(
+            opts.shader_mode,
+            opts.mastering_profile,
+            opts.performance_mode,
+            Some(eff_master),
+        ) {
             flags.push(flag.trim_start_matches("--").to_string());
         }
     }
@@ -735,6 +764,7 @@ mod tests {
             shader_mode: VideoShaderMode::Balanced,
             mastering_profile: VideoMasteringProfile::StandardHd,
             performance_mode: PerformanceMode::Quality,
+            manual_mastering: ManualMasteringConfig::default(),
             motion_mode: MotionMode::Smooth120Hz,
             dub_preference: DubPreference::OriginalOnly,
             dub_lang: "en".to_string(),
@@ -771,6 +801,22 @@ mod tests {
         assert!(eco_args.iter().any(|a| a == "--demuxer-max-bytes=48MiB"));
         assert!(!eco_args.iter().any(|a| a.contains("audio-multistreams")));
         assert!(eco_args.iter().any(|a| a == "--scale=spline36"));
+
+        let mut bal_opts = opts.clone();
+        bal_opts.performance_mode = PerformanceMode::Balanced;
+        let bal_args = build_mpv_args(&bal_opts);
+        assert!(bal_args.iter().any(|a| a == "--hdr-compute-peak=no"));
+        assert!(bal_args.iter().any(|a| a == "--cscale=mitchell"));
+        assert!(bal_args.iter().any(|a| a.contains("vcodec:vp9.2:vp9:h264:av01")));
+
+        let mut man_opts = opts.clone();
+        man_opts.performance_mode = PerformanceMode::Manual;
+        man_opts.manual_mastering.super_res = crate::config::SuperResMode::Auto1080p;
+        man_opts.manual_mastering.tone_map = crate::config::ToneMapMode::Bt2446a;
+        man_opts.manual_mastering.hdr_compute_peak = true;
+        let man_args = build_mpv_args(&man_opts);
+        assert!(man_args.iter().any(|a| a == "--tone-mapping=bt.2446a"));
+        assert!(man_args.iter().any(|a| a == "--hdr-compute-peak=yes"));
     }
 
     #[test]
@@ -791,6 +837,7 @@ mod tests {
             shader_mode: VideoShaderMode::Reference4K,
             mastering_profile: VideoMasteringProfile::StandardHd,
             performance_mode: PerformanceMode::Quality,
+            manual_mastering: ManualMasteringConfig::default(),
             motion_mode: MotionMode::Cadence,
             dub_preference: DubPreference::PreferDubbed,
             dub_lang: "ar".to_string(),
@@ -830,6 +877,7 @@ mod tests {
             shader_mode: VideoShaderMode::Reference4K,
             mastering_profile: VideoMasteringProfile::StandardHd,
             performance_mode: PerformanceMode::Quality,
+            manual_mastering: ManualMasteringConfig::default(),
             motion_mode: MotionMode::Smooth120Hz,
             dub_preference: DubPreference::OriginalOnly,
             dub_lang: "en".to_string(),
