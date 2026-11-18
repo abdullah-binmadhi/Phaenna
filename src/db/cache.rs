@@ -91,6 +91,15 @@ impl VideoItem {
         }
     }
 
+    pub fn is_live_stream(&self) -> bool {
+        self.is_live == Some(true)
+            || self
+                .duration_string
+                .as_deref()
+                .map(|s| s.trim().eq_ignore_ascii_case("live"))
+                .unwrap_or(false)
+    }
+
     pub fn best_thumbnail_url(&self) -> String {
         if let Some(ref t) = self.thumbnails {
             if let Some(th) = t

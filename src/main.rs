@@ -1752,6 +1752,12 @@ async fn handle_app_message(
             state.reset_live_playback();
             state.active_playback_video_id = Some(video_id.clone());
             state.active_playback_title = Some(title.clone());
+            state.live_playback.is_live_stream = state
+                .all_known_videos()
+                .into_iter()
+                .find(|v| v.id == video_id)
+                .map(|v| v.is_live_stream())
+                .unwrap_or(false);
             state.active_session_id = session_id;
             state.active_playback_pos = 0.0;
             state.active_playback_dur = 0.0;
@@ -2395,26 +2401,64 @@ async fn start_nonblocking_playback(
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
 ) {
+    start_nonblocking_playback_with_live_opts(
+        video,
+        start_override,
+        false,
+        false,
+        state,
+        pool,
+        tx,
+        client,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_nonblocking_playback_with_live_opts(
+    video: &VideoItem,
+    start_override: Option<f64>,
+    force_from_start: bool,
+    force_audio_radio: bool,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let is_live = video.is_live_stream();
     let quality = Quality::ALL
         .get(state.play_quality_idx)
         .copied()
         .unwrap_or(state.config.quality);
+    let eff_quality = if force_audio_radio {
+        Quality::AudioOnly
+    } else {
+        quality
+    };
     let session_id = state.active_session_id.wrapping_add(1).max(1);
     let sock_path = ipc_socket_path(video.clean_id(), session_id);
-    let start_pos = start_override.or_else(|| {
-        state.progress_map.get(&video.id).and_then(|(p, dur)| {
-            if *dur > 10.0 && *p >= *dur - 8.0 {
-                None
-            } else {
-                Some(*p)
-            }
+    let start_pos = if is_live {
+        None
+    } else {
+        start_override.or_else(|| {
+            state.progress_map.get(&video.id).and_then(|(p, dur)| {
+                if *dur > 10.0 && *p >= *dur - 8.0 {
+                    None
+                } else {
+                    Some(*p)
+                }
+            })
         })
-    });
-    let local_file = state
-        .offline_paths
-        .get(&video.id)
-        .map(PathBuf::from)
-        .filter(|p| p.exists());
+    };
+    let local_file = if is_live {
+        None
+    } else {
+        state
+            .offline_paths
+            .get(&video.id)
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+    };
 
     let sub_url = if state.config.subtitles_enabled {
         state
@@ -2430,11 +2474,22 @@ async fn start_nonblocking_playback(
         let _ = state.auth_vault.sync_isolated_cookie_jar(cpath);
     }
 
-    let ytdl_format = quality.ytdl_format_with_dub(
-        state.config.dub_preference,
-        &state.config.dub_lang,
-        state.config.performance_mode.loads_multistreams(state.config.audio_multistreams),
-    );
+    let ytdl_format = if is_live {
+        eff_quality.ytdl_format_for_live(
+            state.config.live_mode,
+            state.config.dub_preference,
+            &state.config.dub_lang,
+        )
+    } else {
+        eff_quality.ytdl_format_with_dub(
+            state.config.dub_preference,
+            &state.config.dub_lang,
+            state
+                .config
+                .performance_mode
+                .loads_multistreams(state.config.audio_multistreams),
+        )
+    };
     let opts = PlayOptions {
         video_id: video.id.clone(),
         title: video.title.clone(),
@@ -2460,6 +2515,10 @@ async fn start_nonblocking_playback(
         dub_lang: state.config.dub_lang.clone(),
         audio_multistreams: state.config.audio_multistreams,
         audio_loudnorm: state.config.audio_loudnorm,
+        is_live,
+        live_mode: state.config.live_mode,
+        live_from_start: force_from_start,
+        live_auto_catchup: state.config.live_auto_catchup,
     };
 
     match spawn_player(&opts) {
@@ -2516,14 +2575,30 @@ async fn start_nonblocking_playback(
                 .await;
             });
 
-            state.show_toast(format!(
-                "Playing via {} ({})",
-                state.config.player.label(),
-                quality.label()
-            ));
+            let toast_msg = if force_audio_radio {
+                format!(
+                    "Live Radio ({} Audio-Only)",
+                    state.config.player.label()
+                )
+            } else if is_live {
+                format!(
+                    "Playing Live ({} / {})",
+                    eff_quality.label(),
+                    state.config.live_mode.label()
+                )
+            } else {
+                format!(
+                    "Playing via {} ({})",
+                    state.config.player.label(),
+                    eff_quality.label()
+                )
+            };
+            state.show_toast(toast_msg);
 
             if state.config.player == Player::Mpv {
-                let mut sb_segs = if !state.detail_sponsor_segments.is_empty()
+                let mut sb_segs = if is_live {
+                    Vec::new()
+                } else if !state.detail_sponsor_segments.is_empty()
                     && state
                         .detail_video
                         .as_ref()
@@ -2536,11 +2611,13 @@ async fn start_nonblocking_playback(
                         .await
                         .unwrap_or_default()
                 };
-                sb_segs = filter_segments_for_mode_with_outro(
-                    &sb_segs,
-                    state.config.sponsorblock_mode,
-                    state.config.skip_outro,
-                );
+                if !is_live {
+                    sb_segs = filter_segments_for_mode_with_outro(
+                        &sb_segs,
+                        state.config.sponsorblock_mode,
+                        state.config.skip_outro,
+                    );
+                }
 
                 let _ = tx
                     .send(AppMessage::PlaybackStarted {
@@ -2558,6 +2635,7 @@ async fn start_nonblocking_playback(
                     channel_name: video.display_uploader().to_string(),
                     duration_hint_secs: video.duration.unwrap_or(0) as f64,
                     initial_pos_secs: start_pos.unwrap_or(0.0),
+                    is_live,
                     sock_path,
                     pool: pool.clone(),
                     tx: tx.clone(),
@@ -2581,7 +2659,9 @@ async fn start_nonblocking_playback(
                         raw_elapsed
                     };
                     if watched >= 5.0 {
-                        let done = dur_ext >= 60.0 && ((start_ext + watched) / dur_ext) >= 0.85;
+                        let done = !is_live
+                            && dur_ext >= 60.0
+                            && ((start_ext + watched) / dur_ext) >= 0.85;
                         let _ = upsert_watch_session(
                             &p_ext,
                             &WatchSessionWrite {
@@ -3286,18 +3366,8 @@ async fn toggle_dub_live_or_config(
     }
 }
 
-async fn relaunch_live_video_from_pos(
-    state: &mut AppState,
-    pool: &SqlitePool,
-    tx: &mpsc::Sender<AppMessage>,
-    client: &reqwest::Client,
-) {
-    let resume_at = if state.active_playback_pos > 2.0 {
-        Some(state.active_playback_pos)
-    } else {
-        None
-    };
-    let target_vid = if let Some(ref vid_id) = state.active_playback_video_id {
+fn active_or_selected_video(state: &AppState) -> Option<VideoItem> {
+    if let Some(ref vid_id) = state.active_playback_video_id {
         state
             .all_known_videos()
             .into_iter()
@@ -3305,6 +3375,63 @@ async fn relaunch_live_video_from_pos(
             .or_else(|| state.active_selected_video())
     } else {
         state.active_selected_video()
+    }
+}
+
+fn cycle_live_mode(state: &mut AppState) {
+    state.config.live_mode = state.config.live_mode.next();
+    let _ = state.config.save();
+    let msg = if state.live_playback.is_live_stream && state.has_live_ipc() {
+        format!(
+            "Live Profile: {} (press Enter to apply)",
+            state.config.live_mode.label()
+        )
+    } else {
+        format!("Live Profile: {}", state.config.live_mode.label())
+    };
+    state.show_toast(msg);
+}
+
+async fn relaunch_with_live_opts(
+    video: &VideoItem,
+    force_from_start: bool,
+    force_audio_radio: bool,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    if state.has_live_ipc() {
+        state.send_player_cmd(PlayerCommand::Stop);
+    }
+    start_nonblocking_playback_with_live_opts(
+        video,
+        None,
+        force_from_start,
+        force_audio_radio,
+        state,
+        pool,
+        tx,
+        client,
+    )
+    .await;
+}
+
+async fn relaunch_live_video_from_pos(
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    let target_vid = active_or_selected_video(state);
+    let is_live = target_vid
+        .as_ref()
+        .map(|v| v.is_live_stream())
+        .unwrap_or(false);
+    let resume_at = if !is_live && state.active_playback_pos > 2.0 {
+        Some(state.active_playback_pos)
+    } else {
+        None
     };
     if state.has_live_ipc() {
         state.send_player_cmd(PlayerCommand::Stop);
@@ -3562,6 +3689,40 @@ async fn apply_play_options_hit(
                 start_nonblocking_playback(&v, None, state, pool, tx, client).await;
             }
         }
+        PlayOptionsHit::CycleLiveMode => {
+            cycle_live_mode(state);
+        }
+        PlayOptionsHit::ToggleLiveCatchup => {
+            state.config.live_auto_catchup = !state.config.live_auto_catchup;
+            let _ = state.config.save();
+            state.show_toast(format!(
+                "Live Edge Auto-Catchup: {}",
+                if state.config.live_auto_catchup {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            ));
+        }
+        PlayOptionsHit::JumpToLiveEdge => {
+            if state.send_player_cmd(PlayerCommand::JumpToLiveEdge) {
+                state.show_toast("Jumping to Live Edge...");
+            } else {
+                state.show_toast("Start mpv live playback first");
+            }
+        }
+        PlayOptionsHit::PlayLiveFromStart => {
+            state.overlay = ActiveOverlay::None;
+            if let Some(v) = active_or_selected_video(state) {
+                relaunch_with_live_opts(&v, true, false, state, pool, tx, client).await;
+            }
+        }
+        PlayOptionsHit::LaunchAudioRadio => {
+            state.overlay = ActiveOverlay::None;
+            if let Some(v) = active_or_selected_video(state) {
+                relaunch_with_live_opts(&v, false, true, state, pool, tx, client).await;
+            }
+        }
         PlayOptionsHit::StopPlayer => {
             state.send_player_cmd(PlayerCommand::Stop);
             state.overlay = ActiveOverlay::None;
@@ -3587,6 +3748,11 @@ async fn apply_now_playing_hit(
         }
         NowPlayingHit::SeekFwd => {
             state.send_player_cmd(PlayerCommand::SeekRelative(10.0));
+        }
+        NowPlayingHit::JumpToLiveEdge => {
+            if state.send_player_cmd(PlayerCommand::JumpToLiveEdge) {
+                state.show_toast("Jumping to Live Edge...");
+            }
         }
         NowPlayingHit::ToggleDub => {
             toggle_dub_live_or_config(state, pool, tx, client).await;
@@ -3615,6 +3781,9 @@ async fn apply_now_playing_hit(
         NowPlayingHit::CycleMotion => {
             let next = state.config.motion_mode.next();
             apply_motion_mode(state, next);
+        }
+        NowPlayingHit::CycleLiveMode => {
+            cycle_live_mode(state);
         }
         NowPlayingHit::OpenStudio => {
             state.overlay = ActiveOverlay::PlayOptions;
@@ -4079,6 +4248,21 @@ async fn handle_mouse_event(
                                 if let Some(v) = state.detail_video.clone() {
                                     start_nonblocking_playback(&v, None, state, pool, tx, client).await;
                                 }
+                            }
+                            DetailHit::PlayLiveFromStart => {
+                                if let Some(v) = state.detail_video.clone() {
+                                    relaunch_with_live_opts(&v, true, false, state, pool, tx, client)
+                                        .await;
+                                }
+                            }
+                            DetailHit::PlayAudioRadio => {
+                                if let Some(v) = state.detail_video.clone() {
+                                    relaunch_with_live_opts(&v, false, true, state, pool, tx, client)
+                                        .await;
+                                }
+                            }
+                            DetailHit::CycleLiveMode => {
+                                cycle_live_mode(state);
                             }
                             DetailHit::VoteLike => {
                                 toggle_video_vote(VideoVote::Liked, state, pool, tx, client).await;
@@ -4727,6 +4911,33 @@ async fn handle_key_event(
                         spawn_offline_download(&v, state, pool, tx);
                     }
                 }
+                KeyCode::Char('E') => {
+                    if state.send_player_cmd(PlayerCommand::JumpToLiveEdge) {
+                        state.show_toast("Jumping to Live Edge...");
+                    }
+                }
+                KeyCode::Char('S') => {
+                    if let Some(v) = state.detail_video.clone() {
+                        if v.is_live_stream() {
+                            relaunch_with_live_opts(&v, true, false, state, pool, tx, client).await;
+                        }
+                    }
+                }
+                KeyCode::Char('R') => {
+                    if let Some(v) = state.detail_video.clone() {
+                        relaunch_with_live_opts(&v, false, true, state, pool, tx, client).await;
+                    }
+                }
+                KeyCode::Char('L') => {
+                    if state
+                        .detail_video
+                        .as_ref()
+                        .map(|v| v.is_live_stream())
+                        .unwrap_or(false)
+                    {
+                        cycle_live_mode(state);
+                    }
+                }
                 KeyCode::Char('M') => state.overlay = ActiveOverlay::Remote,
                 KeyCode::Char('C') => execute_hub_action(HubActionId::CastScan, state, pool, tx, client).await,
                 KeyCode::Char('s') | KeyCode::Char(',') => state.overlay = ActiveOverlay::Settings,
@@ -5205,6 +5416,24 @@ async fn handle_overlay_key(
                 state.live_playback.saturation = 0;
                 state.live_playback.gamma = 0;
                 state.send_player_cmd(PlayerCommand::ResetPicture);
+            }
+            KeyCode::Char('v') | KeyCode::Char('E') | KeyCode::Char('R') | KeyCode::Char('S') => {
+                let hit = match code {
+                    KeyCode::Char('v') => PlayOptionsHit::CycleLiveMode,
+                    KeyCode::Char('E') => PlayOptionsHit::JumpToLiveEdge,
+                    KeyCode::Char('R') => PlayOptionsHit::LaunchAudioRadio,
+                    _ => PlayOptionsHit::PlayLiveFromStart,
+                };
+                apply_play_options_hit(
+                    hit,
+                    0,
+                    ratatui::layout::Rect::default(),
+                    state,
+                    pool,
+                    tx,
+                    client,
+                )
+                .await;
             }
             KeyCode::Char('X') => {
                 state.send_player_cmd(PlayerCommand::Stop);

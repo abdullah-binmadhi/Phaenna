@@ -1,6 +1,8 @@
 //! Cross-platform binary detector & non-blocking external video player launcher.
 
-use crate::config::{Config, DubPreference, MotionMode, PerformanceMode, Player, VideoShaderMode};
+use crate::config::{
+    Config, DubPreference, LiveStreamMode, MotionMode, PerformanceMode, Player, VideoShaderMode,
+};
 use crate::error::{AppError, Result};
 use crate::services::shaders::{
     mpv_mastering_flags_for, prepare_video_shaders_for, VideoMasteringProfile,
@@ -126,6 +128,10 @@ pub struct PlayOptions {
     pub dub_lang: String,
     pub audio_multistreams: bool,
     pub audio_loudnorm: bool,
+    pub is_live: bool,
+    pub live_mode: LiveStreamMode,
+    pub live_from_start: bool,
+    pub live_auto_catchup: bool,
 }
 
 pub const LOUDNORM_FILTER: &str = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]";
@@ -162,6 +168,68 @@ c cycle sub-visibility
 HOME seek 0 absolute
 END seek 99 absolute-percent
 d cycle aid
+L script-binding phaenna-snap-live-edge
+"#;
+
+const PHAENNA_LIVE_LUA: &str = r#"-- Phaenna Live Edge Controller: automatic drift catch-up (with DVR rewind guard) & Shift+L snap
+local catchup_on = (mp.get_opt("phaenna_live_catchup") or "1") == "1"
+local trigger_lag = tonumber(mp.get_opt("phaenna_live_trigger") or "12.0") or 12.0
+local target_lag = tonumber(mp.get_opt("phaenna_live_target") or "4.5") or 4.5
+local catchup_spd = tonumber(mp.get_opt("phaenna_live_speed") or "1.04") or 1.04
+local catching_up = false
+
+local function max_seekable_end()
+    local st = mp.get_property_native("demuxer-cache-state")
+    if not st or not st["seekable-ranges"] then return nil end
+    local best = nil
+    for _, r in ipairs(st["seekable-ranges"]) do
+        if r["end"] and (best == nil or r["end"] > best) then
+            best = r["end"]
+        end
+    end
+    return best
+end
+
+local function jump_to_live_edge()
+    local max_end = max_seekable_end()
+    if max_end then
+        local dest = math.max(0.0, max_end - target_lag)
+        mp.commandv("seek", dest, "absolute")
+        mp.set_property_number("speed", 1.0)
+        catching_up = false
+        mp.osd_message(string.format("LIVE EDGE (-%.1fs)", target_lag), 2.0)
+    else
+        mp.osd_message("LIVE EDGE (buffering manifest...)", 1.5)
+    end
+end
+
+mp.add_forced_key_binding("L", "phaenna-snap-live-edge", jump_to_live_edge)
+
+mp.add_periodic_timer(1.5, function()
+    if not catchup_on then return end
+    if mp.get_property_bool("pause", false) then return end
+    local pos = mp.get_property_number("time-pos", nil)
+    local max_end = max_seekable_end()
+    if not pos or not max_end then return end
+    local lag = max_end - pos
+    -- Respect intentional DVR rewinding (>30s behind): never rush user back against their will.
+    if lag > 30.0 then
+        if catching_up then
+            mp.set_property_number("speed", 1.0)
+            catching_up = false
+        end
+        return
+    end
+    if lag >= trigger_lag then
+        if not catching_up then
+            catching_up = true
+            mp.set_property_number("speed", catchup_spd)
+        end
+    elseif catching_up and lag <= target_lag then
+        catching_up = false
+        mp.set_property_number("speed", 1.0)
+    end
+end)
 "#;
 
 const PHAENNA_LOADER_LUA: &str = r#"-- Phaenna Animated ASS Loading Bar Overlay (replaces startup black screen until first frame)
@@ -286,6 +354,14 @@ pub fn prepare_loading_overlay_script() -> Option<PathBuf> {
     std::fs::write(&path, PHAENNA_LOADER_LUA).ok().map(|_| path)
 }
 
+/// Write `mpv` live-edge controller Lua script and return its path.
+pub fn prepare_live_controller_script() -> Option<PathBuf> {
+    let dir = player_support_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("phaenna_live.lua");
+    std::fs::write(&path, PHAENNA_LIVE_LUA).ok().map(|_| path)
+}
+
 fn sanitize_script_opt(s: &str) -> String {
     s.replace([',', '\n', '\r', '='], " ").trim().to_string()
 }
@@ -296,7 +372,12 @@ pub fn youtube_watch_url(video_id: &str) -> String {
 }
 
 fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
-    let (max_buf, back_buf) = opts.performance_mode.demuxer_limits();
+    let use_live_pipeline = opts.is_live && opts.live_mode != LiveStreamMode::Off;
+    let (max_buf, back_buf) = if use_live_pipeline {
+        opts.live_mode.demuxer_limits()
+    } else {
+        opts.performance_mode.demuxer_limits()
+    };
     let mut flags = vec![
         "hwdec=auto-safe".to_string(),
         "vo=gpu-next".to_string(),
@@ -307,38 +388,88 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         format!("force-media-title={}", opts.title),
     ];
 
+    if opts.quality_format.starts_with("bestaudio") {
+        flags.push("vid=no".to_string());
+    }
+
     if let Some(conf_path) = prepare_youtube_input_conf() {
         flags.push(format!("input-conf={}", conf_path.to_string_lossy()));
     }
+
+    let mut script_opt_parts: Vec<String> = Vec::new();
     if let Some(lua_path) = prepare_loading_overlay_script() {
         flags.push(format!("script={}", lua_path.to_string_lossy()));
         let safe_title = sanitize_script_opt(&opts.title);
-        let safe_meta = format!(
-            "PHAENNA {} | {}",
-            opts.performance_mode.short_badge(),
-            opts.motion_mode.short_badge()
-        );
-        flags.push(format!(
-            "script-opts=phaenna_title={safe_title},phaenna_meta={safe_meta}"
-        ));
+        let safe_meta = if use_live_pipeline {
+            format!("PHAENNA LIVE | {}", opts.live_mode.short_badge())
+        } else {
+            format!(
+                "PHAENNA {} | {}",
+                opts.performance_mode.short_badge(),
+                opts.motion_mode.short_badge()
+            )
+        };
+        script_opt_parts.push(format!("phaenna_title={safe_title}"));
+        script_opt_parts.push(format!("phaenna_meta={safe_meta}"));
     }
 
-    match opts.motion_mode {
-        MotionMode::Off => {
-            flags.push("interpolation=no".to_string());
+    if use_live_pipeline {
+        flags.push(format!(
+            "demuxer-readahead-secs={}",
+            opts.live_mode.readahead_secs()
+        ));
+        flags.push(format!(
+            "cache-pause-initial={}",
+            if opts.live_mode.cache_pause_initial() { "yes" } else { "no" }
+        ));
+        flags.push(format!(
+            "cache-pause-wait={:.1}",
+            opts.live_mode.cache_pause_wait_secs()
+        ));
+        flags.push("network-timeout=15".to_string());
+        flags.push("hls-bitrate=max".to_string());
+        flags.push("stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=4".to_string());
+        flags.push("video-sync=audio".to_string());
+        flags.push("interpolation=no".to_string());
+
+        if let Some(live_lua) = prepare_live_controller_script() {
+            flags.push(format!("scripts-append={}", live_lua.to_string_lossy()));
+            let (trig, tgt, spd) = opts
+                .live_mode
+                .catchup_threshold_and_speed()
+                .unwrap_or((999.0, 15.0, 1.0));
+            let active_catchup = opts.live_auto_catchup
+                && opts.live_mode.catchup_threshold_and_speed().is_some();
+            script_opt_parts.push(format!(
+                "phaenna_live_catchup={}",
+                if active_catchup { "1" } else { "0" }
+            ));
+            script_opt_parts.push(format!("phaenna_live_trigger={trig:.1}"));
+            script_opt_parts.push(format!("phaenna_live_target={tgt:.1}"));
+            script_opt_parts.push(format!("phaenna_live_speed={spd:.2}"));
         }
-        MotionMode::Cadence => {
-            flags.push("video-sync=display-resample".to_string());
-            flags.push("interpolation=yes".to_string());
-            flags.push("tscale=oversample".to_string());
+    } else {
+        match opts.motion_mode {
+            MotionMode::Off => {
+                flags.push("interpolation=no".to_string());
+            }
+            MotionMode::Cadence => {
+                flags.push("video-sync=display-resample".to_string());
+                flags.push("interpolation=yes".to_string());
+                flags.push("tscale=oversample".to_string());
+            }
+            MotionMode::Smooth120Hz => {
+                flags.push("video-sync=display-resample".to_string());
+                flags.push("interpolation=yes".to_string());
+                flags.push("tscale=catmull_rom".to_string());
+                flags.push("interpolation-threshold=0.01".to_string());
+                flags.push("override-display-fps=120".to_string());
+            }
         }
-        MotionMode::Smooth120Hz => {
-            flags.push("video-sync=display-resample".to_string());
-            flags.push("interpolation=yes".to_string());
-            flags.push("tscale=catmull_rom".to_string());
-            flags.push("interpolation-threshold=0.01".to_string());
-            flags.push("override-display-fps=120".to_string());
-        }
+    }
+
+    if !script_opt_parts.is_empty() {
+        flags.push(format!("script-opts={}", script_opt_parts.join(",")));
     }
 
     if opts.local_file.is_none() {
@@ -350,8 +481,11 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             DubPreference::PreferDubbed => "res:2160,fps,hdr,vcodec:av01:vp9.2:vp9,vbr,abr",
         };
         flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
-        if opts.performance_mode.loads_multistreams(opts.audio_multistreams) {
+        if !use_live_pipeline && opts.performance_mode.loads_multistreams(opts.audio_multistreams) {
             flags.push("ytdl-raw-options-append=audio-multistreams=".to_string());
+        }
+        if use_live_pipeline && opts.live_from_start {
+            flags.push("ytdl-raw-options-append=live-from-start=".to_string());
         }
         if let Some(ref cpath) = opts.cookies_path {
             if cpath.exists() {
@@ -380,9 +514,11 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         flags.push(format!("af={LOUDNORM_FILTER}"));
     }
 
-    if let Some(start) = opts.start_pos {
-        if start > 3.0 {
-            flags.push(format!("start={:.1}", start));
+    if !use_live_pipeline {
+        if let Some(start) = opts.start_pos {
+            if start > 3.0 {
+                flags.push(format!("start={:.1}", start));
+            }
         }
     }
 
@@ -398,11 +534,16 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         }
     }
 
-    if let Some(shaders) = prepare_video_shaders_for(opts.shader_mode, opts.performance_mode) {
-        flags.push(format!("glsl-shaders={}", shaders));
-    }
-    for flag in mpv_mastering_flags_for(opts.shader_mode, opts.mastering_profile, opts.performance_mode) {
-        flags.push(flag.trim_start_matches("--").to_string());
+    // Bypass heavy 4K GLSL shader chains in LowLatency / BalancedLive to avoid frame drops on live streams.
+    let allow_shaders =
+        !use_live_pipeline || opts.live_mode == LiveStreamMode::SmoothDvr;
+    if allow_shaders {
+        if let Some(shaders) = prepare_video_shaders_for(opts.shader_mode, opts.performance_mode) {
+            flags.push(format!("glsl-shaders={}", shaders));
+        }
+        for flag in mpv_mastering_flags_for(opts.shader_mode, opts.mastering_profile, opts.performance_mode) {
+            flags.push(flag.trim_start_matches("--").to_string());
+        }
     }
 
     flags
@@ -599,6 +740,10 @@ mod tests {
             dub_lang: "en".to_string(),
             audio_multistreams: true,
             audio_loudnorm: true,
+            is_live: false,
+            live_mode: LiveStreamMode::BalancedLive,
+            live_from_start: false,
+            live_auto_catchup: true,
         };
 
         let args = build_mpv_args(&opts);
@@ -651,6 +796,10 @@ mod tests {
             dub_lang: "ar".to_string(),
             audio_multistreams: true,
             audio_loudnorm: false,
+            is_live: false,
+            live_mode: LiveStreamMode::BalancedLive,
+            live_from_start: false,
+            live_auto_catchup: true,
         };
 
         let args = build_iina_args(&opts);
@@ -661,5 +810,47 @@ mod tests {
         assert!(args.iter().any(|a| a == "--mpv-start=18.0"));
         assert!(args.iter().any(|a| a == "--mpv-alang=ar"));
         assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
+    }
+
+    #[test]
+    fn test_live_stream_mode_mpv_flags() {
+        let opts = PlayOptions {
+            video_id: "liveStream1".to_string(),
+            title: "24/7 Live Stream".to_string(),
+            local_file: None,
+            quality_format: "best[height<=?1080][vcodec!^=av01][protocol^=m3u8]/best".to_string(),
+            player: Player::Mpv,
+            cookies_path: None,
+            start_pos: Some(120.0),
+            ipc_socket: None,
+            subtitles_enabled: false,
+            sub_lang: None,
+            sub_url: None,
+            sub_style: SubtitleStyleConfig::default(),
+            shader_mode: VideoShaderMode::Reference4K,
+            mastering_profile: VideoMasteringProfile::StandardHd,
+            performance_mode: PerformanceMode::Quality,
+            motion_mode: MotionMode::Smooth120Hz,
+            dub_preference: DubPreference::OriginalOnly,
+            dub_lang: "en".to_string(),
+            audio_multistreams: true,
+            audio_loudnorm: false,
+            is_live: true,
+            live_mode: LiveStreamMode::LowLatency,
+            live_from_start: false,
+            live_auto_catchup: true,
+        };
+
+        let args = build_mpv_args(&opts);
+        assert!(args.iter().any(|a| a == "--video-sync=audio"));
+        assert!(args.iter().any(|a| a == "--interpolation=no"));
+        assert!(args.iter().any(|a| a == "--cache-pause-initial=no"));
+        assert!(args.iter().any(|a| a == "--cache-pause-wait=1.2"));
+        assert!(args.iter().any(|a| a == "--demuxer-readahead-secs=3"));
+        assert!(args.iter().any(|a| a.contains("reconnect=1")));
+        assert!(args.iter().any(|a| a.starts_with("--scripts-append=")));
+        assert!(!args.iter().any(|a| a.starts_with("--start=")));
+        assert!(!args.iter().any(|a| a.starts_with("--glsl-shaders=")));
+        assert!(!args.iter().any(|a| a.contains("audio-multistreams")));
     }
 }

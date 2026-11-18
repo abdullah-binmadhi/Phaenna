@@ -552,15 +552,43 @@ fn render_header_bar(
             Style::default().fg(pal.text_dim)
         };
 
-        let buttons: Vec<(String, Style, DetailHit)> = vec![
-            (
-                "[ Play Space ]".to_string(),
+        let mut buttons: Vec<(String, Style, DetailHit)> = vec![(
+            if video.is_live_stream() {
+                "[ Play Live Space ]".to_string()
+            } else {
+                "[ Play Space ]".to_string()
+            },
+            Style::default()
+                .fg(Color::Black)
+                .bg(pal.accent)
+                .add_modifier(Modifier::BOLD),
+            DetailHit::Play,
+        )];
+        if video.is_live_stream() {
+            buttons.push((
+                "[ From Start S ]".to_string(),
                 Style::default()
                     .fg(Color::Black)
-                    .bg(pal.accent)
+                    .bg(Color::Rgb(56, 189, 248))
                     .add_modifier(Modifier::BOLD),
-                DetailHit::Play,
-            ),
+                DetailHit::PlayLiveFromStart,
+            ));
+            buttons.push((
+                "[ Radio R ]".to_string(),
+                Style::default()
+                    .fg(pal.primary)
+                    .add_modifier(Modifier::BOLD),
+                DetailHit::PlayAudioRadio,
+            ));
+            buttons.push((
+                format!("[ {} L ]", state.config.live_mode.short_badge()),
+                Style::default()
+                    .fg(Color::Rgb(52, 211, 153))
+                    .add_modifier(Modifier::BOLD),
+                DetailHit::CycleLiveMode,
+            ));
+        }
+        buttons.extend([
             (like_lbl, like_st, DetailHit::VoteLike),
             (dislike_lbl, dislike_st, DetailHit::VoteDislike),
             (
@@ -578,7 +606,7 @@ fn render_header_bar(
                 Style::default().fg(pal.secondary),
                 DetailHit::Download,
             ),
-        ];
+        ]);
 
         let row2_y = inner.y + 1;
         let mut bx = inner.x;
@@ -1067,9 +1095,37 @@ fn render_mastering_panel(
         format!("{} ({sel})", state.detail_subtitles.len())
     };
     let source_str = if state.offline_paths.contains_key(&video.id) {
-        "Offline Vault"
+        "Offline Vault".to_string()
+    } else if video.is_live_stream() {
+        format!(
+            "Live ({} · {}s buf)",
+            state.config.live_mode.short_badge(),
+            state.config.live_mode.readahead_secs()
+        )
     } else {
-        "Adaptive Live"
+        "Adaptive Live".to_string()
+    };
+
+    let third_line = if video.is_live_stream() {
+        Line::from(vec![
+            Span::styled("Live  : ", Style::default().fg(pal.text_dim)),
+            Span::styled(
+                format!(
+                    "{} · wait {:.1}s [L Cycle · E Edge]",
+                    state.config.live_mode.label(),
+                    state.config.live_mode.cache_pause_wait_secs()
+                ),
+                Style::default().fg(Color::Rgb(52, 211, 153)),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Shader: ", Style::default().fg(pal.text_dim)),
+            Span::styled(
+                format!("{} · {source_str}", state.config.shader_mode.short_label()),
+                Style::default().fg(pal.accent),
+            ),
+        ])
     };
 
     let lines = vec![
@@ -1103,13 +1159,7 @@ fn render_mastering_panel(
                 Style::default().fg(pal.text),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("Shader: ", Style::default().fg(pal.text_dim)),
-            Span::styled(
-                format!("{} · {source_str}", state.config.shader_mode.short_label()),
-                Style::default().fg(pal.accent),
-            ),
-        ]),
+        third_line,
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }

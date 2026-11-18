@@ -53,6 +53,7 @@ pub struct IpcMonitorConfig {
     pub video_id: String,
     pub channel_id: Option<String>,
     pub channel_name: String,
+    pub is_live: bool,
     pub duration_hint_secs: f64,
     pub initial_pos_secs: f64,
     pub sock_path: String,
@@ -131,6 +132,10 @@ pub enum LiveIpcEvent {
     Saturation(i64),
     Gamma(i64),
     CacheBytes(u64),
+    LiveCacheTelemetry {
+        cache_ahead_secs: f64,
+        seekable_end_secs: f64,
+    },
     DroppedFrames(i64),
     Tracks {
         audio: Vec<LiveMediaTrack>,
@@ -160,6 +165,7 @@ pub enum PlayerCommand {
     ResetPicture,
     SetOnTop(bool),
     SetLoop(bool),
+    JumpToLiveEdge,
     Stop,
 }
 
@@ -304,6 +310,10 @@ impl PlayerCommand {
                 let v = if *on { "inf" } else { "no" };
                 vec![json!({"command": ["set_property", "loop-file", v]}).to_string()]
             }
+            Self::JumpToLiveEdge => vec![
+                json!({"command": ["script-binding", "phaenna-snap-live-edge"]}).to_string(),
+                json!({"command": ["set_property", "speed", 1.0]}).to_string(),
+            ],
             Self::Stop => vec![json!({"command": ["quit"]}).to_string()],
         }
     }
@@ -445,6 +455,31 @@ pub fn parse_live_ipc_event(line: &str) -> Option<LiveIpcEvent> {
         }
         _ => None,
     }
+}
+
+/// Parse optional buffer-duration & seekable-ranges end seconds from `demuxer-cache-state`.
+pub fn parse_live_cache_telemetry(line: &str) -> Option<(f64, f64)> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? != "property-change" {
+        return None;
+    }
+    if parsed.get("name")?.as_str()? != "demuxer-cache-state" {
+        return None;
+    }
+    let data = parsed.get("data")?;
+    let ahead = data
+        .get("cache-duration")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let end = data
+        .get("seekable-ranges")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.iter().filter_map(|r| r.get("end").and_then(Value::as_f64)).reduce(f64::max))
+        .or_else(|| data.get("cache-end").and_then(Value::as_f64))
+        .unwrap_or(0.0)
+        .max(0.0);
+    (ahead > 0.0 || end > 0.0).then_some((ahead, end))
 }
 
 /// EOF-safe SponsorBlock matcher: never seeks past `duration - 2.0s` so video endings aren't cut short.
@@ -678,7 +713,10 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                     }
                                 }
 
-                                if !marked_watched && is_completion_threshold_reached(last_pos, last_dur) {
+                                if !config.is_live
+                                    && !marked_watched
+                                    && is_completion_threshold_reached(last_pos, last_dur)
+                                {
                                     marked_watched = true;
                                     tracker.flush(&config, last_pos, last_dur, true).await;
                                     let _ = db::user::record_watched(
@@ -745,12 +783,26 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                             })
                             .await;
                     }
+                    if let Some((cache_ahead_secs, seekable_end_secs)) =
+                        parse_live_cache_telemetry(&line)
+                    {
+                        let _ = config
+                            .tx
+                            .send(AppMessage::PlaybackTelemetryUpdated {
+                                session_id: config.session_id,
+                                event: LiveIpcEvent::LiveCacheTelemetry {
+                                    cache_ahead_secs,
+                                    seekable_end_secs,
+                                },
+                            })
+                            .await;
+                    }
                 }
             }
         }
 
         // Persist final position and session telemetry when mpv closes
-        if last_pos > 3.0 {
+        if !config.is_live && last_pos > 3.0 {
             let _ = db::user::save_playback_progress(
                 &config.pool,
                 &config.video_id,
@@ -765,7 +817,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                 &config,
                 last_pos,
                 last_dur,
-                marked_watched || is_completion_threshold_reached(last_pos, last_dur),
+                marked_watched || (!config.is_live && is_completion_threshold_reached(last_pos, last_dur)),
             )
             .await;
 
@@ -849,8 +901,13 @@ mod tests {
         assert!(eco_cmds.iter().any(|c| c.contains("\"48MiB\"")));
         assert!(eco_cmds.iter().any(|c| c.contains("00_light_cas.glsl")));
 
-        let cache_line = r#"{"event":"property-change","id":19,"name":"demuxer-cache-state","data":{"fw-bytes":52428800}}"#;
+        let cache_line = r#"{"event":"property-change","id":19,"name":"demuxer-cache-state","data":{"fw-bytes":52428800,"cache-duration":6.25,"seekable-ranges":[{"start":120.0,"end":485.5}]}}"#;
         assert!(matches!(parse_live_ipc_event(cache_line), Some(LiveIpcEvent::CacheBytes(52428800))));
+        let (ahead, seek_end) = parse_live_cache_telemetry(cache_line).unwrap();
+        assert!((ahead - 6.25).abs() < 0.01);
+        assert!((seek_end - 485.5).abs() < 0.01);
+        let jump = PlayerCommand::JumpToLiveEdge.to_mpv_json_commands();
+        assert!(jump[0].contains("phaenna-snap-live-edge"));
 
         assert!(!is_completion_threshold_reached(40.0, 45.0));
         assert!(!is_completion_threshold_reached(80.0, 100.0));

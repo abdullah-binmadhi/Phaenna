@@ -56,6 +56,14 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
     state.live_playback.play_hitboxes.clear();
 
     let live = state.has_live_ipc();
+    let is_live_stream = if live {
+        state.live_playback.is_live_stream
+    } else {
+        state
+            .active_selected_video()
+            .map(|v| v.is_live_stream())
+            .unwrap_or(false)
+    };
     let video_title = if live {
         state
             .active_playback_title
@@ -67,7 +75,7 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
             .map(|v| v.title)
             .unwrap_or_else(|| "Selected Video".to_string())
     };
-    let title_budget = area.width.saturating_sub(54).max(14) as usize;
+    let title_budget = area.width.saturating_sub(68).max(12) as usize;
     let display_title = marquee_window(&video_title, title_budget, state.ticker_step);
     let badge_text = if live { " [LIVE mpv IPC] " } else { " [PRE-LAUNCH] " };
     let mode_badge = format!(" [MODE: {}] ", state.config.performance_mode.label().to_uppercase());
@@ -77,30 +85,41 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
         PerformanceMode::Quality => Color::Rgb(251, 191, 36),
     };
 
+    let mut title_spans = vec![
+        Span::styled(
+            format!(" PLAYBACK STUDIO - {} ", display_title),
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            badge_text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(if live { Color::Rgb(52, 211, 153) } else { theme.secondary })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            mode_badge,
+            Style::default()
+                .fg(Color::Black)
+                .bg(mode_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if is_live_stream {
+        title_spans.push(Span::styled(
+            format!(" [{}] ", state.config.live_mode.short_badge()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(248, 113, 113))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let outer = Block::default()
-        .title(Line::from(vec![
-            Span::styled(
-                format!(" PLAYBACK STUDIO - {} ", display_title),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                badge_text,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(if live { Color::Rgb(52, 211, 153) } else { theme.secondary })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                mode_badge,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(mode_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
+        .title(Line::from(title_spans))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.primary));
@@ -152,7 +171,11 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
             Span::styled("· ", Style::default().fg(theme.divider)),
             Span::styled("[m] Mode ", Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD)),
             Span::styled("· ", Style::default().fg(theme.divider)),
-            Span::styled("[Space] Pause/Play ", Style::default().fg(theme.text)),
+            Span::styled("[v] Live ", Style::default().fg(Color::Rgb(248, 113, 113)).add_modifier(Modifier::BOLD)),
+            Span::styled("· ", Style::default().fg(theme.divider)),
+            Span::styled("[E] Edge ", Style::default().fg(Color::Rgb(52, 211, 153))),
+            Span::styled("· ", Style::default().fg(theme.divider)),
+            Span::styled("[R] Radio ", Style::default().fg(theme.secondary)),
             Span::styled("· ", Style::default().fg(theme.divider)),
             Span::styled("[s] Shader ", Style::default().fg(theme.primary)),
             Span::styled("· ", Style::default().fg(theme.divider)),
@@ -383,6 +406,50 @@ fn render_stream_engine_pane(frame: &mut Frame, area: Rect, state: &mut AppState
             },
         )));
         push_line_hit(hitboxes, inner, row, PlayOptionsHit::SelectPlayer(pl));
+    }
+
+    if (lines.len() as u16) + 2 <= inner.height {
+        let row_live = lines.len() as u16;
+        lines.push(Line::from(vec![
+            Span::styled(" Live [v]: ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                state.config.live_mode.label(),
+                Style::default()
+                    .fg(Color::Rgb(52, 211, 153))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        push_line_hit(hitboxes, inner, row_live, PlayOptionsHit::CycleLiveMode);
+    }
+    if (lines.len() as u16) < inner.height {
+        let row_cu = lines.len() as u16;
+        lines.push(Line::from(vec![
+            Span::styled(" Catchup : ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                if state.config.live_auto_catchup {
+                    "ON (Auto 1.04x+)  [R:Radio]"
+                } else {
+                    "OFF (Manual)      [R:Radio]"
+                },
+                Style::default().fg(theme.secondary),
+            ),
+        ]));
+        push_line_hit(hitboxes, inner, row_cu, PlayOptionsHit::ToggleLiveCatchup);
+    }
+    if (lines.len() as u16) < inner.height {
+        let row_act = lines.len() as u16;
+        lines.push(Line::from(vec![
+            Span::styled(
+                " [E Live Edge] ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(52, 211, 153))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled("[S From Start]", Style::default().fg(theme.primary)),
+        ]));
+        push_line_hit(hitboxes, inner, row_act, PlayOptionsHit::JumpToLiveEdge);
     }
     push_panel_hit(hitboxes, area, 0);
 
@@ -682,6 +749,11 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     let theme = state.base_theme();
     let focused = state.play_modal_section == 4;
     let live = state.has_live_ipc();
+    let is_live_stream = state.live_playback.is_live_stream;
+    let live_lag = state.live_playback.live_edge_lag_secs(state.active_playback_pos);
+    let cache_ahead_secs = state.live_playback.cache_ahead_secs;
+    let cache_mb = state.live_playback.cache_bytes / (1024 * 1024);
+    let dropped_frames = state.live_playback.dropped_frames;
     let blk = section_block(" 5. Performance Mode, Transport & Picture ", focused, theme);
     let inner = blk.inner(area);
     let hits = &mut state.live_playback.play_hitboxes;
@@ -744,14 +816,16 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
         hits.push((mode_rects[idx + 1], PlayOptionsHit::SetPerformanceMode(*pm)));
     }
 
-    // Row 1: Mode Summary + Live Cache/Drops Telemetry
-    let cache_mb = state.live_playback.cache_bytes / (1024 * 1024);
+    // Row 1: Mode Summary + Live Cache/Drops/Edge Telemetry
     let max_mb = state.config.performance_mode.demuxer_max_bytes_num() / (1024 * 1024);
-    let info_line = if live {
+    let info_line = if live && is_live_stream {
         format!(
-            " {} | Buf: {cache_mb}/{max_mb}MB | Drops: {}",
-            state.config.performance_mode.summary(),
-            state.live_playback.dropped_frames
+            " Edge: -{live_lag:.1}s | BufAhead: {cache_ahead_secs:.1}s ({cache_mb}MB) | Drops: {dropped_frames}"
+        )
+    } else if live {
+        format!(
+            " {} | Buf: {cache_mb}/{max_mb}MB | Drops: {dropped_frames}",
+            state.config.performance_mode.summary()
         )
     } else {
         format!(" {}", state.config.performance_mode.summary())
@@ -937,21 +1011,50 @@ pub fn render_now_playing_bar(frame: &mut Frame, area: Rect, state: &mut AppStat
         format!("{}%", state.live_playback.volume)
     };
     let shader_lbl = format!("[{}]", state.config.shader_mode.short_label());
-    let time_lbl = format!(
-        "{}/{}",
-        format_hms(state.active_playback_pos),
-        format_hms(state.active_playback_dur.max(0.0))
-    );
+    let is_live_str = state.live_playback.is_live_stream;
+    let time_lbl = if is_live_str {
+        let lag = state.live_playback.live_edge_lag_secs(state.active_playback_pos);
+        format!("Edge:-{lag:.1}s Buf:{:.1}s", state.live_playback.cache_ahead_secs)
+    } else {
+        format!(
+            "{}/{}",
+            format_hms(state.active_playback_pos),
+            format_hms(state.active_playback_dur.max(0.0))
+        )
+    };
 
     let bg = Color::Rgb(18, 22, 32);
     let mut spans: Vec<(String, Style, Option<NowPlayingHit>)> = vec![
-        (" LIVE ".to_string(), Style::default().fg(Color::Black).bg(Color::Rgb(52, 211, 153)).add_modifier(Modifier::BOLD), Some(NowPlayingHit::OpenStudio)),
+        (
+            if is_live_str { " LIVE " } else { " PLAY " }.to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(if is_live_str { Color::Rgb(248, 113, 113) } else { Color::Rgb(52, 211, 153) })
+                .add_modifier(Modifier::BOLD),
+            Some(NowPlayingHit::OpenStudio),
+        ),
         (format!(" {time_lbl} "), Style::default().fg(theme.text).bg(bg).add_modifier(Modifier::BOLD), None),
         (format!(" {play_lbl} "), Style::default().fg(theme.primary).bg(bg).add_modifier(Modifier::BOLD), Some(NowPlayingHit::TogglePause)),
         ("[-10]".to_string(), Style::default().fg(theme.text_dim).bg(bg), Some(NowPlayingHit::SeekBack)),
         (" ".to_string(), Style::default().bg(bg), None),
         ("[+10]".to_string(), Style::default().fg(theme.text_dim).bg(bg), Some(NowPlayingHit::SeekFwd)),
         (" ".to_string(), Style::default().bg(bg), None),
+    ];
+    if is_live_str {
+        spans.push((
+            "[E Edge]".to_string(),
+            Style::default().fg(Color::Rgb(52, 211, 153)).bg(bg).add_modifier(Modifier::BOLD),
+            Some(NowPlayingHit::JumpToLiveEdge),
+        ));
+        spans.push((" ".to_string(), Style::default().bg(bg), None));
+        spans.push((
+            format!("[{}]", state.config.live_mode.short_badge()),
+            Style::default().fg(Color::Rgb(248, 113, 113)).bg(bg).add_modifier(Modifier::BOLD),
+            Some(NowPlayingHit::CycleLiveMode),
+        ));
+        spans.push((" ".to_string(), Style::default().bg(bg), None));
+    }
+    spans.extend([
         (
             dub_lbl,
             Style::default()
@@ -981,7 +1084,7 @@ pub fn render_now_playing_bar(frame: &mut Frame, area: Rect, state: &mut AppStat
         (shader_lbl, Style::default().fg(theme.primary).bg(bg), Some(NowPlayingHit::CycleShader)),
         (" [Studio(p)]".to_string(), Style::default().fg(theme.accent).bg(bg).add_modifier(Modifier::BOLD), Some(NowPlayingHit::OpenStudio)),
         (" [Stop] ".to_string(), Style::default().fg(Color::Rgb(239, 68, 68)).bg(bg).add_modifier(Modifier::BOLD), Some(NowPlayingHit::StopPlayer)),
-    ];
+    ]);
 
     let fixed_w: usize = spans.iter().map(|(s, _, _)| s.chars().count()).sum();
     let title_budget = (area.width as usize).saturating_sub(fixed_w + 3);

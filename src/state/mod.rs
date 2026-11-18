@@ -609,6 +609,13 @@ impl AppState {
             LiveIpcEvent::Saturation(v) => self.live_playback.saturation = v,
             LiveIpcEvent::Gamma(v) => self.live_playback.gamma = v,
             LiveIpcEvent::CacheBytes(b) => self.live_playback.cache_bytes = b,
+            LiveIpcEvent::LiveCacheTelemetry {
+                cache_ahead_secs,
+                seekable_end_secs,
+            } => {
+                self.live_playback.cache_ahead_secs = cache_ahead_secs;
+                self.live_playback.seekable_end_secs = seekable_end_secs;
+            }
             LiveIpcEvent::DroppedFrames(d) => self.live_playback.dropped_frames = d,
             LiveIpcEvent::Tracks { audio, sub } => {
                 if let Some(sel) = audio.iter().find(|t| t.selected) {
@@ -1469,6 +1476,9 @@ pub struct CommentNodeHitbox {
 #[derive(Debug, Clone)]
 pub enum DetailHit {
     Play,
+    PlayLiveFromStart,
+    PlayAudioRadio,
+    CycleLiveMode,
     VoteLike,
     VoteDislike,
     PinQueue,
@@ -1521,6 +1531,11 @@ pub enum PlayOptionsHit {
     SelectShader(VideoShaderMode),
     SetPerformanceMode(PerformanceMode),
     CycleMotion,
+    CycleLiveMode,
+    ToggleLiveCatchup,
+    JumpToLiveEdge,
+    PlayLiveFromStart,
+    LaunchAudioRadio,
     ScrollAudioTracks(i8),
     TogglePause,
     SeekDelta(f64),
@@ -1549,6 +1564,8 @@ pub enum NowPlayingHit {
     CycleShader,
     CyclePerfMode,
     CycleMotion,
+    JumpToLiveEdge,
+    CycleLiveMode,
     OpenStudio,
     StopPlayer,
 }
@@ -1571,6 +1588,9 @@ pub struct LivePlaybackControlState {
     pub saturation: i64,
     pub gamma: i64,
     pub cache_bytes: u64,
+    pub cache_ahead_secs: f64,
+    pub seekable_end_secs: f64,
+    pub is_live_stream: bool,
     pub dropped_frames: i64,
     pub audio_tracks: Vec<LiveMediaTrack>,
     pub audio_track_scroll: usize,
@@ -1599,6 +1619,9 @@ impl Default for LivePlaybackControlState {
             saturation: 0,
             gamma: 0,
             cache_bytes: 0,
+            cache_ahead_secs: 0.0,
+            seekable_end_secs: 0.0,
+            is_live_stream: false,
             dropped_frames: 0,
             audio_tracks: Vec::new(),
             audio_track_scroll: 0,
@@ -1606,6 +1629,16 @@ impl Default for LivePlaybackControlState {
             cmd_tx: None,
             play_hitboxes: Vec::new(),
             now_playing_hitboxes: Vec::new(),
+        }
+    }
+}
+
+impl LivePlaybackControlState {
+    pub fn live_edge_lag_secs(&self, current_pos: f64) -> f64 {
+        if self.seekable_end_secs > current_pos {
+            (self.seekable_end_secs - current_pos).max(0.0)
+        } else {
+            self.cache_ahead_secs.max(0.0)
         }
     }
 }

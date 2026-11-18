@@ -160,6 +160,49 @@ impl Quality {
         branches.join("/")
     }
 
+    pub fn max_height_or_default(self, default_max: u16) -> u16 {
+        match self {
+            Quality::Best | Quality::P2160 => default_max.min(2160),
+            Quality::P1440 => default_max.min(1440),
+            Quality::P1080 => default_max.min(1080),
+            Quality::P720 => 720,
+            Quality::P480 => 480,
+            Quality::P360 => 360,
+            Quality::AudioOnly => 0,
+        }
+    }
+
+    /// Build a fast-start `yt-dlp` format selector optimized for live broadcasts.
+    pub fn ytdl_format_for_live(
+        self,
+        mode: LiveStreamMode,
+        dub: DubPreference,
+        dub_lang: &str,
+    ) -> String {
+        if self == Quality::AudioOnly {
+            return "bestaudio[protocol^=m3u8]/bestaudio/best".to_string();
+        }
+        if mode == LiveStreamMode::Off {
+            return self.ytdl_format_with_dub(dub, dub_lang, false);
+        }
+        let max_cap = match mode {
+            LiveStreamMode::LowLatency => 1080,
+            LiveStreamMode::BalancedLive => 1440,
+            LiveStreamMode::SmoothDvr => 2160,
+            LiveStreamMode::Off => 4320,
+        };
+        let h = self.max_height_or_default(max_cap);
+        match mode {
+            LiveStreamMode::LowLatency | LiveStreamMode::BalancedLive => format!(
+                "best[height<=?{h}][vcodec!^=av01][protocol^=m3u8]/bestvideo[height<=?{h}][vcodec!^=av01][protocol^=m3u8]+bestaudio[protocol^=m3u8]/bestvideo[height<=?{h}][vcodec!^=av01]+bestaudio/best[height<=?{h}]/best"
+            ),
+            LiveStreamMode::SmoothDvr => format!(
+                "bestvideo[height<=?{h}]+bestaudio/best[height<=?{h}]/best"
+            ),
+            LiveStreamMode::Off => unreachable!(),
+        }
+    }
+
     pub const fn short_badge(self) -> &'static str {
         match self {
             Quality::Best => "4K-AV1",
@@ -645,6 +688,85 @@ impl MotionMode {
     }
 }
 
+/// Live broadcast optimization profile controlling buffer depth, CDN codec cap, and edge catch-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveStreamMode {
+    LowLatency,
+    #[default]
+    BalancedLive,
+    SmoothDvr,
+    Off,
+}
+
+impl LiveStreamMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::LowLatency => Self::BalancedLive,
+            Self::BalancedLive => Self::SmoothDvr,
+            Self::SmoothDvr => Self::Off,
+            Self::Off => Self::LowLatency,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LowLatency => "Low-Latency (3s buf)",
+            Self::BalancedLive => "Balanced Live (6s buf)",
+            Self::SmoothDvr => "Smooth DVR (20s buf)",
+            Self::Off => "Off (VOD Pipeline)",
+        }
+    }
+
+    pub const fn short_badge(self) -> &'static str {
+        match self {
+            Self::LowLatency => "LIVE-LL",
+            Self::BalancedLive => "LIVE-BAL",
+            Self::SmoothDvr => "LIVE-DVR",
+            Self::Off => "LIVE-OFF",
+        }
+    }
+
+    pub const fn readahead_secs(self) -> u32 {
+        match self {
+            Self::LowLatency => 3,
+            Self::BalancedLive => 6,
+            Self::SmoothDvr => 20,
+            Self::Off => 10,
+        }
+    }
+
+    pub const fn cache_pause_wait_secs(self) -> f64 {
+        match self {
+            Self::LowLatency => 1.2,
+            Self::BalancedLive => 2.5,
+            Self::SmoothDvr => 4.0,
+            Self::Off => 1.5,
+        }
+    }
+
+    pub const fn cache_pause_initial(self) -> bool {
+        !matches!(self, Self::LowLatency)
+    }
+
+    pub const fn demuxer_limits(self) -> (&'static str, &'static str) {
+        match self {
+            Self::LowLatency => ("24MiB", "8MiB"),
+            Self::BalancedLive => ("48MiB", "32MiB"),
+            Self::SmoothDvr => ("96MiB", "128MiB"),
+            Self::Off => ("160MiB", "48MiB"),
+        }
+    }
+
+    pub const fn catchup_threshold_and_speed(self) -> Option<(f64, f64, f64)> {
+        match self {
+            Self::LowLatency => Some((6.0, 2.2, 1.06)),
+            Self::BalancedLive => Some((12.0, 4.5, 1.04)),
+            Self::SmoothDvr | Self::Off => None,
+        }
+    }
+}
+
 /// Persistent application configuration for Phaenna (`config.toml`).
 /// Root user configuration persisted to `<config_dir>/config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -693,6 +815,10 @@ pub struct Config {
     pub performance_mode: PerformanceMode,
     #[serde(default)]
     pub motion_mode: MotionMode,
+    #[serde(default)]
+    pub live_mode: LiveStreamMode,
+    #[serde(default = "default_true")]
+    pub live_auto_catchup: bool,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
     #[serde(default = "default_theme_index")]
@@ -731,6 +857,8 @@ impl Default for Config {
             shader_mode: VideoShaderMode::default(),
             performance_mode: PerformanceMode::default(),
             motion_mode: MotionMode::default(),
+            live_mode: LiveStreamMode::default(),
+            live_auto_catchup: true,
             ambilight_enabled: true,
             theme_index: default_theme_index(),
             google_oauth: GoogleOAuthConfig::default(),
@@ -898,5 +1026,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.cookies_path().unwrap(), PathBuf::from("/tmp/custom-yt-cookies.txt"));
+    }
+
+    #[test]
+    fn test_live_stream_mode_and_format_selectors() {
+        assert_eq!(LiveStreamMode::BalancedLive.short_badge(), "LIVE-BAL");
+        assert_eq!(LiveStreamMode::LowLatency.next(), LiveStreamMode::BalancedLive);
+        assert_eq!(LiveStreamMode::LowLatency.readahead_secs(), 3);
+        assert!(!LiveStreamMode::LowLatency.cache_pause_initial());
+        assert!(LiveStreamMode::BalancedLive.cache_pause_initial());
+        assert!(LiveStreamMode::SmoothDvr.catchup_threshold_and_speed().is_none());
+
+        let ll = Quality::Best.ytdl_format_for_live(
+            LiveStreamMode::LowLatency,
+            DubPreference::OriginalOnly,
+            "en",
+        );
+        assert!(ll.contains("height<=?1080"));
+        assert!(ll.contains("vcodec!^=av01"));
+        assert!(ll.contains("m3u8"));
+        assert!(!ll.contains("audio-multistreams"));
+
+        let radio = Quality::AudioOnly.ytdl_format_for_live(
+            LiveStreamMode::BalancedLive,
+            DubPreference::OriginalOnly,
+            "en",
+        );
+        assert!(radio.contains("bestaudio"));
     }
 }
