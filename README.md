@@ -113,6 +113,17 @@ curl -fsSL https://raw.githubusercontent.com/abdullah-binmadhi/Phaenna/main/inst
 irm https://raw.githubusercontent.com/abdullah-binmadhi/Phaenna/main/install.ps1 | iex
 ```
 
+### Raspberry Pi / Linux ARM64 (Opt-In)
+
+Optional scripts for 64-bit Raspberry Pi OS / Debian ARM64 (`--dry-run`, low-RAM `--jobs 1` build, Foot/Kitty choice, USB UUID download guard, and `--uninstall`):
+
+```bash
+bash scripts/raspberry-pi/install.sh --dry-run
+bash scripts/raspberry-pi/install.sh --terminal foot
+```
+
+See [docs/raspberry-pi.md](docs/raspberry-pi.md) for full instructions, USB storage setup, checksum verification, and recovery steps.
+
 ---
 
 ### Copy-Paste Per-OS Single Commands
