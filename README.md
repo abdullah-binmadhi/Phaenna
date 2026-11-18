@@ -99,7 +99,7 @@ Finding the exact video is instant, accurate, and interactive from the first key
 
 ## One-Command Installation (Everything in One Go)
 
-Every installer below installs **GPU terminals** (`kitty`, `wezterm`), **video players & dependencies** (`mpv`, `vlc`, `iina` on macOS, `yt-dlp`, `ffmpeg`, `git`), the **Rust toolchain** (`cargo` if missing), builds & installs **`phaenna`**, and runs `phaenna doctor`.
+Every installer below installs **GPU terminals** (`kitty` on macOS/Linux, `wezterm` on Windows), **video players & dependencies** (`mpv`, `vlc`, `iina` on macOS, `yt-dlp`, `ffmpeg`, `git`), the **Rust toolchain** (`cargo` if missing), builds & installs **`phaenna`**, and runs `phaenna doctor`.
 
 ### Universal One-Liner (Auto-Detects macOS & Linux Distros)
 
@@ -131,45 +131,45 @@ See [docs/raspberry-pi.md](docs/raspberry-pi.md) for full instructions, USB stor
 > Prefer pasting an explicit OS command directly? Pick your platform below:
 
 #### macOS (Apple Silicon / Intel via Homebrew)
-Installs `kitty`, `wezterm`, `iina`, `vlc`, `mpv`, `yt-dlp`, `ffmpeg`, `git`, `rust`, compiles `phaenna`, self-signs on Apple Silicon, and runs `phaenna doctor`:
+Installs `kitty`, `iina`, `vlc`, `mpv`, `yt-dlp`, `ffmpeg`, `git`, `rust`, compiles `phaenna`, self-signs on Apple Silicon, and runs `phaenna doctor`:
 
 ```bash
-(command -v brew >/dev/null || NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)") && (eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)" || true) && brew install mpv yt-dlp ffmpeg git && for c in kitty wezterm iina vlc; do brew install --cask "$c" || true; done && (command -v cargo >/dev/null || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env")) && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && codesign -s - -f "$HOME/.cargo/bin/phaenna" && "$HOME/.cargo/bin/phaenna" doctor
+(command -v brew >/dev/null || NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)") && (eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)" || true) && brew install mpv yt-dlp ffmpeg git && for c in kitty iina vlc; do brew install --cask "$c" || true; done && (command -v cargo >/dev/null || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env")) && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && codesign -s - -f "$HOME/.cargo/bin/phaenna" && "$HOME/.cargo/bin/phaenna" doctor
 ```
 
 #### Linux — Arch / Manjaro / EndeavourOS (`pacman`)
-Installs `kitty`, `wezterm`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `base-devel`, `rust`, and builds `phaenna`:
+Installs `kitty`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `base-devel`, `rust`, and builds `phaenna`:
 
 ```bash
-sudo pacman -S --needed --noconfirm kitty wezterm mpv vlc yt-dlp ffmpeg git base-devel rust && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
+sudo pacman -S --needed --noconfirm kitty mpv vlc yt-dlp ffmpeg git base-devel rust && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
 ```
 
 #### Linux — Ubuntu / Debian / Pop!_OS / Linux Mint (`apt`)
-Installs `kitty`, official `wezterm` apt repo, `mpv`, `vlc`, `ffmpeg`, latest official `yt-dlp`, build tools, `rustup`, and builds `phaenna`:
+Installs `kitty`, `mpv`, `vlc`, `ffmpeg`, latest official `yt-dlp`, build tools, `rustup`, and builds `phaenna`:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y kitty mpv vlc ffmpeg git curl gnupg build-essential pkg-config libsqlite3-dev libssl-dev && curl -fsSL https://apt.fury.io/wez/gpg.key | sudo gpg --yes --dearmor -o /usr/share/keyrings/wezterm-fury.gpg && echo 'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *' | sudo tee /etc/apt/sources.list.d/wezterm.list >/dev/null && sudo apt-get update && sudo apt-get install -y wezterm && sudo curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && sudo chmod a+rx /usr/local/bin/yt-dlp && (command -v cargo >/dev/null || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env")) && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
+sudo apt-get update && sudo apt-get install -y kitty mpv vlc ffmpeg git curl build-essential pkg-config libsqlite3-dev libssl-dev && sudo curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && sudo chmod a+rx /usr/local/bin/yt-dlp && (command -v cargo >/dev/null || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env")) && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
 ```
 
 #### Linux — Fedora / Nobara / RHEL (`dnf`)
-Enables RPM Fusion + WezTerm COPR, installs `kitty`, `wezterm`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `cargo`, `rust`, and builds `phaenna`:
+Enables RPM Fusion, installs `kitty`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `cargo`, `rust`, and builds `phaenna`:
 
 ```bash
-sudo dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" || true; sudo dnf copr enable -y wezfurlong/wezterm-nightly || true; sudo dnf install -y kitty wezterm mpv vlc yt-dlp ffmpeg git rust cargo gcc openssl-devel sqlite-devel && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
+sudo dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" || true; sudo dnf install -y kitty mpv vlc yt-dlp ffmpeg git rust cargo gcc openssl-devel sqlite-devel && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
 ```
 
 #### Linux — openSUSE Tumbleweed / Leap (`zypper`)
-Installs `kitty`, `wezterm`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `rust`, `cargo`, and builds `phaenna`:
+Installs `kitty`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `rust`, `cargo`, and builds `phaenna`:
 
 ```bash
-sudo zypper --non-interactive install kitty wezterm mpv vlc yt-dlp ffmpeg git rust cargo gcc sqlite3-devel libopenssl-devel && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
+sudo zypper --non-interactive install kitty mpv vlc yt-dlp ffmpeg git rust cargo gcc sqlite3-devel libopenssl-devel && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
 ```
 
 #### Linux — NixOS / Nix (`nix profile`)
-Installs `kitty`, `wezterm`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `rustc`, `cargo` into your Nix profile and builds `phaenna`:
+Installs `kitty`, `mpv`, `vlc`, `yt-dlp`, `ffmpeg`, `git`, `rustc`, `cargo` into your Nix profile and builds `phaenna`:
 
 ```bash
-nix profile install nixpkgs#kitty nixpkgs#wezterm nixpkgs#mpv nixpkgs#vlc nixpkgs#yt-dlp nixpkgs#ffmpeg nixpkgs#git nixpkgs#rustc nixpkgs#cargo && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
+nix profile install nixpkgs#kitty nixpkgs#mpv nixpkgs#vlc nixpkgs#yt-dlp nixpkgs#ffmpeg nixpkgs#git nixpkgs#rustc nixpkgs#cargo && rm -rf /tmp/phaenna-src && git clone https://github.com/abdullah-binmadhi/Phaenna.git /tmp/phaenna-src && cargo install --path /tmp/phaenna-src --force && "$HOME/.cargo/bin/phaenna" doctor
 ```
 
 #### Windows 10 / 11 (PowerShell + `winget`)

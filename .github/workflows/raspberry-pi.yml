@@ -71,28 +71,27 @@ jobs:
 
   arm64-smoke:
     name: debian-arm64-native-build-and-installer
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
     steps:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: enable arm64 emulation
-        uses: docker/setup-qemu-action@v3
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates curl git mpv ffmpeg yt-dlp file python3
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: native ARM64 build and regression check
         run: |
-          docker run --rm --platform linux/arm64 \
-            -v "$PWD:/work" -w /work \
-            debian:13-slim bash -lc '
-              apt-get update
-              apt-get install -y build-essential pkg-config libssl-dev libsqlite3-dev ca-certificates curl git mpv ffmpeg yt-dlp file python3
-              curl --fail --location --silent --show-error --retry 3 https://sh.rustup.rs -o /tmp/rustup.sh
-              sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path
-              export PATH="$HOME/.cargo/bin:$PATH"
-              rustc --version
-              bash scripts/raspberry-pi/build.sh --jobs 1 --dry-run
-              cargo build --release --locked --jobs 1 --config "profile.release.package.phaenna.opt-level=1"
-              bash -n scripts/raspberry-pi/*.sh
-              python3 scripts/raspberry-pi/check_install.py /work/target/release/phaenna
-            '
+          rustc --version
+          bash scripts/raspberry-pi/build.sh --jobs 1 --dry-run
+          cargo build --release --locked --config "profile.release.package.phaenna.opt-level=1"
+          bash -n scripts/raspberry-pi/*.sh
+          python3 scripts/raspberry-pi/check_install.py "$PWD/target/release/phaenna"

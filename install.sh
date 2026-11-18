@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phaenna Universal All-In-One Installer (macOS & Linux)
-# Installs: GPU terminals (Kitty, WezTerm), players (mpv, VLC, IINA on macOS),
+# Installs: GPU terminal (Kitty), players (mpv, VLC, IINA on macOS),
 #           yt-dlp, ffmpeg, Rust/Cargo toolchain, and Phaenna from source.
 set -euo pipefail
 
@@ -37,29 +37,21 @@ install_macos() {
   log "Installing CLI media stack (mpv, yt-dlp, ffmpeg, git)..."
   brew install mpv yt-dlp ffmpeg git
 
-  log "Installing GPU terminals & GUI players (kitty, wezterm, iina, vlc)..."
-  for cask in kitty wezterm iina vlc; do
+  log "Installing GPU terminal & GUI players (kitty, iina, vlc)..."
+  for cask in kitty iina vlc; do
     brew list --cask "$cask" >/dev/null 2>&1 || brew install --cask "$cask" || warn "Optional cask '$cask' skipped or already present."
   done
 }
 
 install_arch() {
   log "Detected Arch-based Linux (pacman)..."
-  sudo pacman -S --needed --noconfirm kitty wezterm mpv vlc yt-dlp ffmpeg git base-devel
+  sudo pacman -S --needed --noconfirm kitty mpv vlc yt-dlp ffmpeg git base-devel
 }
 
 install_debian_ubuntu() {
   log "Detected Debian/Ubuntu-based Linux (apt)..."
   sudo apt-get update
-  sudo apt-get install -y kitty mpv vlc ffmpeg git curl gnupg build-essential pkg-config libsqlite3-dev libssl-dev
-
-  if ! command -v wezterm >/dev/null 2>&1; then
-    log "Adding official WezTerm apt repository..."
-    curl -fsSL https://apt.fury.io/wez/gpg.key | sudo gpg --yes --dearmor -o /usr/share/keyrings/wezterm-fury.gpg
-    echo 'deb [signed-by=/usr/share/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *' | sudo tee /etc/apt/sources.list.d/wezterm.list >/dev/null
-    sudo chmod 644 /usr/share/keyrings/wezterm-fury.gpg
-    sudo apt-get update && sudo apt-get install -y wezterm || warn "Could not install wezterm from apt; install manually from https://wezterm.org"
-  fi
+  sudo apt-get install -y kitty mpv vlc ffmpeg git curl build-essential pkg-config libsqlite3-dev libssl-dev
 
   if ! command -v yt-dlp >/dev/null 2>&1; then
     log "Installing latest yt-dlp binary to /usr/local/bin/yt-dlp..."
@@ -77,14 +69,13 @@ install_fedora() {
       "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${fver}.noarch.rpm" \
       "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${fver}.noarch.rpm" || true
   fi
-  sudo dnf copr enable -y wezfurlong/wezterm-nightly || true
-  sudo dnf install -y kitty wezterm mpv vlc yt-dlp ffmpeg git gcc openssl-devel sqlite-devel || \
+  sudo dnf install -y kitty mpv vlc yt-dlp ffmpeg git gcc openssl-devel sqlite-devel || \
     sudo dnf install -y kitty mpv yt-dlp ffmpeg git gcc
 }
 
 install_opensuse() {
   log "Detected openSUSE Linux (zypper)..."
-  sudo zypper --non-interactive install kitty wezterm mpv vlc yt-dlp ffmpeg git gcc sqlite3-devel libopenssl-devel || \
+  sudo zypper --non-interactive install kitty mpv vlc yt-dlp ffmpeg git gcc sqlite3-devel libopenssl-devel || \
     sudo zypper --non-interactive install kitty mpv vlc yt-dlp ffmpeg git gcc
 }
 
@@ -92,7 +83,6 @@ install_nix() {
   log "Detected Nix environment (nix profile)..."
   nix profile install \
     nixpkgs#kitty \
-    nixpkgs#wezterm \
     nixpkgs#mpv \
     nixpkgs#vlc \
     nixpkgs#yt-dlp \
@@ -104,7 +94,7 @@ install_nix() {
 
 install_alpine() {
   log "Detected Alpine Linux (apk)..."
-  sudo apk add --no-cache kitty wezterm mpv vlc yt-dlp ffmpeg git build-base sqlite-dev openssl-dev curl
+  sudo apk add --no-cache kitty mpv vlc yt-dlp ffmpeg git build-base sqlite-dev openssl-dev curl
 }
 
 main() {
@@ -131,7 +121,7 @@ main() {
       elif command -v nix >/dev/null 2>&1; then
         install_nix
       else
-        warn "Unrecognized Linux package manager. Please ensure kitty, wezterm, mpv, vlc, yt-dlp, ffmpeg, git, and cargo are installed."
+        warn "Unrecognized Linux package manager. Please ensure kitty, mpv, vlc, yt-dlp, ffmpeg, git, and cargo are installed."
       fi
       ;;
     *)
@@ -171,7 +161,7 @@ main() {
   cat <<'EOF'
 
 Installation complete!
-Recommended launch: open Kitty or WezTerm and run:
+Recommended launch: open Kitty and run:
   phaenna
 
 Make sure Cargo's bin directory is on your PATH:
