@@ -138,13 +138,7 @@ impl Quality {
         multistreams: bool,
         codec: CodecPriority,
     ) -> String {
-        let lang: String = dub_lang
-            .trim()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .take(8)
-            .collect();
-        let lang = if lang.is_empty() { "en" } else { lang.as_str() };
+        let lang = sanitize_dub_lang(dub_lang);
 
         let primary_audio = match dub {
             DubPreference::OriginalOnly => {
@@ -182,6 +176,42 @@ impl Quality {
         branches.push(format!("{video_chain}+bestaudio"));
         branches.push("best".to_string());
         branches.join("/")
+    }
+
+    /// Build a bandwidth-capped `yt-dlp` format selector for normal vs. congested/shared Wi-Fi.
+    pub fn ytdl_format_for_network(
+        self,
+        dub: DubPreference,
+        dub_lang: &str,
+        multistreams: bool,
+        codec: CodecPriority,
+        net: NetworkMode,
+    ) -> String {
+        if !net.is_congested() {
+            return self.ytdl_format_with_dub_and_codec(dub, dub_lang, multistreams, codec);
+        }
+
+        let lang = sanitize_dub_lang(dub_lang);
+        let abr = net.max_audio_abr_kbps().unwrap_or(128);
+        let primary_audio = match dub {
+            DubPreference::OriginalOnly => format!(
+                "(bestaudio[abr<=?{abr}][format_note*=original][format_note!*=dubbed][format_note!*=DRC]/bestaudio[abr<=?{abr}][language_preference>=0][format_note!*=dubbed]/bestaudio[abr<=?{abr}][format_note!*=dubbed]/bestaudio[format_note!*=dubbed]/bestaudio)"
+            ),
+            DubPreference::PreferDubbed => format!(
+                "(bestaudio[abr<=?{abr}][format_note*=dubbed][language^={lang}]/bestaudio[abr<=?{abr}][language^={lang}][format_note!*=original]/bestaudio[format_note*=dubbed]/bestaudio)"
+            ),
+        };
+
+        if self == Quality::AudioOnly {
+            return format!("{primary_audio}/best");
+        }
+
+        let h = self.max_height_or_default(net.max_height_cap().unwrap_or(720));
+        let fps = net.max_fps_cap().unwrap_or(30);
+        let video_chain = format!(
+            "(bestvideo[height<=?{h}][fps<=?{fps}][vcodec^=av01]/bestvideo[height<=?{h}][fps<=?{fps}][vcodec^=vp9]/bestvideo[height<=?{h}][fps<=?{fps}]/bestvideo[height<=?{h}])"
+        );
+        format!("{video_chain}+{primary_audio}/best[height<=?{h}]/best")
     }
 
     pub fn max_height_or_default(self, default_max: u16) -> u16 {
@@ -227,6 +257,32 @@ impl Quality {
         }
     }
 
+    /// Build a live broadcast `yt-dlp` selector honoring `NetworkMode` bitrate/resolution caps.
+    pub fn ytdl_format_for_live_with_network(
+        self,
+        mode: LiveStreamMode,
+        dub: DubPreference,
+        dub_lang: &str,
+        net: NetworkMode,
+    ) -> String {
+        if !net.is_congested() || self == Quality::AudioOnly {
+            return self.ytdl_format_for_live(mode, dub, dub_lang);
+        }
+        if mode == LiveStreamMode::Off {
+            return self.ytdl_format_for_network(
+                dub,
+                dub_lang,
+                false,
+                CodecPriority::Vp9HwFirst,
+                net,
+            );
+        }
+        let h = self.max_height_or_default(net.max_height_cap().unwrap_or(720));
+        format!(
+            "best[height<=?{h}][vcodec!^=av01][protocol^=m3u8]/bestvideo[height<=?{h}][vcodec!^=av01][protocol^=m3u8]+bestaudio[protocol^=m3u8]/bestvideo[height<=?{h}]+bestaudio/best[height<=?{h}]/best"
+        )
+    }
+
     pub const fn short_badge(self) -> &'static str {
         match self {
             Quality::Best => "4K-AV1",
@@ -237,6 +293,142 @@ impl Quality {
             Quality::P480 => "480p",
             Quality::P360 => "360p",
             Quality::AudioOnly => "AUDIO",
+        }
+    }
+}
+
+fn sanitize_dub_lang(dub_lang: &str) -> String {
+    let lang: String = dub_lang
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(8)
+        .collect();
+    if lang.is_empty() {
+        "en".to_string()
+    } else {
+        lang
+    }
+}
+
+/// Network bandwidth & shared-Wi-Fi congestion resilience profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    Normal,
+    CongestedWifi,
+    UltraSaver,
+}
+
+#[allow(dead_code)]
+impl NetworkMode {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::CongestedWifi, Self::UltraSaver];
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::CongestedWifi,
+            Self::CongestedWifi => Self::UltraSaver,
+            Self::UltraSaver => Self::Normal,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal (Full Speed)",
+            Self::CongestedWifi => "Congested Wi-Fi (720p30 + Cushion)",
+            Self::UltraSaver => "Ultra Saver (480p30 + Disk Cache)",
+        }
+    }
+
+    pub const fn short_badge(self) -> &'static str {
+        match self {
+            Self::Normal => "NET:FULL",
+            Self::CongestedWifi => "NET:WIFI",
+            Self::UltraSaver => "NET:ECO",
+        }
+    }
+
+    pub const fn is_congested(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    pub const fn max_height_cap(self) -> Option<u16> {
+        match self {
+            Self::Normal => None,
+            Self::CongestedWifi => Some(720),
+            Self::UltraSaver => Some(480),
+        }
+    }
+
+    pub const fn max_fps_cap(self) -> Option<u16> {
+        match self {
+            Self::Normal => None,
+            Self::CongestedWifi | Self::UltraSaver => Some(30),
+        }
+    }
+
+    pub const fn max_audio_abr_kbps(self) -> Option<u16> {
+        match self {
+            Self::Normal => None,
+            Self::CongestedWifi => Some(128),
+            Self::UltraSaver => Some(72),
+        }
+    }
+
+    pub const fn vod_cache_pause_wait_secs(self) -> f64 {
+        match self {
+            Self::Normal => 2.5,
+            Self::CongestedWifi => 4.5,
+            Self::UltraSaver => 6.0,
+        }
+    }
+
+    pub const fn vod_readahead_secs(self) -> u32 {
+        match self {
+            Self::Normal => 45,
+            Self::CongestedWifi => 120,
+            Self::UltraSaver => 180,
+        }
+    }
+
+    pub const fn network_timeout_secs(self) -> u32 {
+        match self {
+            Self::Normal => 15,
+            Self::CongestedWifi => 12,
+            Self::UltraSaver => 10,
+        }
+    }
+
+    pub const fn use_disk_cache(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    pub const fn vlc_network_caching_ms(self) -> u32 {
+        match self {
+            Self::Normal => 3000,
+            Self::CongestedWifi => 8000,
+            Self::UltraSaver => 12000,
+        }
+    }
+
+    pub const fn live_hls_bitrate(self) -> &'static str {
+        match self {
+            Self::Normal => "max",
+            Self::CongestedWifi => "1800000",
+            Self::UltraSaver => "900000",
+        }
+    }
+
+    pub const fn prefer_compact_thumbs(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    pub const fn effective_multistreams(self, config_multi: bool, perf: PerformanceMode) -> bool {
+        if self.is_congested() {
+            false
+        } else {
+            perf.loads_multistreams(config_multi)
         }
     }
 }
@@ -1180,6 +1372,12 @@ pub struct Config {
     pub live_mode: LiveStreamMode,
     #[serde(default = "default_true")]
     pub live_auto_catchup: bool,
+    #[serde(default)]
+    pub network_mode: NetworkMode,
+    #[serde(default)]
+    pub force_ipv4: bool,
+    #[serde(default = "default_true")]
+    pub auto_abr_downshift: bool,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
     #[serde(default = "default_theme_index")]
@@ -1221,6 +1419,9 @@ impl Default for Config {
             motion_mode: MotionMode::default(),
             live_mode: LiveStreamMode::default(),
             live_auto_catchup: true,
+            network_mode: NetworkMode::default(),
+            force_ipv4: false,
+            auto_abr_downshift: true,
             ambilight_enabled: true,
             theme_index: default_theme_index(),
             google_oauth: GoogleOAuthConfig::default(),
@@ -1471,5 +1672,71 @@ mod tests {
         cfg.manual_mastering.demuxer_cache = DemuxerCachePreset::Large512M;
         assert_eq!(cfg.effective_mastering().super_res, SuperResMode::Auto1080p);
         assert_eq!(cfg.effective_demuxer_max_bytes_num(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_network_mode_and_congested_selectors() {
+        assert_eq!(NetworkMode::ALL.len(), 3);
+        assert_eq!(NetworkMode::Normal.next(), NetworkMode::CongestedWifi);
+        assert_eq!(NetworkMode::CongestedWifi.next(), NetworkMode::UltraSaver);
+        assert_eq!(NetworkMode::UltraSaver.next(), NetworkMode::Normal);
+        assert!(!NetworkMode::Normal.is_congested());
+        assert!(NetworkMode::CongestedWifi.is_congested());
+        assert!(NetworkMode::UltraSaver.is_congested());
+        assert_eq!(NetworkMode::Normal.short_badge(), "NET:FULL");
+        assert_eq!(NetworkMode::CongestedWifi.short_badge(), "NET:WIFI");
+        assert_eq!(NetworkMode::UltraSaver.short_badge(), "NET:ECO");
+        assert_eq!(NetworkMode::CongestedWifi.max_height_cap(), Some(720));
+        assert_eq!(NetworkMode::UltraSaver.max_height_cap(), Some(480));
+        assert!(!NetworkMode::CongestedWifi.effective_multistreams(true, PerformanceMode::Quality));
+        assert!(NetworkMode::Normal.effective_multistreams(true, PerformanceMode::Quality));
+
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("net_config.toml");
+        let cfg = Config {
+            network_mode: NetworkMode::CongestedWifi,
+            force_ipv4: true,
+            auto_abr_downshift: false,
+            ..Default::default()
+        };
+        cfg.save_to_path(&cfg_path).unwrap();
+        let loaded = Config::load_from_path(&cfg_path).unwrap();
+        assert_eq!(loaded.network_mode, NetworkMode::CongestedWifi);
+        assert!(loaded.force_ipv4);
+        assert!(!loaded.auto_abr_downshift);
+
+        let wifi_fmt = Quality::Best.ytdl_format_for_network(
+            DubPreference::OriginalOnly,
+            "en",
+            true,
+            CodecPriority::Vp9HwFirst,
+            NetworkMode::CongestedWifi,
+        );
+        assert!(wifi_fmt.contains("height<=?720"));
+        assert!(wifi_fmt.contains("fps<=?30"));
+        assert!(wifi_fmt.contains("abr<=?128"));
+        assert!(wifi_fmt.contains("vcodec^=av01"));
+        assert!(!wifi_fmt.contains(")+("));
+
+        let ultra_fmt = Quality::Best.ytdl_format_for_network(
+            DubPreference::OriginalOnly,
+            "en",
+            true,
+            CodecPriority::Av1First,
+            NetworkMode::UltraSaver,
+        );
+        assert!(ultra_fmt.contains("height<=?480"));
+        assert!(ultra_fmt.contains("fps<=?30"));
+        assert!(ultra_fmt.contains("abr<=?72"));
+
+        let low_cap_fmt = Quality::P360.ytdl_format_for_network(
+            DubPreference::OriginalOnly,
+            "en",
+            false,
+            CodecPriority::Av1First,
+            NetworkMode::CongestedWifi,
+        );
+        assert!(low_cap_fmt.contains("height<=?360"));
+        assert!(!low_cap_fmt.contains("height<=?720"));
     }
 }

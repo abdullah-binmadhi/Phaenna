@@ -27,8 +27,8 @@ use crate::api::sponsorblock::{
     fetch_sponsor_segments, filter_segments_for_mode_with_outro, from_db_rows, to_db_rows,
 };
 use crate::api::ytdlp::{
-    fetch_channel_videos, fetch_feed_range, fetch_feed_range_stream, fetch_video_details,
-    search_youtube,
+    fetch_channel_videos, fetch_feed_range, fetch_feed_range_stream,
+    fetch_video_details_with_ladder, resolve_stream_ladder, search_youtube,
 };
 use crate::config::{
     next_dub_lang, Config, ManualMasteringConfig, MotionMode, PerformanceMode, Player, Quality,
@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         .user_agent(concat!("phaenna/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let thumb_sem = Arc::new(Semaphore::new(12));
+    let congested_thumb_sem = Arc::new(Semaphore::new(2));
 
     // 4. Start LAN Companion Remote Server if configured
     if state.config.remote.enabled {
@@ -338,21 +339,32 @@ async fn main() -> anyhow::Result<()> {
             let _ = execute!(out_handle, EndSynchronizedUpdate);
             needs_redraw = false;
 
-            // Dispatch pending lazy thumbnail fetches via 12-permit Semaphore
-            let pending = std::mem::take(&mut state.pending_thumb_requests);
-            for (vid, url) in pending {
-                if state.loading_thumbs.contains(&vid) {
-                    continue;
+            // Dispatch pending lazy thumbnail fetches; pause network thumbnails while mpv is rebuffering
+            if !(state.has_live_ipc() && state.live_playback.paused_for_cache) {
+                let pending = std::mem::take(&mut state.pending_thumb_requests);
+                let active_sem = if state.config.network_mode.is_congested() || state.has_live_ipc()
+                {
+                    congested_thumb_sem.clone()
+                } else {
+                    thumb_sem.clone()
+                };
+                let prefer_compact =
+                    state.config.network_mode.prefer_compact_thumbs() || state.has_live_ipc();
+                for (vid, url) in pending {
+                    if state.loading_thumbs.contains(&vid) {
+                        continue;
+                    }
+                    state.loading_thumbs.insert(vid.clone());
+                    spawn_thumb_loader(
+                        vid,
+                        url,
+                        pool.clone(),
+                        client.clone(),
+                        active_sem.clone(),
+                        tx.clone(),
+                        prefer_compact,
+                    );
                 }
-                state.loading_thumbs.insert(vid.clone());
-                spawn_thumb_loader(
-                    vid,
-                    url,
-                    pool.clone(),
-                    client.clone(),
-                    thumb_sem.clone(),
-                    tx.clone(),
-                );
             }
         }
 
@@ -505,6 +517,7 @@ fn trigger_swr_feed_refreshes(
     let cookies = state.config.cookies_path().ok();
     let cfg_cache = state.config.cache.clone();
     let session_opt = state.auth_vault.active_account().cloned();
+    let congested = state.config.network_mode.is_congested();
 
     let jobs = [
         (Category::Recommended, RECOMMENDED, cfg_cache.recommended_ttl),
@@ -586,9 +599,10 @@ fn trigger_swr_feed_refreshes(
                             fetched = page.videos;
                         }
 
-                        // Automatically chain up to 2 pages if initial shelf has fewer than target items
+                        // Automatically chain up to 2 pages (1 when congested) if initial shelf has fewer than target items
                         let target_min = if key_s == RECOMMENDED { 24 } else { 30 };
-                        for _ in 0..2 {
+                        let chain_pages = if congested && !force { 1 } else { 2 };
+                        for _ in 0..chain_pages {
                             if fetched.len() >= target_min {
                                 break;
                             }
@@ -791,6 +805,7 @@ fn trigger_swr_feed_refreshes(
         let c_sub = client.clone();
         let sess_sub = session_opt.clone();
         let sub_ttl = cfg_cache.subscriptions_ttl;
+        let max_sub_ch = if congested && !force { 3 } else { 8 };
         tokio::spawn(async move {
             let stale = force
                 || sub_shorts_empty
@@ -813,7 +828,7 @@ fn trigger_swr_feed_refreshes(
                 &c_sub,
                 sess_sub.as_ref(),
                 sub_channel_ids,
-                8,
+                max_sub_ch,
             )
             .await;
             let ts = now_unix();
@@ -937,7 +952,10 @@ fn spawn_card_metadata_enrichment(
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
     session: Option<crate::services::auth::GoogleAccountSession>,
+    congested: bool,
 ) {
+    let max_items = if congested { 6 } else { 18 };
+    let conc = if congested { 2 } else { 6 };
     let missing_ids: Vec<String> = items
         .iter()
         .filter(|v| {
@@ -945,7 +963,7 @@ fn spawn_card_metadata_enrichment(
                 || (v.timestamp.is_none() && v.published_text.is_none())
                 || v.display_uploader() == "Unknown"
         })
-        .take(18)
+        .take(max_items)
         .map(|v| v.id.clone())
         .collect();
 
@@ -957,7 +975,7 @@ fn spawn_card_metadata_enrichment(
     let tx_e = tx.clone();
     let c_e = client.clone();
     tokio::spawn(async move {
-        let sem = Arc::new(Semaphore::new(6));
+        let sem = Arc::new(Semaphore::new(conc));
         let mut handles = Vec::with_capacity(missing_ids.len());
         for vid in missing_ids {
             let permit = sem.clone().acquire_owned().await;
@@ -993,6 +1011,7 @@ fn spawn_thumb_loader(
     client: reqwest::Client,
     sem: Arc<Semaphore>,
     tx: mpsc::Sender<AppMessage>,
+    prefer_compact: bool,
 ) {
     tokio::spawn(async move {
         let Ok(_permit) = sem.acquire().await else {
@@ -1019,14 +1038,18 @@ fn spawn_thumb_loader(
             }
         }
 
-        // 2. Network fetch + fallback chain
+        // 2. Network fetch + fallback chain (prefer compact ~12KB mqdefault on congested Wi-Fi / active playback)
         let clean_id = video_id.trim_start_matches("RD");
         let hq = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", clean_id);
         let mq = format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", clean_id);
-        let candidates: Vec<String> = [url, hq, mq]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
+        let candidates: Vec<String> = if prefer_compact {
+            [mq, hq, url]
+        } else {
+            [url, hq, mq]
+        }
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
 
         for cand in candidates {
             if let Ok(resp) = client.get(&cand).send().await {
@@ -1293,6 +1316,7 @@ async fn handle_app_message(
                     tx,
                     client,
                     state.auth_vault.active_account().cloned(),
+                    state.config.network_mode.is_congested(),
                 );
             } else if !is_from_cache && !items.is_empty() {
                 let filtered_items: Vec<VideoItem> = if feed_key == RECOMMENDED {
@@ -1309,6 +1333,7 @@ async fn handle_app_message(
                     tx,
                     client,
                     state.auth_vault.active_account().cloned(),
+                    state.config.network_mode.is_congested(),
                 );
                 if let Some((_, list)) = state
                     .categories
@@ -1442,6 +1467,7 @@ async fn handle_app_message(
                     tx,
                     client,
                     state.auth_vault.active_account().cloned(),
+                    state.config.network_mode.is_congested(),
                 );
                 state.show_toast(format!("Loaded +{} videos", added_items.len()));
             } else if state.feed_continuations.contains_key(&feed_key) {
@@ -1502,7 +1528,13 @@ async fn handle_app_message(
             video_id,
             item,
             subtitles,
+            ladder,
         } => {
+            if let Some(lad) = ladder {
+                let clean = video_id.trim_start_matches("RD").to_string();
+                state.stream_ladder_cache.insert(video_id.clone(), lad.clone());
+                state.stream_ladder_cache.insert(clean, lad);
+            }
             let _ = upsert_video(pool, &item, now_unix()).await;
             let _ = backfill_session_video_metadata(
                 pool,
@@ -1522,6 +1554,11 @@ async fn handle_app_message(
                 state.detail_subtitles = subtitles;
                 state.detail_selected_sub_idx = 0;
             }
+        }
+        AppMessage::StreamLadderResolved { video_id, ladder } => {
+            let clean = video_id.trim_start_matches("RD").to_string();
+            state.stream_ladder_cache.insert(video_id, ladder.clone());
+            state.stream_ladder_cache.insert(clean, ladder);
         }
         AppMessage::SponsorSegmentsLoaded { video_id, segments } => {
             let rows = to_db_rows(&video_id, &segments);
@@ -1750,8 +1787,17 @@ async fn handle_app_message(
             title,
             session_id,
             sock_path,
+            stream_hint,
+            is_local,
         } => {
             state.reset_live_playback();
+            state.live_playback.is_local_file = is_local;
+            state.live_playback.playback_started_at = Some(Instant::now());
+            if let Some((h, fps, tbr)) = stream_hint {
+                state.live_playback.current_stream_height = h;
+                state.live_playback.current_stream_fps = fps;
+                state.live_playback.current_stream_tbr_kbps = tbr;
+            }
             state.active_playback_video_id = Some(video_id.clone());
             state.active_playback_title = Some(title.clone());
             state.live_playback.is_live_stream = state
@@ -1784,6 +1830,9 @@ async fn handle_app_message(
             if session_id == state.active_session_id {
                 let ev_copy = event.clone();
                 state.apply_live_ipc_event(event);
+                if matches!(ev_copy, LiveIpcEvent::PausedForCache(true)) {
+                    maybe_trigger_auto_abr_downshift(state);
+                }
                 if matches!(ev_copy, LiveIpcEvent::Tracks { .. })
                     && state.config.dub_preference == crate::config::DubPreference::OriginalOnly
                 {
@@ -2300,15 +2349,19 @@ fn open_detail_for_video(
     state.screen = Screen::Detail;
 
     let cookies = state.config.cookies_path().ok();
+    let force_ipv4 = state.config.force_ipv4;
     let tx_d = tx.clone();
     let id_d = vid_id.clone();
     tokio::spawn(async move {
-        if let Some((full_item, subs)) = fetch_video_details(cookies.as_deref(), &id_d).await {
+        if let Some((full_item, subs, ladder)) =
+            fetch_video_details_with_ladder(cookies.as_deref(), &id_d, force_ipv4).await
+        {
             let _ = tx_d
                 .send(AppMessage::VideoDetailsLoaded {
                     video_id: id_d,
                     item: full_item,
                     subtitles: subs,
+                    ladder,
                 })
                 .await;
         }
@@ -2478,22 +2531,77 @@ async fn start_nonblocking_playback_with_live_opts(
 
     let eff_master = state.config.effective_mastering();
     let ytdl_format = if is_live {
-        eff_quality.ytdl_format_for_live(
+        eff_quality.ytdl_format_for_live_with_network(
             state.config.live_mode,
             state.config.dub_preference,
             &state.config.dub_lang,
+            state.config.network_mode,
         )
     } else {
-        eff_quality.ytdl_format_with_dub_and_codec(
+        eff_quality.ytdl_format_for_network(
             state.config.dub_preference,
             &state.config.dub_lang,
-            state
-                .config
-                .performance_mode
-                .loads_multistreams(state.config.audio_multistreams),
+            state.config.network_mode.effective_multistreams(
+                state.config.audio_multistreams,
+                state.config.performance_mode,
+            ),
             eff_master.codec_priority,
+            state.config.network_mode,
         )
     };
+
+    let now_ts = now_unix();
+    let clean_id = video.clean_id().to_string();
+    let fresh_ladder = state
+        .stream_ladder_cache
+        .get(&video.id)
+        .or_else(|| state.stream_ladder_cache.get(&clean_id))
+        .filter(|l| l.is_fresh(now_ts))
+        .cloned();
+    let direct_stream = if !is_live
+        && local_file.is_none()
+        && matches!(state.config.player, Player::Mpv | Player::Iina)
+    {
+        fresh_ladder.as_ref().and_then(|l| {
+            l.select_best_pair(
+                eff_quality,
+                state.config.network_mode,
+                eff_master.codec_priority,
+                state.config.dub_preference,
+                &state.config.dub_lang,
+            )
+        })
+    } else {
+        None
+    };
+
+    if !is_live
+        && local_file.is_none()
+        && direct_stream.is_none()
+        && state.config.auto_abr_downshift
+        && state.config.player == Player::Mpv
+    {
+        let ck_res = cookies_path.clone();
+        let vid_res = video.id.clone();
+        let tx_res = tx.clone();
+        let ipv4 = state.config.force_ipv4;
+        tokio::spawn(async move {
+            if let Some(lad) = resolve_stream_ladder(ck_res.as_deref(), &vid_res, ipv4).await {
+                let _ = tx_res
+                    .send(AppMessage::StreamLadderResolved {
+                        video_id: vid_res,
+                        ladder: lad,
+                    })
+                    .await;
+            }
+        });
+    }
+
+    let is_local = local_file.is_some();
+    let stream_hint = direct_stream
+        .as_ref()
+        .map(|d| (d.height, d.fps, d.tbr_kbps));
+
     let opts = PlayOptions {
         video_id: video.id.clone(),
         title: video.title.clone(),
@@ -2524,6 +2632,9 @@ async fn start_nonblocking_playback_with_live_opts(
         live_mode: state.config.live_mode,
         live_from_start: force_from_start,
         live_auto_catchup: state.config.live_auto_catchup,
+        network_mode: state.config.network_mode,
+        force_ipv4: state.config.force_ipv4,
+        direct_stream,
     };
 
     match spawn_player(&opts) {
@@ -2549,7 +2660,7 @@ async fn start_nonblocking_playback_with_live_opts(
             } else {
                 usize::MAX
             };
-            if rec_len < 12 && !state.is_fetching_more {
+            if rec_len < 12 && !state.is_fetching_more && !state.config.network_mode.is_congested() {
                 maybe_trigger_infinite_scroll_for(
                     Category::Recommended,
                     state,
@@ -2591,6 +2702,13 @@ async fn start_nonblocking_playback_with_live_opts(
                     eff_quality.label(),
                     state.config.live_mode.label()
                 )
+            } else if state.config.network_mode.is_congested() {
+                format!(
+                    "Playing via {} ({} · {})",
+                    state.config.player.label(),
+                    eff_quality.label(),
+                    state.config.network_mode.short_badge()
+                )
             } else {
                 format!(
                     "Playing via {} ({})",
@@ -2601,28 +2719,31 @@ async fn start_nonblocking_playback_with_live_opts(
             state.show_toast(toast_msg);
 
             if state.config.player == Player::Mpv {
-                let mut sb_segs = if is_live {
-                    Vec::new()
-                } else if !state.detail_sponsor_segments.is_empty()
+                let sb_segs = if !is_live
+                    && !state.detail_sponsor_segments.is_empty()
                     && state
                         .detail_video
                         .as_ref()
                         .map(|v| v.id == video.id)
                         .unwrap_or(false)
                 {
-                    state.detail_sponsor_segments.clone()
-                } else {
-                    fetch_sponsor_segments(client, &video.id)
-                        .await
-                        .unwrap_or_default()
-                };
-                if !is_live {
-                    sb_segs = filter_segments_for_mode_with_outro(
-                        &sb_segs,
+                    filter_segments_for_mode_with_outro(
+                        &state.detail_sponsor_segments,
                         state.config.sponsorblock_mode,
                         state.config.skip_outro,
-                    );
-                }
+                    )
+                } else {
+                    Vec::new()
+                };
+                let sponsorblock_fetch = if sb_segs.is_empty() && !is_live {
+                    Some((
+                        client.clone(),
+                        state.config.sponsorblock_mode,
+                        state.config.skip_outro,
+                    ))
+                } else {
+                    None
+                };
 
                 let _ = tx
                     .send(AppMessage::PlaybackStarted {
@@ -2630,6 +2751,8 @@ async fn start_nonblocking_playback_with_live_opts(
                         title: video.title.clone(),
                         session_id,
                         sock_path: sock_path.clone(),
+                        stream_hint,
+                        is_local,
                     })
                     .await;
 
@@ -2645,6 +2768,7 @@ async fn start_nonblocking_playback_with_live_opts(
                     pool: pool.clone(),
                     tx: tx.clone(),
                     skip_segments: sb_segs,
+                    sponsorblock_fetch,
                 });
             } else {
                 let p_ext = pool.clone();
@@ -3234,6 +3358,20 @@ fn spawn_offline_download(video: &VideoItem, state: &mut AppState, pool: &Sqlite
         .get(state.play_quality_idx)
         .copied()
         .unwrap_or(state.config.quality);
+    let eff_master = state.config.effective_mastering();
+    let quality_format = quality.ytdl_format_for_network(
+        state.config.dub_preference,
+        &state.config.dub_lang,
+        false,
+        eff_master.codec_priority,
+        state.config.network_mode,
+    );
+    let concurrent_fragments = if state.has_live_ipc() { 1 } else { 4 };
+    let rate_limit = if state.has_live_ipc() {
+        Some("500K".to_string())
+    } else {
+        None
+    };
     state.active_download = Some(DownloadJobState {
         video_id: video.id.clone(),
         title: video.title.clone(),
@@ -3248,8 +3386,11 @@ fn spawn_offline_download(video: &VideoItem, state: &mut AppState, pool: &Sqlite
             video_id: video.id.clone(),
             title: video.title.clone(),
             channel_name: video.display_uploader().to_string(),
-            quality_format: quality.ytdl_format().to_string(),
+            quality_format,
             cookies_path: state.config.cookies_path().ok(),
+            force_ipv4: state.config.force_ipv4,
+            concurrent_fragments,
+            rate_limit,
         },
         pool.clone(),
         tx.clone(),
@@ -3275,6 +3416,27 @@ async fn execute_hub_action(
         HubActionId::PlayerBackend => {
             state.config.player = state.config.player.next();
             let _ = state.config.save();
+        }
+        HubActionId::NetworkMode => {
+            cycle_network_mode(state);
+        }
+        HubActionId::ForceIpv4 => {
+            state.config.force_ipv4 = !state.config.force_ipv4;
+            let _ = state.config.save();
+            state.show_toast(if state.config.force_ipv4 {
+                "Force IPv4 Routing: ON"
+            } else {
+                "Force IPv4 Routing: OFF"
+            });
+        }
+        HubActionId::AutoAbrDownshift => {
+            state.config.auto_abr_downshift = !state.config.auto_abr_downshift;
+            let _ = state.config.save();
+            state.show_toast(if state.config.auto_abr_downshift {
+                "Auto-ABR Stall Downshift: ON"
+            } else {
+                "Auto-ABR Stall Downshift: OFF"
+            });
         }
         HubActionId::SponsorBlockMode => {
             state.config.sponsorblock_mode = state.config.sponsorblock_mode.next();
@@ -3414,6 +3576,193 @@ fn cycle_live_mode(state: &mut AppState) {
         format!("Live Profile: {}", state.config.live_mode.label())
     };
     state.show_toast(msg);
+}
+
+fn cycle_network_mode(state: &mut AppState) {
+    let next = state.config.network_mode.next();
+    state.config.network_mode = next;
+    let _ = state.config.save();
+
+    if state.has_live_ipc() {
+        state.send_player_cmd(PlayerCommand::SetNetworkMode(next));
+        if next.is_congested()
+            && !state.live_playback.is_live_stream
+            && !state.live_playback.is_local_file
+        {
+            if let Some(ref vid) = state.active_playback_video_id {
+                let clean = vid.trim_start_matches("RD");
+                let now_ts = now_unix();
+                if let Some(ladder) = state
+                    .stream_ladder_cache
+                    .get(vid)
+                    .or_else(|| state.stream_ladder_cache.get(clean))
+                    .filter(|l| l.is_fresh(now_ts))
+                    .cloned()
+                {
+                    let eff_q = Quality::ALL
+                        .get(state.play_quality_idx)
+                        .copied()
+                        .unwrap_or(state.config.quality);
+                    let eff_master = state.config.effective_mastering();
+                    if let Some(pair) = ladder.select_best_pair(
+                        eff_q,
+                        next,
+                        eff_master.codec_priority,
+                        state.config.dub_preference,
+                        &state.config.dub_lang,
+                    ) {
+                        let cap_h = next.max_height_cap().unwrap_or(720);
+                        let should_switch = state.live_playback.current_stream_height == 0
+                            || state.live_playback.current_stream_height > cap_h
+                            || (state.live_playback.current_stream_fps > 40.0 && pair.fps <= 30.5);
+                        if should_switch && state.active_playback_pos > 1.0 {
+                            let h = pair.height;
+                            let fps = pair.fps;
+                            let tbr = pair.tbr_kbps;
+                            state.live_playback.current_stream_height = h;
+                            state.live_playback.current_stream_fps = fps;
+                            state.live_playback.current_stream_tbr_kbps = tbr;
+                            state.live_playback.last_abr_switch_at = Some(Instant::now());
+                            state.live_playback.recent_stall_times.clear();
+                            state.send_player_cmd(PlayerCommand::HotSwitchStream {
+                                primary_url: pair.primary_url,
+                                audio_url: pair.audio_url,
+                                user_agent: pair.user_agent,
+                                resume_pos: state.active_playback_pos,
+                                osd_message: format!("{} -> {h}p{fps:.0}", next.short_badge()),
+                            });
+                            state.show_toast(format!(
+                                "Network: {} (switched live to {h}p{fps:.0})",
+                                next.label()
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        state.show_toast(format!("Live Network: {}", next.label()));
+    } else {
+        state.show_toast(format!("Network Profile: {}", next.label()));
+    }
+}
+
+fn maybe_trigger_auto_abr_downshift(state: &mut AppState) {
+    if state.live_playback.is_live_stream || state.live_playback.is_local_file {
+        return;
+    }
+    let startup_ok = state
+        .live_playback
+        .playback_started_at
+        .map(|t| t.elapsed() >= Duration::from_secs(6))
+        .unwrap_or(false);
+    if !startup_ok {
+        return;
+    }
+
+    let now = Instant::now();
+    state.live_playback.stall_count = state.live_playback.stall_count.saturating_add(1);
+    state.live_playback.recent_stall_times.push(now);
+    state
+        .live_playback
+        .recent_stall_times
+        .retain(|t| now.duration_since(*t) <= Duration::from_secs(60));
+
+    if !state.config.auto_abr_downshift || state.active_playback_pos <= 2.0 {
+        return;
+    }
+    let cooldown_ok = state
+        .live_playback
+        .last_abr_switch_at
+        .map(|t| t.elapsed() >= Duration::from_secs(25))
+        .unwrap_or(true);
+    if !cooldown_ok {
+        return;
+    }
+
+    let speed_kbps = (state.live_playback.cache_speed_bps * 8) / 1000;
+    let slow_speed = state.live_playback.cache_speed_bps > 0
+        && state.live_playback.current_stream_tbr_kbps > 0.0
+        && (speed_kbps as f64) < state.live_playback.current_stream_tbr_kbps * 0.6;
+    let multi_stall = state.live_playback.recent_stall_times.len() >= 2;
+    if !(multi_stall || slow_speed) {
+        return;
+    }
+
+    let Some(ref vid) = state.active_playback_video_id else {
+        return;
+    };
+    let clean_id = vid.trim_start_matches("RD");
+    let now_ts = now_unix();
+    let Some(ladder) = state
+        .stream_ladder_cache
+        .get(vid)
+        .or_else(|| state.stream_ladder_cache.get(clean_id))
+        .filter(|l| l.is_fresh(now_ts))
+        .cloned()
+    else {
+        if multi_stall && !state.config.network_mode.is_congested() {
+            state.show_toast(
+                "Buffering on Wi-Fi — press [W] or [p]->[w] for Congested Wi-Fi mode",
+            );
+        }
+        return;
+    };
+
+    let eff_q = Quality::ALL
+        .get(state.play_quality_idx)
+        .copied()
+        .unwrap_or(state.config.quality);
+    let cur_h = if state.live_playback.current_stream_height > 0 {
+        state.live_playback.current_stream_height
+    } else {
+        eff_q.max_height_or_default(state.config.network_mode.max_height_cap().unwrap_or(2160))
+    };
+    let cur_fps = if state.live_playback.current_stream_fps > 0.0 {
+        state.live_playback.current_stream_fps
+    } else {
+        state
+            .config
+            .network_mode
+            .max_fps_cap()
+            .map(|f| f as f32)
+            .unwrap_or(60.0)
+    };
+    let cur_tbr = state.live_playback.current_stream_tbr_kbps;
+    let eff_master = state.config.effective_mastering();
+
+    if let Some(next_pair) = ladder.select_lower_tier(
+        cur_h,
+        cur_fps,
+        cur_tbr,
+        eff_master.codec_priority,
+        state.config.dub_preference,
+        &state.config.dub_lang,
+    ) {
+        let h = next_pair.height;
+        let fps = next_pair.fps;
+        let tbr = next_pair.tbr_kbps;
+        let osd = format!("Auto-ABR: {h}p{fps:.0} (~{tbr:.0} kbps)");
+        state.live_playback.current_stream_height = h;
+        state.live_playback.current_stream_fps = fps;
+        state.live_playback.current_stream_tbr_kbps = tbr;
+        state.live_playback.last_abr_switch_at = Some(now);
+        state.live_playback.recent_stall_times.clear();
+        state.send_player_cmd(PlayerCommand::HotSwitchStream {
+            primary_url: next_pair.primary_url,
+            audio_url: next_pair.audio_url,
+            user_agent: next_pair.user_agent,
+            resume_pos: state.active_playback_pos,
+            osd_message: osd,
+        });
+        state.show_toast(format!(
+            "Auto-ABR: stepped down to {h}p{fps:.0} (~{tbr:.0} kbps) for smooth Wi-Fi"
+        ));
+    } else if multi_stall && !state.config.network_mode.is_congested() {
+        state.show_toast(
+            "Buffering on Wi-Fi — press [W] or [p]->[w] for Congested Wi-Fi mode",
+        );
+    }
 }
 
 async fn relaunch_with_live_opts(
@@ -3848,6 +4197,9 @@ async fn apply_play_options_hit(
         PlayOptionsHit::CycleLiveMode => {
             cycle_live_mode(state);
         }
+        PlayOptionsHit::CycleNetworkMode => {
+            cycle_network_mode(state);
+        }
         PlayOptionsHit::ToggleLiveCatchup => {
             state.config.live_auto_catchup = !state.config.live_auto_catchup;
             let _ = state.config.save();
@@ -3940,6 +4292,9 @@ async fn apply_now_playing_hit(
         }
         NowPlayingHit::CycleLiveMode => {
             cycle_live_mode(state);
+        }
+        NowPlayingHit::CycleNetworkMode => {
+            cycle_network_mode(state);
         }
         NowPlayingHit::OpenStudio => {
             state.overlay = ActiveOverlay::PlayOptions;
@@ -5245,6 +5600,9 @@ async fn handle_key_event(
                 toggle_watch_later(&v, state, pool, client).await;
             }
         }
+        KeyCode::Char('W') => {
+            cycle_network_mode(state);
+        }
         KeyCode::Char('D') => {
             if let Some(v) = state.current_home_video() {
                 spawn_offline_download(&v, state, pool, tx);
@@ -5585,6 +5943,9 @@ async fn handle_overlay_key(
             KeyCode::Char('t') => {
                 let next = state.config.motion_mode.next();
                 apply_motion_mode(state, next);
+            }
+            KeyCode::Char('w') => {
+                cycle_network_mode(state);
             }
             KeyCode::Char(' ') => {
                 if state.play_modal_section == 4 {

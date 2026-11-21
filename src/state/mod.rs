@@ -4,6 +4,7 @@ use crate::api::dislike::DislikeInfo;
 use crate::api::innertube::{VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
+use crate::api::ytdlp::ResolvedStreamLadder;
 use crate::config::{
     Config, PerformanceMode, Player, Quality, SponsorBlockMode, VideoShaderMode,
 };
@@ -337,6 +338,7 @@ pub struct AppState {
     pub active_session_id: u64,
     pub sponsor_skips_session: u32,
     pub live_playback: LivePlaybackControlState,
+    pub stream_ladder_cache: HashMap<String, ResolvedStreamLadder>,
 
     // Intelligence & Services
     pub analytics: UserAnalytics,
@@ -513,6 +515,7 @@ impl AppState {
             active_session_id: 0,
             sponsor_skips_session: 0,
             live_playback: LivePlaybackControlState::default(),
+            stream_ladder_cache: HashMap::new(),
 
             analytics: UserAnalytics::default(),
             analytics_loaded: false,
@@ -633,6 +636,9 @@ impl AppState {
                 self.live_playback.seekable_end_secs = seekable_end_secs;
             }
             LiveIpcEvent::DroppedFrames(d) => self.live_playback.dropped_frames = d,
+            LiveIpcEvent::PausedForCache(v) => self.live_playback.paused_for_cache = v,
+            LiveIpcEvent::CacheSpeed(bps) => self.live_playback.cache_speed_bps = bps,
+            LiveIpcEvent::BufferingPct(pct) => self.live_playback.buffering_pct = pct,
             LiveIpcEvent::Tracks { audio, sub } => {
                 if let Some(sel) = audio.iter().find(|t| t.selected) {
                     self.live_playback.active_aid = Some(sel.id);
@@ -1579,6 +1585,7 @@ pub enum PlayOptionsHit {
     SeedManualFrom(PerformanceMode),
     DownloadNeuralShaders,
     CycleLiveMode,
+    CycleNetworkMode,
     ToggleLiveCatchup,
     JumpToLiveEdge,
     PlayLiveFromStart,
@@ -1613,6 +1620,7 @@ pub enum NowPlayingHit {
     CycleMotion,
     JumpToLiveEdge,
     CycleLiveMode,
+    CycleNetworkMode,
     OpenStudio,
     StopPlayer,
 }
@@ -1639,6 +1647,17 @@ pub struct LivePlaybackControlState {
     pub seekable_end_secs: f64,
     pub is_live_stream: bool,
     pub dropped_frames: i64,
+    pub paused_for_cache: bool,
+    pub cache_speed_bps: u64,
+    pub buffering_pct: i64,
+    pub stall_count: u32,
+    pub recent_stall_times: Vec<Instant>,
+    pub current_stream_height: u16,
+    pub current_stream_fps: f32,
+    pub current_stream_tbr_kbps: f64,
+    pub is_local_file: bool,
+    pub playback_started_at: Option<Instant>,
+    pub last_abr_switch_at: Option<Instant>,
     pub audio_tracks: Vec<LiveMediaTrack>,
     pub audio_track_scroll: usize,
     pub sub_tracks: Vec<LiveMediaTrack>,
@@ -1670,6 +1689,17 @@ impl Default for LivePlaybackControlState {
             seekable_end_secs: 0.0,
             is_live_stream: false,
             dropped_frames: 0,
+            paused_for_cache: false,
+            cache_speed_bps: 0,
+            buffering_pct: 0,
+            stall_count: 0,
+            recent_stall_times: Vec::new(),
+            current_stream_height: 0,
+            current_stream_fps: 0.0,
+            current_stream_tbr_kbps: 0.0,
+            is_local_file: false,
+            playback_started_at: None,
+            last_abr_switch_at: None,
             audio_tracks: Vec::new(),
             audio_track_scroll: 0,
             sub_tracks: Vec::new(),

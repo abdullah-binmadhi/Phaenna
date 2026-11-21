@@ -4,6 +4,7 @@ use crate::api::dislike::DislikeInfo;
 use crate::api::innertube::{VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
+use crate::api::ytdlp::ResolvedStreamLadder;
 use crate::db::cache::{VideoItem, VideoStatsUpdate};
 use crate::services::auth::{ChallengeKind, DeviceCodeSession, GoogleAccountSession};
 use crate::services::cast::CastDevice;
@@ -60,6 +61,11 @@ pub enum AppMessage {
         video_id: String,
         item: VideoItem,
         subtitles: Vec<SubtitleTrack>,
+        ladder: Option<ResolvedStreamLadder>,
+    },
+    StreamLadderResolved {
+        video_id: String,
+        ladder: ResolvedStreamLadder,
     },
 
     // Community Enrichment
@@ -134,6 +140,8 @@ pub enum AppMessage {
         title: String,
         session_id: u64,
         sock_path: String,
+        stream_hint: Option<(u16, f32, f64)>,
+        is_local: bool,
     },
     PlaybackCommandReady {
         session_id: u64,

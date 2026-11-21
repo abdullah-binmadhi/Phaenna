@@ -18,6 +18,9 @@ pub struct DownloadTask {
     pub channel_name: String,
     pub quality_format: String,
     pub cookies_path: Option<PathBuf>,
+    pub force_ipv4: bool,
+    pub concurrent_fragments: u8,
+    pub rate_limit: Option<String>,
 }
 
 /// Parse yt-dlp `[download]  42.3% of ... at  3.25MiB/s ETA 00:12` output.
@@ -107,6 +110,24 @@ pub fn spawn_download_task(task: DownloadTask, pool: SqlitePool, tx: Sender<AppM
         }
         cmd.args([
             "--newline",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--file-access-retries",
+            "5",
+        ]);
+        if task.concurrent_fragments > 1 {
+            cmd.arg("--concurrent-fragments")
+                .arg(task.concurrent_fragments.to_string());
+        }
+        if task.force_ipv4 {
+            cmd.arg("--force-ipv4");
+        }
+        if let Some(ref lim) = task.rate_limit {
+            cmd.arg("--limit-rate").arg(lim);
+        }
+        cmd.args([
             "-f",
             &task.quality_format,
             "--merge-output-format",

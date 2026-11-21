@@ -4,8 +4,8 @@
 //! 10-Point Manual Thermal/GPU Controls (`a`), Picture EQ, and Live Transport.
 
 use crate::config::{
-    dub_lang_label, GlslStageMode, PerformanceMode, Player, Quality, SponsorBlockMode,
-    SuperResMode, VideoShaderMode,
+    dub_lang_label, GlslStageMode, NetworkMode, PerformanceMode, Player, Quality,
+    SponsorBlockMode, SuperResMode, VideoShaderMode,
 };
 use crate::services::shaders::neural_shader_installed;
 use crate::state::{
@@ -31,6 +31,16 @@ pub fn format_hms(secs: f64) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m:02}:{s:02}")
+    }
+}
+
+fn format_speed_bps(bps: u64) -> String {
+    if bps >= 1_048_576 {
+        format!("{:.1}M/s", bps as f64 / 1_048_576.0)
+    } else if bps >= 1024 {
+        format!("{}K/s", bps / 1024)
+    } else {
+        "--".to_string()
     }
 }
 
@@ -218,6 +228,20 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
                 .add_modifier(Modifier::BOLD),
         ),
     ];
+    if state.config.network_mode.is_congested() {
+        let net_bg = match state.config.network_mode {
+            NetworkMode::CongestedWifi => Color::Rgb(251, 191, 36),
+            NetworkMode::UltraSaver => Color::Rgb(52, 211, 153),
+            NetworkMode::Normal => theme.primary,
+        };
+        title_spans.push(Span::styled(
+            format!(" [{}] ", state.config.network_mode.short_badge()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(net_bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if is_live_stream {
         title_spans.push(Span::styled(
             format!(" [{}] ", state.config.live_mode.short_badge()),
@@ -317,6 +341,8 @@ pub fn render_play_options_modal(frame: &mut Frame, state: &mut AppState) {
             Span::styled("| ", Style::default().fg(theme.divider)),
             Span::styled("[v] Live ", Style::default().fg(Color::Rgb(248, 113, 113))),
             Span::styled("| ", Style::default().fg(theme.divider)),
+            Span::styled("[w] Net ", Style::default().fg(Color::Rgb(251, 191, 36))),
+            Span::styled("| ", Style::default().fg(theme.divider)),
             Span::styled(
                 if live {
                     "[Enter] Relaunch/Apply "
@@ -365,11 +391,23 @@ fn render_transport_banner(frame: &mut Frame, area: Rect, state: &mut AppState) 
             .copied()
             .unwrap_or(state.config.quality);
         let eff_master = state.config.effective_mastering();
+        let net_pill = format!(" {} ", state.config.network_mode.short_badge());
+        let net_bg = match state.config.network_mode {
+            NetworkMode::Normal => theme.border_idle,
+            NetworkMode::CongestedWifi => Color::Rgb(251, 191, 36),
+            NetworkMode::UltraSaver => Color::Rgb(52, 211, 153),
+        };
+        let net_fg = if state.config.network_mode.is_congested() {
+            Color::Black
+        } else {
+            theme.text
+        };
         let launch_label = " [Launch Video] ";
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(20),
+                Constraint::Length(net_pill.len() as u16 + 1),
                 Constraint::Length(dub_pill.len() as u16 + 1),
                 Constraint::Length(launch_label.len() as u16 + 1),
             ])
@@ -410,6 +448,16 @@ fn render_transport_banner(frame: &mut Frame, area: Rect, state: &mut AppState) 
         frame.render_widget(Paragraph::new(summary), cols[0]);
         frame.render_widget(
             Paragraph::new(Span::styled(
+                net_pill,
+                Style::default()
+                    .fg(net_fg)
+                    .bg(net_bg)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            cols[1],
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
                 dub_pill,
                 Style::default()
                     .fg(Color::Black)
@@ -420,7 +468,7 @@ fn render_transport_banner(frame: &mut Frame, area: Rect, state: &mut AppState) 
                     })
                     .add_modifier(Modifier::BOLD),
             )),
-            cols[1],
+            cols[2],
         );
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -430,16 +478,20 @@ fn render_transport_banner(frame: &mut Frame, area: Rect, state: &mut AppState) 
                     .bg(Color::Rgb(52, 211, 153))
                     .add_modifier(Modifier::BOLD),
             )),
-            cols[2],
+            cols[3],
         );
         state
             .live_playback
             .play_hitboxes
-            .push((cols[1], PlayOptionsHit::ToggleDub));
+            .push((cols[1], PlayOptionsHit::CycleNetworkMode));
         state
             .live_playback
             .play_hitboxes
-            .push((cols[2], PlayOptionsHit::LaunchOrRelaunch));
+            .push((cols[2], PlayOptionsHit::ToggleDub));
+        state
+            .live_playback
+            .play_hitboxes
+            .push((cols[3], PlayOptionsHit::LaunchOrRelaunch));
         return;
     }
 
@@ -1402,12 +1454,23 @@ fn render_live_controls_pane(frame: &mut Frame, area: Rect, state: &mut AppState
         .split(inner);
 
     // Row 0: Telemetry
+    let spd = format_speed_bps(state.live_playback.cache_speed_bps);
+    let stalls = state.live_playback.stall_count;
     let telem = if live && is_live_stream {
-        format!(" Edge: -{live_lag:.1}s | Buf: {cache_ahead_secs:.1}s ({cache_mb}M) | Drp:{dropped_frames}")
+        format!(" Edge: -{live_lag:.1}s | Buf: {cache_ahead_secs:.1}s ({spd}) | Drp:{dropped_frames}")
     } else if live {
-        format!(" Buf: {cache_mb}/{max_mb}MB | Drp: {dropped_frames} | IPC Ready")
+        let buf_tag = if state.live_playback.paused_for_cache {
+            " [BUF]"
+        } else {
+            ""
+        };
+        format!(" Buf: {cache_ahead_secs:.1}s ({cache_mb}M) | {spd} | Stl:{stalls}{buf_tag}")
     } else {
-        format!(" Max Buf: {max_mb}MB | Engine: {}", state.config.player.as_str())
+        format!(
+            " Max:{max_mb}M | {} | {}",
+            state.config.network_mode.short_badge(),
+            state.config.player.as_str()
+        )
     };
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -1690,11 +1753,19 @@ pub fn render_now_playing_bar(frame: &mut Frame, area: Rect, state: &mut AppStat
     let time_lbl = if is_live_str {
         let lag = state.live_playback.live_edge_lag_secs(state.active_playback_pos);
         format!("Edge:-{lag:.1}s Buf:{:.1}s", state.live_playback.cache_ahead_secs)
+    } else if state.live_playback.paused_for_cache {
+        format!(
+            "{}/{} BUF:{}%",
+            format_hms(state.active_playback_pos),
+            format_hms(state.active_playback_dur.max(0.0)),
+            state.live_playback.buffering_pct.clamp(0, 100)
+        )
     } else {
         format!(
-            "{}/{}",
+            "{}/{} Buf:{:.0}s",
             format_hms(state.active_playback_pos),
-            format_hms(state.active_playback_dur.max(0.0))
+            format_hms(state.active_playback_dur.max(0.0)),
+            state.live_playback.cache_ahead_secs
         )
     };
 
@@ -1748,6 +1819,19 @@ pub fn render_now_playing_bar(frame: &mut Frame, area: Rect, state: &mut AppStat
             format!("[{}]", state.config.performance_mode.short_badge()),
             Style::default().fg(Color::Rgb(56, 189, 248)).bg(bg).add_modifier(Modifier::BOLD),
             Some(NowPlayingHit::CyclePerfMode),
+        ),
+        (" ".to_string(), Style::default().bg(bg), None),
+        (
+            format!("[{}]", state.config.network_mode.short_badge()),
+            Style::default()
+                .fg(if state.config.network_mode.is_congested() {
+                    Color::Rgb(251, 191, 36)
+                } else {
+                    theme.text_dim
+                })
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+            Some(NowPlayingHit::CycleNetworkMode),
         ),
         (" ".to_string(), Style::default().bg(bg), None),
         (

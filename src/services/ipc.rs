@@ -3,9 +3,13 @@
 //! triggers 85% completion watch logging, and performs automatic SponsorBlock segment skipping.
 
 use crate::api::player::LOUDNORM_FILTER;
-use crate::api::sponsorblock::{category_label, SponsorSegment};
+use crate::api::sponsorblock::{
+    category_label, fetch_sponsor_segments, filter_segments_for_mode_with_outro, from_db_rows,
+    SponsorSegment,
+};
 use crate::config::{
-    DebandTier, GpuScalerMode, ManualMasteringConfig, MotionMode, PerformanceMode, VideoShaderMode,
+    DebandTier, GpuScalerMode, ManualMasteringConfig, MotionMode, NetworkMode, PerformanceMode,
+    SponsorBlockMode, VideoShaderMode,
 };
 use crate::db;
 use crate::messages::AppMessage;
@@ -17,7 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::{
+    mpsc::{self, Sender},
+    oneshot,
+};
 
 #[cfg(unix)]
 type IpcStream = tokio::net::UnixStream;
@@ -62,6 +69,7 @@ pub struct IpcMonitorConfig {
     pub pool: SqlitePool,
     pub tx: Sender<AppMessage>,
     pub skip_segments: Vec<SponsorSegment>,
+    pub sponsorblock_fetch: Option<(reqwest::Client, SponsorBlockMode, bool)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +146,9 @@ pub enum LiveIpcEvent {
         cache_ahead_secs: f64,
         seekable_end_secs: f64,
     },
+    PausedForCache(bool),
+    CacheSpeed(u64),
+    BufferingPct(i64),
     DroppedFrames(i64),
     Tracks {
         audio: Vec<LiveMediaTrack>,
@@ -169,6 +180,14 @@ pub enum PlayerCommand {
     SetOnTop(bool),
     SetLoop(bool),
     JumpToLiveEdge,
+    SetNetworkMode(NetworkMode),
+    HotSwitchStream {
+        primary_url: String,
+        audio_url: Option<String>,
+        user_agent: Option<String>,
+        resume_pos: f64,
+        osd_message: String,
+    },
     Stop,
 }
 
@@ -342,6 +361,40 @@ impl PlayerCommand {
                 json!({"command": ["script-binding", "phaenna-snap-live-edge"]}).to_string(),
                 json!({"command": ["set_property", "speed", 1.0]}).to_string(),
             ],
+            Self::SetNetworkMode(mode) => vec![
+                json!({"command": ["set_property", "cache-pause-wait", mode.vod_cache_pause_wait_secs()]}).to_string(),
+                json!({"command": ["set_property", "demuxer-readahead-secs", mode.vod_readahead_secs()]}).to_string(),
+                json!({"command": ["set_property", "network-timeout", mode.network_timeout_secs()]}).to_string(),
+                json!({"command": ["show-text", format!("Phaenna Network: {}", mode.label()), 2500]}).to_string(),
+            ],
+            Self::HotSwitchStream {
+                primary_url,
+                audio_url,
+                user_agent,
+                resume_pos,
+                osd_message,
+            } => {
+                let mut cmds = Vec::new();
+                if *resume_pos > 1.0 {
+                    cmds.push(
+                        json!({"command": ["set_property", "start", format!("{:.2}", resume_pos)]})
+                            .to_string(),
+                    );
+                }
+                if let Some(ref ua) = user_agent {
+                    if !ua.trim().is_empty() {
+                        cmds.push(json!({"command": ["set_property", "user-agent", ua]}).to_string());
+                    }
+                }
+                if let Some(ref aurl) = audio_url {
+                    cmds.push(json!({"command": ["set_property", "audio-files", [aurl]]}).to_string());
+                } else {
+                    cmds.push(json!({"command": ["set_property", "audio-files", []]}).to_string());
+                }
+                cmds.push(json!({"command": ["loadfile", primary_url, "replace"]}).to_string());
+                cmds.push(json!({"command": ["show-text", osd_message, 3500]}).to_string());
+                cmds
+            }
             Self::Stop => vec![json!({"command": ["quit"]}).to_string()],
         }
     }
@@ -468,6 +521,9 @@ pub fn parse_live_ipc_event(line: &str) -> Option<LiveIpcEvent> {
         "saturation" => Some(LiveIpcEvent::Saturation(data.as_f64()?.round() as i64)),
         "gamma" => Some(LiveIpcEvent::Gamma(data.as_f64()?.round() as i64)),
         "frame-drop-count" => Some(LiveIpcEvent::DroppedFrames(data.as_i64()?)),
+        "paused-for-cache" => Some(LiveIpcEvent::PausedForCache(data.as_bool()?)),
+        "cache-speed" => Some(LiveIpcEvent::CacheSpeed(data.as_f64()?.max(0.0).round() as u64)),
+        "cache-buffering-state" => Some(LiveIpcEvent::BufferingPct(data.as_f64()?.round() as i64)),
         "demuxer-cache-state" => {
             let bytes = data
                 .get("fw-bytes")
@@ -546,6 +602,17 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+fn is_file_loaded_event(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("event")
+                .and_then(Value::as_str)
+                .map(|e| e == "file-loaded")
+        })
+        .unwrap_or(false)
+}
+
 pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
     tokio::spawn(async move {
         let mut stream = None;
@@ -593,6 +660,9 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             (18, "track-list"),
             (19, "demuxer-cache-state"),
             (20, "frame-drop-count"),
+            (21, "paused-for-cache"),
+            (22, "cache-speed"),
+            (23, "cache-buffering-state"),
         ];
         for (id, prop) in observe_props {
             let msg = format!("{{\"command\":[\"observe_property\",{id},\"{prop}\"]}}\n");
@@ -668,12 +738,53 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
         let mut last_ui_tick = std::time::Instant::now();
         let mut skipped_uuids: HashSet<String> = HashSet::new();
         let mut marked_watched = false;
+        let mut skip_segments = config.skip_segments.clone();
+        let mut pending_reset_start = false;
+        let mut sb_rx: Option<oneshot::Receiver<Vec<SponsorSegment>>> = None;
+
+        if skip_segments.is_empty() && !config.is_live {
+            if let Some((sb_client, sb_mode, skip_outro)) = config.sponsorblock_fetch.clone() {
+                if sb_mode != SponsorBlockMode::Off {
+                    let (sb_tx, rx) = oneshot::channel();
+                    let sb_vid = config.video_id.clone();
+                    let sb_pool = config.pool.clone();
+                    tokio::spawn(async move {
+                        let raw = match db::user::get_sponsorblock_segments(&sb_pool, &sb_vid).await {
+                            Ok(cached) if !cached.is_empty() => from_db_rows(&cached),
+                            _ => fetch_sponsor_segments(&sb_client, &sb_vid)
+                                .await
+                                .unwrap_or_default(),
+                        };
+                        if !raw.is_empty() {
+                            let filtered =
+                                filter_segments_for_mode_with_outro(&raw, sb_mode, skip_outro);
+                            let _ = sb_tx.send(filtered);
+                        }
+                    });
+                    sb_rx = Some(rx);
+                }
+            }
+        }
 
         loop {
             tokio::select! {
+                sb_res = async {
+                    match sb_rx.as_mut() {
+                        Some(rx) => rx.await.ok(),
+                        None => std::future::pending().await,
+                    }
+                }, if sb_rx.is_some() => {
+                    sb_rx = None;
+                    if let Some(segs) = sb_res {
+                        skip_segments = segs;
+                    }
+                }
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(cmd) => {
+                            if matches!(cmd, PlayerCommand::HotSwitchStream { .. }) {
+                                pending_reset_start = true;
+                            }
                             for raw in cmd.to_mpv_json_commands() {
                                 let line = format!("{raw}\n");
                                 if writer.write_all(line.as_bytes()).await.is_err() {
@@ -688,6 +799,13 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                     let Ok(Some(line)) = next_line else {
                         break;
                     };
+
+                    if pending_reset_start && is_file_loaded_event(&line) {
+                        pending_reset_start = false;
+                        let _ = writer
+                            .write_all(b"{\"command\":[\"set_property\",\"start\",\"none\"]}\n")
+                            .await;
+                    }
 
                     if let Some((name, val)) = parse_property_change(&line) {
                         match name.as_str() {
@@ -711,7 +829,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                 if let Some(seg) = check_skip_interval_with_duration(
                                     val,
                                     last_dur,
-                                    &config.skip_segments,
+                                    &skip_segments,
                                     &skipped_uuids,
                                 ) {
                                     skipped_uuids.insert(seg.uuid.clone());
@@ -952,5 +1070,45 @@ mod tests {
         assert!(!is_completion_threshold_reached(40.0, 45.0));
         assert!(!is_completion_threshold_reached(80.0, 100.0));
         assert!(is_completion_threshold_reached(86.0, 100.0));
+    }
+
+    #[test]
+    fn test_buffer_telemetry_and_abr_hot_switch_commands() {
+        let pfc_line = r#"{"event":"property-change","id":21,"name":"paused-for-cache","data":true}"#;
+        assert!(matches!(
+            parse_live_ipc_event(pfc_line),
+            Some(LiveIpcEvent::PausedForCache(true))
+        ));
+
+        let spd_line = r#"{"event":"property-change","id":22,"name":"cache-speed","data":524288.4}"#;
+        assert!(matches!(
+            parse_live_ipc_event(spd_line),
+            Some(LiveIpcEvent::CacheSpeed(524288))
+        ));
+
+        let pct_line = r#"{"event":"property-change","id":23,"name":"cache-buffering-state","data":67.8}"#;
+        assert!(matches!(
+            parse_live_ipc_event(pct_line),
+            Some(LiveIpcEvent::BufferingPct(68))
+        ));
+
+        let net_cmds = PlayerCommand::SetNetworkMode(NetworkMode::CongestedWifi).to_mpv_json_commands();
+        assert!(net_cmds.iter().any(|c| c.contains("\"cache-pause-wait\",4.5")));
+        assert!(net_cmds.iter().any(|c| c.contains("\"demuxer-readahead-secs\",120")));
+        assert!(net_cmds.iter().any(|c| c.contains("\"network-timeout\",12")));
+
+        let sw_cmds = PlayerCommand::HotSwitchStream {
+            primary_url: "https://cdn.example.com/v480.webm".to_string(),
+            audio_url: Some("https://cdn.example.com/a96.webm".to_string()),
+            user_agent: Some("PhaennaTest/1.0".to_string()),
+            resume_pos: 142.35,
+            osd_message: "Auto-ABR -> 480p30".to_string(),
+        }
+        .to_mpv_json_commands();
+        assert!(sw_cmds.iter().any(|c| c.contains("\"start\",\"142.35\"")));
+        assert!(sw_cmds.iter().any(|c| c.contains("\"audio-files\",[\"https://cdn.example.com/a96.webm\"]")));
+        assert!(sw_cmds.iter().any(|c| c.contains("\"loadfile\",\"https://cdn.example.com/v480.webm\",\"replace\"")));
+        assert!(is_file_loaded_event(r#"{"event":"file-loaded"}"#));
+        assert!(!is_file_loaded_event(r#"{"event":"end-file"}"#));
     }
 }

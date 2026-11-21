@@ -1,8 +1,9 @@
 //! Cross-platform binary detector & non-blocking external video player launcher.
 
+use crate::api::ytdlp::SelectedStreamPair;
 use crate::config::{
-    Config, DubPreference, LiveStreamMode, ManualMasteringConfig, MotionMode, PerformanceMode,
-    Player, VideoShaderMode,
+    Config, DubPreference, LiveStreamMode, ManualMasteringConfig, MotionMode, NetworkMode,
+    PerformanceMode, Player, VideoShaderMode,
 };
 use crate::error::{AppError, Result};
 use crate::services::shaders::{
@@ -134,6 +135,9 @@ pub struct PlayOptions {
     pub live_mode: LiveStreamMode,
     pub live_from_start: bool,
     pub live_auto_catchup: bool,
+    pub network_mode: NetworkMode,
+    pub force_ipv4: bool,
+    pub direct_stream: Option<SelectedStreamPair>,
 }
 
 pub const LOUDNORM_FILTER: &str = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]";
@@ -247,8 +251,20 @@ meta = meta:gsub("[{}]", "")
 
 local phase = 0.0
 local cache_pct = nil
+local cache_speed = 0
+local cache_dur = 0
 local is_loading = true
 local timer = nil
+
+local function fmt_speed(bps)
+    if not bps or bps <= 0 then return "" end
+    if bps >= 1048576 then
+        return string.format(" · %.1f MB/s", bps / 1048576.0)
+    elseif bps >= 1024 then
+        return string.format(" · %d KB/s", math.floor(bps / 1024.0))
+    end
+    return string.format(" · %d B/s", math.floor(bps))
+end
 
 local function render_loader()
     if not is_loading then
@@ -261,11 +277,13 @@ local function render_loader()
     local bar_y0 = 404
     local bar_y1 = 418
 
-    local status = "Connecting & Buffering HD Stream..."
+    local spd_txt = fmt_speed(cache_speed)
+    local dur_txt = (cache_dur and cache_dur > 0.1) and string.format(" · %.1fs", cache_dur) or ""
+    local status = "Connecting & Buffering HD Stream" .. spd_txt .. "..."
     local fill_x0 = bar_x0
     local fill_w = 180
     if cache_pct and cache_pct > 0 and cache_pct < 100 then
-        status = string.format("Buffering Stream (%d%%)...", math.floor(cache_pct))
+        status = string.format("Buffering Stream (%d%%)%s%s...", math.floor(cache_pct), spd_txt, dur_txt)
         fill_w = math.max(24, math.floor(bar_w * (cache_pct / 100.0)))
     else
         local sweep = math.floor(phase * (bar_w - 160))
@@ -329,6 +347,14 @@ end)
 
 mp.observe_property("cache-buffering-state", "number", function(_, val)
     cache_pct = val
+end)
+
+mp.observe_property("cache-speed", "number", function(_, val)
+    cache_speed = val or 0
+end)
+
+mp.observe_property("demuxer-cache-duration", "number", function(_, val)
+    cache_dur = val or 0
 end)
 
 start_anim()
@@ -419,7 +445,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     if let Some(lua_path) = prepare_loading_overlay_script() {
         flags.push(format!("script={}", lua_path.to_string_lossy()));
         let safe_title = sanitize_script_opt(&opts.title);
-        let safe_meta = if use_live_pipeline {
+        let mut safe_meta = if use_live_pipeline {
             format!("PHAENNA LIVE | {}", opts.live_mode.short_badge())
         } else {
             format!(
@@ -428,8 +454,22 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
                 opts.motion_mode.short_badge()
             )
         };
+        if opts.network_mode.is_congested() {
+            safe_meta.push_str(&format!(" | {}", opts.network_mode.short_badge()));
+        }
         script_opt_parts.push(format!("phaenna_title={safe_title}"));
         script_opt_parts.push(format!("phaenna_meta={safe_meta}"));
+    }
+
+    if opts.local_file.is_none() {
+        flags.push(format!(
+            "network-timeout={}",
+            opts.network_mode.network_timeout_secs()
+        ));
+        flags.push(
+            "stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=3,http_persistent=1,multiple_requests=1"
+                .to_string(),
+        );
     }
 
     if use_live_pipeline {
@@ -441,13 +481,16 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             "cache-pause-initial={}",
             if opts.live_mode.cache_pause_initial() { "yes" } else { "no" }
         ));
-        flags.push(format!(
-            "cache-pause-wait={:.1}",
+        let live_pause_wait = if opts.network_mode.is_congested() {
+            opts.live_mode.cache_pause_wait_secs().max(3.5)
+        } else {
             opts.live_mode.cache_pause_wait_secs()
+        };
+        flags.push(format!("cache-pause-wait={:.1}", live_pause_wait));
+        flags.push(format!(
+            "hls-bitrate={}",
+            opts.network_mode.live_hls_bitrate()
         ));
-        flags.push("network-timeout=15".to_string());
-        flags.push("hls-bitrate=max".to_string());
-        flags.push("stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=4".to_string());
         flags.push("video-sync=audio".to_string());
         flags.push("interpolation=no".to_string());
 
@@ -485,6 +528,20 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
                 flags.push("override-display-fps=120".to_string());
             }
         }
+        if opts.local_file.is_none() {
+            flags.push(format!(
+                "demuxer-readahead-secs={}",
+                opts.network_mode.vod_readahead_secs()
+            ));
+            flags.push("cache-pause-initial=yes".to_string());
+            flags.push(format!(
+                "cache-pause-wait={:.1}",
+                opts.network_mode.vod_cache_pause_wait_secs()
+            ));
+            if opts.network_mode.use_disk_cache() {
+                flags.push("cache-on-disk=yes".to_string());
+            }
+        }
     }
 
     if !script_opt_parts.is_empty() {
@@ -492,28 +549,57 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     }
 
     if opts.local_file.is_none() {
-        flags.push(format!("ytdl-format={}", opts.quality_format));
-        let vcodec_order = eff_master.codec_priority.format_sort_vcodec();
-        let sort_spec = match opts.dub_preference {
-            // Keep `lang` ahead of `abr` so YouTube's `language_preference=10` (Original)
-            // never loses to slightly higher-bitrate AI-dubbed audio tracks.
-            DubPreference::OriginalOnly => format!("lang,res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr"),
-            DubPreference::PreferDubbed => format!("res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr"),
+        let direct_opt = if use_live_pipeline {
+            None
+        } else {
+            opts.direct_stream.as_ref()
         };
-        flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
-        if !use_live_pipeline && opts.performance_mode.loads_multistreams(opts.audio_multistreams) {
-            flags.push("ytdl-raw-options-append=audio-multistreams=".to_string());
-        }
-        if use_live_pipeline && opts.live_from_start {
-            flags.push("ytdl-raw-options-append=live-from-start=".to_string());
-        }
-        if let Some(ref cpath) = opts.cookies_path {
-            if cpath.exists() {
-                flags.push(format!(
-                    "ytdl-raw-options-append=cookies={}",
-                    cpath.to_string_lossy()
-                ));
-                flags.push("ytdl-raw-options-append=mark-watched=".to_string());
+        if let Some(direct) = direct_opt {
+            flags.push("ytdl=no".to_string());
+            if let Some(ref ua) = direct.user_agent {
+                if !ua.trim().is_empty() {
+                    flags.push(format!("user-agent={ua}"));
+                }
+            }
+            if let Some(ref aurl) = direct.audio_url {
+                flags.push(format!("audio-file={aurl}"));
+            }
+        } else {
+            flags.push(format!("ytdl-format={}", opts.quality_format));
+            let vcodec_order = eff_master.codec_priority.format_sort_vcodec();
+            let sort_spec = match opts.dub_preference {
+                // Keep `lang` ahead of `abr` so YouTube's `language_preference=10` (Original)
+                // never loses to slightly higher-bitrate AI-dubbed audio tracks.
+                DubPreference::OriginalOnly => {
+                    format!("lang,res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr")
+                }
+                DubPreference::PreferDubbed => {
+                    format!("res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr")
+                }
+            };
+            flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
+            flags.push("ytdl-raw-options-append=no-playlist=".to_string());
+            if opts.force_ipv4 {
+                flags.push("ytdl-raw-options-append=force-ipv4=".to_string());
+            }
+            if !use_live_pipeline
+                && opts
+                    .network_mode
+                    .effective_multistreams(opts.audio_multistreams, opts.performance_mode)
+            {
+                flags.push("ytdl-raw-options-append=audio-multistreams=".to_string());
+            }
+            if use_live_pipeline && opts.live_from_start {
+                flags.push("ytdl-raw-options-append=live-from-start=".to_string());
+            }
+            if let Some(ref cpath) = opts.cookies_path {
+                if cpath.exists() {
+                    flags.push(format!(
+                        "ytdl-raw-options-append=cookies={}",
+                        cpath.to_string_lossy()
+                    ));
+                    flags.push("ytdl-raw-options-append=mark-watched=".to_string());
+                }
             }
         }
     }
@@ -546,7 +632,12 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         let lang = opts.sub_lang.as_deref().unwrap_or("en,eng");
         flags.push(format!("slang={}", lang));
         flags.push("sub-auto=fuzzy".to_string());
-        if let Some(ref sub_url) = opts.sub_url {
+        let effective_sub_url = opts.sub_url.as_deref().or_else(|| {
+            opts.direct_stream
+                .as_ref()
+                .and_then(|d| d.sub_url.as_deref())
+        });
+        if let Some(sub_url) = effective_sub_url {
             flags.push(format!("sub-file={}", sub_url));
         }
         for flag in opts.sub_style.to_mpv_flags() {
@@ -578,6 +669,21 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     flags
 }
 
+fn resolved_mpv_target(opts: &PlayOptions) -> String {
+    let use_live_pipeline = opts.is_live && opts.live_mode != LiveStreamMode::Off;
+    opts.local_file
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| {
+            if !use_live_pipeline {
+                opts.direct_stream.as_ref().map(|d| d.primary_url.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| youtube_watch_url(&opts.video_id))
+}
+
 /// Build arguments for `mpv` cleanly (pure function for unit testing).
 pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     let mut args = vec!["--force-window=immediate".to_string()];
@@ -587,12 +693,7 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     for kv in shared_mpv_kv_flags(opts) {
         args.push(format!("--{kv}"));
     }
-    let target = opts
-        .local_file
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
-    args.push(target);
+    args.push(resolved_mpv_target(opts));
     args
 }
 
@@ -603,12 +704,7 @@ pub fn build_iina_args(opts: &PlayOptions) -> Vec<String> {
     for kv in shared_mpv_kv_flags(opts) {
         args.push(format!("--mpv-{kv}"));
     }
-    let target = opts
-        .local_file
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
-    args.push(target);
+    args.push(resolved_mpv_target(opts));
     args
 }
 
@@ -621,6 +717,8 @@ pub fn build_vlc_args(opts: &PlayOptions) -> Vec<String> {
         .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
     vec![
         format!("--video-title={}", opts.title),
+        format!("--network-caching={}", opts.network_mode.vlc_network_caching_ms()),
+        "--http-reconnect".to_string(),
         "--short-jump-size=10".to_string(),
         "--extrashort-jump-size=5".to_string(),
         "--key-play-pause=k".to_string(),
@@ -774,6 +872,9 @@ mod tests {
             live_mode: LiveStreamMode::BalancedLive,
             live_from_start: false,
             live_auto_catchup: true,
+            network_mode: NetworkMode::Normal,
+            force_ipv4: false,
+            direct_stream: None,
         };
 
         let args = build_mpv_args(&opts);
@@ -847,6 +948,9 @@ mod tests {
             live_mode: LiveStreamMode::BalancedLive,
             live_from_start: false,
             live_auto_catchup: true,
+            network_mode: NetworkMode::Normal,
+            force_ipv4: false,
+            direct_stream: None,
         };
 
         let args = build_iina_args(&opts);
@@ -887,6 +991,9 @@ mod tests {
             live_mode: LiveStreamMode::LowLatency,
             live_from_start: false,
             live_auto_catchup: true,
+            network_mode: NetworkMode::Normal,
+            force_ipv4: false,
+            direct_stream: None,
         };
 
         let args = build_mpv_args(&opts);
@@ -900,5 +1007,73 @@ mod tests {
         assert!(!args.iter().any(|a| a.starts_with("--start=")));
         assert!(!args.iter().any(|a| a.starts_with("--glsl-shaders=")));
         assert!(!args.iter().any(|a| a.contains("audio-multistreams")));
+    }
+
+    #[test]
+    fn test_congested_wifi_and_direct_stream_mpv_flags() {
+        let mut opts = PlayOptions {
+            video_id: "dQw4w9WgXcQ".to_string(),
+            title: "Congested WiFi Test".to_string(),
+            local_file: None,
+            quality_format: "bestvideo[height<=?720]+bestaudio/best".to_string(),
+            player: Player::Mpv,
+            cookies_path: None,
+            start_pos: None,
+            ipc_socket: None,
+            subtitles_enabled: false,
+            sub_lang: None,
+            sub_url: None,
+            sub_style: SubtitleStyleConfig::default(),
+            shader_mode: VideoShaderMode::Balanced,
+            mastering_profile: VideoMasteringProfile::StandardHd,
+            performance_mode: PerformanceMode::Balanced,
+            manual_mastering: ManualMasteringConfig::default(),
+            motion_mode: MotionMode::Cadence,
+            dub_preference: DubPreference::OriginalOnly,
+            dub_lang: "en".to_string(),
+            audio_multistreams: true,
+            audio_loudnorm: false,
+            is_live: false,
+            live_mode: LiveStreamMode::BalancedLive,
+            live_from_start: false,
+            live_auto_catchup: true,
+            network_mode: NetworkMode::CongestedWifi,
+            force_ipv4: true,
+            direct_stream: None,
+        };
+
+        let wifi_args = build_mpv_args(&opts);
+        assert!(wifi_args.iter().any(|a| a.contains("reconnect=1")));
+        assert!(wifi_args.iter().any(|a| a == "--network-timeout=12"));
+        assert!(wifi_args.iter().any(|a| a == "--cache-pause-wait=4.5"));
+        assert!(wifi_args.iter().any(|a| a == "--demuxer-readahead-secs=120"));
+        assert!(wifi_args.iter().any(|a| a == "--cache-on-disk=yes"));
+        assert!(wifi_args.iter().any(|a| a == "--ytdl-raw-options-append=force-ipv4="));
+        assert!(!wifi_args.iter().any(|a| a.contains("audio-multistreams")));
+
+        let vlc_args = build_vlc_args(&opts);
+        assert!(vlc_args.iter().any(|a| a == "--network-caching=8000"));
+        assert!(vlc_args.iter().any(|a| a == "--http-reconnect"));
+
+        opts.direct_stream = Some(SelectedStreamPair {
+            primary_url: "https://cdn.example.com/video_720p.webm".to_string(),
+            audio_url: Some("https://cdn.example.com/audio_opus.webm".to_string()),
+            height: 720,
+            fps: 30.0,
+            tbr_kbps: 1050.0,
+            vcodec: "vp9".to_string(),
+            user_agent: Some("PhaennaTest/1.0".to_string()),
+            sub_url: None,
+        });
+        let direct_args = build_mpv_args(&opts);
+        assert!(direct_args.iter().any(|a| a == "--ytdl=no"));
+        assert!(direct_args
+            .iter()
+            .any(|a| a == "--audio-file=https://cdn.example.com/audio_opus.webm"));
+        assert!(direct_args.iter().any(|a| a == "--user-agent=PhaennaTest/1.0"));
+        assert_eq!(
+            direct_args.last().unwrap(),
+            "https://cdn.example.com/video_720p.webm"
+        );
     }
 }
