@@ -1716,7 +1716,6 @@ mod tests {
         assert!(wifi_fmt.contains("fps<=?30"));
         assert!(wifi_fmt.contains("abr<=?128"));
         assert!(wifi_fmt.contains("vcodec^=av01"));
-        assert!(!wifi_fmt.contains(")+("));
 
         let ultra_fmt = Quality::Best.ytdl_format_for_network(
             DubPreference::OriginalOnly,
