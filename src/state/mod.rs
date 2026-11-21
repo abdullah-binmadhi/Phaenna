@@ -21,12 +21,13 @@ use crate::services::calendar::{compute_week_bounds, local_tz_offset_secs, Calen
 use crate::services::cast::CastDevice;
 use crate::services::ipc::{LiveIpcEvent, LiveMediaTrack, PlayerCommand};
 use crate::services::remote::RemoteServerHandle;
+use crate::services::substyler::SubtitlePreset;
 use crate::services::updater::UpdateInfo;
 use crate::ui::theme::{self, extract_ambilight_palette, ThemePalette};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
-use std::collections::{HashMap, HashSet};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,8 +306,8 @@ pub struct AppState {
     pub search_pending_remote: bool,
     pub is_searching_remote: bool,
 
-    // Play options modal (6 balanced zones: 0 Stream, 1 Audio, 2 Captions/Live, 3 Mode/Shaders, 4 Manual, 5 Transport)
-    pub play_modal_section: usize,
+    // Multi-page Playback Studio state
+    pub studio: StudioNavState,
     pub play_quality_idx: usize,
     pub manual_mastering_cursor: usize,
 
@@ -486,7 +487,7 @@ impl AppState {
             search_pending_remote: false,
             is_searching_remote: false,
 
-            play_modal_section: 0,
+            studio: StudioNavState::default(),
             play_quality_idx,
             manual_mastering_cursor: 0,
 
@@ -636,9 +637,36 @@ impl AppState {
                 self.live_playback.seekable_end_secs = seekable_end_secs;
             }
             LiveIpcEvent::DroppedFrames(d) => self.live_playback.dropped_frames = d,
-            LiveIpcEvent::PausedForCache(v) => self.live_playback.paused_for_cache = v,
+            LiveIpcEvent::PausedForCache(v) => {
+                if v && !self.live_playback.paused_for_cache {
+                    let pos = self.active_playback_pos;
+                    self.live_playback
+                        .telemetry_history
+                        .push_event(pos, "STALL", "Rebuffering / paused for cache");
+                }
+                self.live_playback.paused_for_cache = v;
+            }
             LiveIpcEvent::CacheSpeed(bps) => self.live_playback.cache_speed_bps = bps,
             LiveIpcEvent::BufferingPct(pct) => self.live_playback.buffering_pct = pct,
+            LiveIpcEvent::VfFps(fps) => self.live_playback.estimated_vf_fps = fps,
+            LiveIpcEvent::VideoBitrateBps(bps) => {
+                self.live_playback.video_bitrate_kbps = bps / 1000.0;
+            }
+            LiveIpcEvent::AudioBitrateBps(bps) => {
+                self.live_playback.audio_bitrate_kbps = bps / 1000.0;
+            }
+            LiveIpcEvent::AvSyncSecs(secs) => {
+                self.live_playback.avsync_ms = secs * 1000.0;
+            }
+            LiveIpcEvent::HwdecCurrent(s) => self.live_playback.hwdec_current = s,
+            LiveIpcEvent::VideoCodec(s) => self.live_playback.video_codec_live = s,
+            LiveIpcEvent::VideoWidth(w) => self.live_playback.decoded_width = w,
+            LiveIpcEvent::VideoHeight(h) => self.live_playback.decoded_height = h,
+            LiveIpcEvent::ColorMatrix(m) => self.live_playback.colormatrix = m,
+            LiveIpcEvent::HdrSigPeak(p) => self.live_playback.hdr_sig_peak = p,
+            LiveIpcEvent::DelayedFrames(d) => self.live_playback.delayed_frames = d,
+            LiveIpcEvent::AudioSampleRate(sr) => self.live_playback.audio_samplerate = sr,
+            LiveIpcEvent::AudioChannels(ch) => self.live_playback.audio_channels = ch,
             LiveIpcEvent::Tracks { audio, sub } => {
                 if let Some(sel) = audio.iter().find(|t| t.selected) {
                     self.live_playback.active_aid = Some(sel.id);
@@ -650,6 +678,53 @@ impl AppState {
                 self.live_playback.sub_tracks = sub;
             }
         }
+        self.record_telemetry_sample_if_due();
+    }
+
+    pub fn log_studio_event(&mut self, kind: &'static str, summary: impl Into<String>) {
+        self.live_playback
+            .telemetry_history
+            .push_event(self.active_playback_pos, kind, summary);
+    }
+
+    pub fn record_telemetry_sample_if_due(&mut self) {
+        if !self.has_live_ipc() {
+            return;
+        }
+        let due = self
+            .live_playback
+            .telemetry_history
+            .last_sampled_at
+            .map(|t| t.elapsed() >= Duration::from_millis(900))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        let net_kbps = (self.live_playback.cache_speed_bps as f64 * 8.0) / 1000.0;
+        let vid_kbps = if self.live_playback.video_bitrate_kbps > 0.0 {
+            self.live_playback.video_bitrate_kbps
+        } else {
+            self.live_playback.current_stream_tbr_kbps
+        };
+        let ahead = self.live_playback.cache_ahead_secs;
+        let fps = self.live_playback.estimated_vf_fps;
+        let avsync = self.live_playback.avsync_ms;
+        let lag = if self.live_playback.is_live_stream {
+            self.live_playback.live_edge_lag_secs(self.active_playback_pos)
+        } else {
+            0.0
+        };
+        let stalled = self.live_playback.paused_for_cache;
+        self.live_playback.telemetry_history.push_sample(
+            net_kbps,
+            vid_kbps,
+            ahead,
+            fps,
+            avsync,
+            lag,
+            stalled,
+        );
+        self.live_playback.telemetry_history.last_sampled_at = Some(Instant::now());
     }
 
     /// Pick matching audio track ID from live `mpv` `track-list` for Original vs. Dubbed audio.
@@ -1562,23 +1637,183 @@ impl ManualToggle {
     ];
 }
 
+pub const TELEMETRY_CAPACITY: usize = 60;
+pub const SESSION_EVENT_CAPACITY: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StudioPage {
+    #[default]
+    Deck,
+    StreamNet,
+    MasteringGpu,
+    AudioSync,
+    CaptionsSkip,
+    LiveTelemetry,
+}
+
+#[allow(dead_code)]
+impl StudioPage {
+    pub const ALL: [Self; 6] = [
+        Self::Deck,
+        Self::StreamNet,
+        Self::MasteringGpu,
+        Self::AudioSync,
+        Self::CaptionsSkip,
+        Self::LiveTelemetry,
+    ];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn shortcut(self) -> char {
+        match self {
+            Self::Deck => '1',
+            Self::StreamNet => '2',
+            Self::MasteringGpu => '3',
+            Self::AudioSync => '4',
+            Self::CaptionsSkip => '5',
+            Self::LiveTelemetry => '6',
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Deck => "Deck",
+            Self::StreamNet => "Stream & Net",
+            Self::MasteringGpu => "Mastering & GPU",
+            Self::AudioSync => "Audio & Sync",
+            Self::CaptionsSkip => "Captions & Skip",
+            Self::LiveTelemetry => "Live & Telemetry",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Deck => "Deck",
+            Self::StreamNet => "Stream",
+            Self::MasteringGpu => "Master",
+            Self::AudioSync => "Audio",
+            Self::CaptionsSkip => "Captions",
+            Self::LiveTelemetry => "Live",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % 6]
+    }
+
+    pub const fn prev(self) -> Self {
+        Self::ALL[(self.index() + 5) % 6]
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StudioNavState {
+    pub page: StudioPage,
+    pub pane_focus: usize,
+    pub eq_cursor: usize,
+    pub sub_track_scroll: usize,
+    pub sponsor_cursor: usize,
+    pub sponsor_scroll: usize,
+    pub event_log_scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEvent {
+    pub media_pos_secs: f64,
+    pub kind: &'static str,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TelemetryHistory {
+    pub cache_speed_kbps: VecDeque<f64>,
+    pub video_bitrate_kbps: VecDeque<f64>,
+    pub cache_ahead_secs: VecDeque<f64>,
+    pub vf_fps: VecDeque<f64>,
+    pub avsync_ms: VecDeque<f64>,
+    pub live_lag_secs: VecDeque<f64>,
+    pub stall_samples: VecDeque<bool>,
+    pub events: VecDeque<SessionEvent>,
+    pub last_sampled_at: Option<Instant>,
+}
+
+impl TelemetryHistory {
+    fn push_bounded<T>(buf: &mut VecDeque<T>, val: T, cap: usize) {
+        if buf.len() >= cap {
+            buf.pop_front();
+        }
+        buf.push_back(val);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_sample(
+        &mut self,
+        cache_speed_kbps: f64,
+        video_bitrate_kbps: f64,
+        cache_ahead_secs: f64,
+        vf_fps: f64,
+        avsync_ms: f64,
+        live_lag_secs: f64,
+        stalled: bool,
+    ) {
+        Self::push_bounded(&mut self.cache_speed_kbps, cache_speed_kbps.max(0.0), TELEMETRY_CAPACITY);
+        Self::push_bounded(&mut self.video_bitrate_kbps, video_bitrate_kbps.max(0.0), TELEMETRY_CAPACITY);
+        Self::push_bounded(&mut self.cache_ahead_secs, cache_ahead_secs.max(0.0), TELEMETRY_CAPACITY);
+        Self::push_bounded(&mut self.vf_fps, vf_fps.max(0.0), TELEMETRY_CAPACITY);
+        Self::push_bounded(&mut self.avsync_ms, avsync_ms, TELEMETRY_CAPACITY);
+        Self::push_bounded(&mut self.live_lag_secs, live_lag_secs.max(0.0), TELEMETRY_CAPACITY);
+        Self::push_bounded(&mut self.stall_samples, stalled, TELEMETRY_CAPACITY);
+    }
+
+    pub fn push_event(
+        &mut self,
+        media_pos_secs: f64,
+        kind: &'static str,
+        summary: impl Into<String>,
+    ) {
+        Self::push_bounded(
+            &mut self.events,
+            SessionEvent {
+                media_pos_secs: media_pos_secs.max(0.0),
+                kind,
+                summary: summary.into(),
+            },
+            SESSION_EVENT_CAPACITY,
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum PlayOptionsHit {
+    SelectPage(StudioPage),
+    FocusPane(usize),
     FocusSection(usize),
     SelectQuality(usize),
     SelectPlayer(Player),
     ToggleDub,
     CycleDubLang,
+    SelectDubLang(String),
     ToggleMultistreams,
     ToggleLoudnorm,
     AudioDelayDelta(i32),
+    SetAudioDelay(i32),
+    SetAudioDelayRatio,
     SelectAudioTrack(i64),
     ToggleSubtitles,
     CycleSubStyle,
+    SelectSubPreset(SubtitlePreset),
+    ToggleSubCollision,
     SubDelayDelta(i32),
+    SetSubDelay(i32),
     SelectSubTrack(i64),
+    ScrollSubTracks(i8),
     SelectSponsorBlock(SponsorBlockMode),
     ToggleSkipOutro,
+    JumpSponsorSegment(f64),
+    ScrollSponsorSegments(i8),
     SelectShader(VideoShaderMode),
     SetPerformanceMode(PerformanceMode),
     ToggleManual(ManualToggle),
@@ -1586,19 +1821,24 @@ pub enum PlayOptionsHit {
     DownloadNeuralShaders,
     CycleLiveMode,
     CycleNetworkMode,
+    ToggleForceIpv4,
+    ToggleAutoAbr,
     ToggleLiveCatchup,
     JumpToLiveEdge,
     PlayLiveFromStart,
     LaunchAudioRadio,
     ScrollAudioTracks(i8),
+    ScrollEventLog(i8),
     TogglePause,
     SeekDelta(f64),
     SeekRatio(f64),
     ChapterStep(i32),
     SetSpeed(f64),
     VolumeDelta(i64),
+    SetVolumeRatio,
     ToggleMute,
     PictureDelta(&'static str, i64),
+    SetPictureRatio(&'static str),
     ResetPicture,
     ToggleOnTop,
     ToggleLoop,
@@ -1655,12 +1895,26 @@ pub struct LivePlaybackControlState {
     pub current_stream_height: u16,
     pub current_stream_fps: f32,
     pub current_stream_tbr_kbps: f64,
+    pub video_bitrate_kbps: f64,
+    pub audio_bitrate_kbps: f64,
+    pub estimated_vf_fps: f64,
+    pub avsync_ms: f64,
+    pub hwdec_current: String,
+    pub video_codec_live: String,
+    pub decoded_width: u32,
+    pub decoded_height: u32,
+    pub colormatrix: String,
+    pub hdr_sig_peak: f64,
+    pub delayed_frames: i64,
+    pub audio_samplerate: u32,
+    pub audio_channels: String,
     pub is_local_file: bool,
     pub playback_started_at: Option<Instant>,
     pub last_abr_switch_at: Option<Instant>,
     pub audio_tracks: Vec<LiveMediaTrack>,
     pub audio_track_scroll: usize,
     pub sub_tracks: Vec<LiveMediaTrack>,
+    pub telemetry_history: TelemetryHistory,
     pub cmd_tx: Option<UnboundedSender<PlayerCommand>>,
     pub play_hitboxes: Vec<(Rect, PlayOptionsHit)>,
     pub now_playing_hitboxes: Vec<(Rect, NowPlayingHit)>,
@@ -1697,12 +1951,26 @@ impl Default for LivePlaybackControlState {
             current_stream_height: 0,
             current_stream_fps: 0.0,
             current_stream_tbr_kbps: 0.0,
+            video_bitrate_kbps: 0.0,
+            audio_bitrate_kbps: 0.0,
+            estimated_vf_fps: 0.0,
+            avsync_ms: 0.0,
+            hwdec_current: String::new(),
+            video_codec_live: String::new(),
+            decoded_width: 0,
+            decoded_height: 0,
+            colormatrix: String::new(),
+            hdr_sig_peak: 0.0,
+            delayed_frames: 0,
+            audio_samplerate: 0,
+            audio_channels: String::new(),
             is_local_file: false,
             playback_started_at: None,
             last_abr_switch_at: None,
             audio_tracks: Vec::new(),
             audio_track_scroll: 0,
             sub_tracks: Vec::new(),
+            telemetry_history: TelemetryHistory::default(),
             cmd_tx: None,
             play_hitboxes: Vec::new(),
             now_playing_hitboxes: Vec::new(),
@@ -1770,9 +2038,9 @@ pub fn help_modal_rect(frame_area: Rect) -> Rect {
     clamped_centered_rect(frame_area, 4, 2, 76, 116, 20, 28)
 }
 
-/// Content-fitted enlarged bounding box for the 6-Zone Playback Studio (`p`) modal (up to 146x33).
+/// Content-fitted enlarged bounding box for the 6-Page Playback Studio (`p`) modal (up to 156x40).
 pub fn play_options_modal_rect(frame_area: Rect) -> Rect {
-    clamped_centered_rect(frame_area, 2, 2, 96, 146, 24, 33)
+    clamped_centered_rect(frame_area, 2, 1, 96, 156, 26, 40)
 }
 
 /// Exact bounds of active modal overlay so underlying native Kitty thumbnails aren't drawn over it.

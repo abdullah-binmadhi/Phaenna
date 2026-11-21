@@ -12,6 +12,7 @@ pub mod play_options;
 pub mod remote;
 pub mod search;
 pub mod settings;
+pub mod studio;
 pub mod theme;
 pub mod update_modal;
 
@@ -32,7 +33,7 @@ pub fn render_app(frame: &mut Frame, state: &mut AppState) {
         ActiveOverlay::Search => search::render_search_modal(frame, state),
         ActiveOverlay::Login => login::render_login_modal(frame, state),
         ActiveOverlay::Filter => home::render_filter_modal(frame, state),
-        ActiveOverlay::PlayOptions => play_options::render_play_options_modal(frame, state),
+        ActiveOverlay::PlayOptions => studio::render_studio_modal(frame, state),
         ActiveOverlay::Settings => settings::render_settings_modal(frame, state),
         ActiveOverlay::Help => help::render_help_modal(frame, state),
         ActiveOverlay::Analytics => analytics::render_analytics_modal(frame, state),

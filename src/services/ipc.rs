@@ -150,6 +150,19 @@ pub enum LiveIpcEvent {
     CacheSpeed(u64),
     BufferingPct(i64),
     DroppedFrames(i64),
+    VfFps(f64),
+    VideoBitrateBps(f64),
+    AudioBitrateBps(f64),
+    AvSyncSecs(f64),
+    HwdecCurrent(String),
+    VideoCodec(String),
+    VideoWidth(u32),
+    VideoHeight(u32),
+    ColorMatrix(String),
+    HdrSigPeak(f64),
+    DelayedFrames(i64),
+    AudioSampleRate(u32),
+    AudioChannels(String),
     Tracks {
         audio: Vec<LiveMediaTrack>,
         sub: Vec<LiveMediaTrack>,
@@ -524,6 +537,31 @@ pub fn parse_live_ipc_event(line: &str) -> Option<LiveIpcEvent> {
         "paused-for-cache" => Some(LiveIpcEvent::PausedForCache(data.as_bool()?)),
         "cache-speed" => Some(LiveIpcEvent::CacheSpeed(data.as_f64()?.max(0.0).round() as u64)),
         "cache-buffering-state" => Some(LiveIpcEvent::BufferingPct(data.as_f64()?.round() as i64)),
+        "estimated-vf-fps" => Some(LiveIpcEvent::VfFps(data.as_f64()?.max(0.0))),
+        "video-bitrate" => Some(LiveIpcEvent::VideoBitrateBps(data.as_f64()?.max(0.0))),
+        "audio-bitrate" => Some(LiveIpcEvent::AudioBitrateBps(data.as_f64()?.max(0.0))),
+        "avsync" => Some(LiveIpcEvent::AvSyncSecs(data.as_f64()?)),
+        "hwdec-current" => {
+            let s = data.as_str()?.trim();
+            (!s.is_empty()).then(|| LiveIpcEvent::HwdecCurrent(s.to_string()))
+        }
+        "video-codec" => {
+            let s = data.as_str()?.trim();
+            (!s.is_empty()).then(|| LiveIpcEvent::VideoCodec(s.to_string()))
+        }
+        "video-params/w" => Some(LiveIpcEvent::VideoWidth(data.as_u64()? as u32)),
+        "video-params/h" => Some(LiveIpcEvent::VideoHeight(data.as_u64()? as u32)),
+        "video-params/colormatrix" => {
+            let s = data.as_str()?.trim();
+            (!s.is_empty()).then(|| LiveIpcEvent::ColorMatrix(s.to_string()))
+        }
+        "video-params/sig-peak" => Some(LiveIpcEvent::HdrSigPeak(data.as_f64()?.max(0.0))),
+        "vo-delayed-frame-count" => Some(LiveIpcEvent::DelayedFrames(data.as_i64()?)),
+        "audio-params/samplerate" => Some(LiveIpcEvent::AudioSampleRate(data.as_u64()? as u32)),
+        "audio-params/hr-channels" => {
+            let s = data.as_str()?.trim();
+            (!s.is_empty()).then(|| LiveIpcEvent::AudioChannels(s.to_string()))
+        }
         "demuxer-cache-state" => {
             let bytes = data
                 .get("fw-bytes")
@@ -663,6 +701,19 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             (21, "paused-for-cache"),
             (22, "cache-speed"),
             (23, "cache-buffering-state"),
+            (24, "estimated-vf-fps"),
+            (25, "video-bitrate"),
+            (26, "audio-bitrate"),
+            (27, "avsync"),
+            (28, "hwdec-current"),
+            (29, "video-codec"),
+            (30, "video-params/w"),
+            (31, "video-params/h"),
+            (32, "video-params/colormatrix"),
+            (33, "video-params/sig-peak"),
+            (34, "vo-delayed-frame-count"),
+            (35, "audio-params/samplerate"),
+            (36, "audio-params/hr-channels"),
         ];
         for (id, prop) in observe_props {
             let msg = format!("{{\"command\":[\"observe_property\",{id},\"{prop}\"]}}\n");
@@ -1110,5 +1161,39 @@ mod tests {
         assert!(sw_cmds.iter().any(|c| c.contains("\"loadfile\",\"https://cdn.example.com/v480.webm\",\"replace\"")));
         assert!(is_file_loaded_event(r#"{"event":"file-loaded"}"#));
         assert!(!is_file_loaded_event(r#"{"event":"end-file"}"#));
+
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":24,"name":"estimated-vf-fps","data":59.94}"#),
+            Some(LiveIpcEvent::VfFps(f)) if (f - 59.94).abs() < 0.01
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":25,"name":"video-bitrate","data":12800000.0}"#),
+            Some(LiveIpcEvent::VideoBitrateBps(b)) if (b - 12_800_000.0).abs() < 1.0
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":27,"name":"avsync","data":-0.0042}"#),
+            Some(LiveIpcEvent::AvSyncSecs(s)) if (s + 0.0042).abs() < 0.0001
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":28,"name":"hwdec-current","data":"videotoolbox"}"#),
+            Some(LiveIpcEvent::HwdecCurrent(ref s)) if s == "videotoolbox"
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":29,"name":"video-codec","data":"av1"}"#),
+            Some(LiveIpcEvent::VideoCodec(ref s)) if s == "av1"
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":32,"name":"video-params/colormatrix","data":"bt.709"}"#),
+            Some(LiveIpcEvent::ColorMatrix(ref s)) if s == "bt.709"
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":34,"name":"vo-delayed-frame-count","data":2}"#),
+            Some(LiveIpcEvent::DelayedFrames(2))
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":36,"name":"audio-params/hr-channels","data":"stereo"}"#),
+            Some(LiveIpcEvent::AudioChannels(ref s)) if s == "stereo"
+        ));
+        assert!(parse_live_ipc_event(r#"{"event":"property-change","id":28,"name":"hwdec-current","data":null}"#).is_none());
     }
 }

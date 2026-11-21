@@ -68,6 +68,7 @@ use crate::services::ipc::{
 };
 use crate::services::remote::start_remote_server;
 use crate::services::shaders::{download_neural_shader_pack, VideoMasteringProfile};
+use crate::services::substyler::SubtitleStyleConfig;
 use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
 };
@@ -75,7 +76,7 @@ use crate::state::{
     ActiveOverlay, AnalysisHit, AppState, Category, CommentTranslation, ContentFilter, DetailHit,
     DetailViewMode, DownloadJobState, HelpHit, ManualToggle, NowPlayingHit, PlayOptionsHit,
     ReplyTarget, Screen, SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter, ShortsSource,
-    SortOrder,
+    SortOrder, StudioPage,
 };
 use crate::ui::components::cover::prepare_16_9_thumbnail;
 use crate::ui::help::confirm_quit_button_rects;
@@ -1810,6 +1811,15 @@ async fn handle_app_message(
             state.active_playback_pos = 0.0;
             state.active_playback_dur = 0.0;
             state.sponsor_skips_session = 0;
+            state.log_studio_event(
+                "LAUNCH",
+                format!(
+                    "Started {} ({} / {})",
+                    state.config.player.as_str(),
+                    state.config.performance_mode.short_badge(),
+                    state.config.shader_mode.short_label()
+                ),
+            );
             if let Some(ref handle) = state.remote_handle {
                 *handle.active_sock.write().await = Some(sock_path);
                 let mut rst = handle.state.write().await;
@@ -1873,6 +1883,7 @@ async fn handle_app_message(
             let need_refresh = !state.is_in_continue_watching(&video_id) && pos >= 10.0;
             state.active_playback_pos = pos;
             state.active_playback_dur = duration;
+            state.record_telemetry_sample_if_due();
             state.progress_map.insert(video_id.clone(), (pos, duration));
             if let Some(meta) = state.continue_watching_meta.get_mut(video_id.trim_start_matches("RD")) {
                 meta.last_pos_secs = pos;
@@ -1898,6 +1909,7 @@ async fn handle_app_message(
             ..
         } => {
             state.sponsor_skips_session += 1;
+            state.log_studio_event("SKIP", format!("Skipped {} (+{:.0}s)", category, saved_secs));
             state.show_toast(format!("Skipped {} (+{:.0}s)", category, saved_secs));
         }
         AppMessage::VideoAutoCompleted { video_id } => {
@@ -3748,6 +3760,7 @@ fn maybe_trigger_auto_abr_downshift(state: &mut AppState) {
         state.live_playback.current_stream_tbr_kbps = tbr;
         state.live_playback.last_abr_switch_at = Some(now);
         state.live_playback.recent_stall_times.clear();
+        state.log_studio_event("ABR", format!("Downshifted to {h}p{fps:.0} (~{tbr:.0} kbps)"));
         state.send_player_cmd(PlayerCommand::HotSwitchStream {
             primary_url: next_pair.primary_url,
             audio_url: next_pair.audio_url,
@@ -3860,6 +3873,7 @@ fn apply_shader_mode(state: &mut AppState, mode: VideoShaderMode) {
     } else {
         state.show_toast(format!("4K Shader: {}", mode.short_label()));
     }
+    state.log_studio_event("SHADER", format!("Shader -> {}", mode.short_label()));
 }
 
 fn apply_performance_mode(state: &mut AppState, mode: PerformanceMode) {
@@ -3884,6 +3898,7 @@ fn apply_performance_mode(state: &mut AppState, mode: PerformanceMode) {
     } else {
         state.show_toast(format!("Performance Mode: {} ({})", mode.label(), mode.summary()));
     }
+    state.log_studio_event("MODE", format!("Engine Mode -> {}", mode.label()));
 }
 
 fn seed_manual_from(state: &mut AppState, preset: PerformanceMode) {
@@ -4000,7 +4015,22 @@ async fn apply_play_options_hit(
     client: &reqwest::Client,
 ) {
     match hit {
-        PlayOptionsHit::FocusSection(sec) => state.play_modal_section = sec.min(4),
+        PlayOptionsHit::SelectPage(page) => {
+            state.studio.page = page;
+            state.studio.pane_focus = 0;
+        }
+        PlayOptionsHit::FocusPane(pane) => {
+            state.studio.pane_focus = pane.min(1);
+        }
+        PlayOptionsHit::FocusSection(sec) => {
+            state.studio.page = match sec {
+                0 => StudioPage::StreamNet,
+                1 => StudioPage::AudioSync,
+                2 => StudioPage::CaptionsSkip,
+                3 | 4 => StudioPage::MasteringGpu,
+                _ => StudioPage::Deck,
+            };
+        }
         PlayOptionsHit::SelectQuality(i) => {
             if let Some(q) = Quality::ALL.get(i).copied() {
                 state.play_quality_idx = i;
@@ -4017,6 +4047,15 @@ async fn apply_play_options_hit(
         }
         PlayOptionsHit::CycleDubLang => {
             state.config.dub_lang = next_dub_lang(&state.config.dub_lang);
+            let _ = state.config.save();
+            if state.has_live_ipc() && state.config.dub_preference.is_dub_on() {
+                if let Some(aid) = state.find_audio_track_for_dub(true) {
+                    state.send_player_cmd(PlayerCommand::SetAudioTrack(aid));
+                }
+            }
+        }
+        PlayOptionsHit::SelectDubLang(code) => {
+            state.config.dub_lang = code;
             let _ = state.config.save();
             if state.has_live_ipc() && state.config.dub_preference.is_dub_on() {
                 if let Some(aid) = state.find_audio_track_for_dub(true) {
@@ -4041,6 +4080,23 @@ async fn apply_play_options_hit(
             state.send_player_cmd(PlayerCommand::SetAudioDelay(
                 state.live_playback.audio_delay_ms as f64 / 1000.0,
             ));
+        }
+        PlayOptionsHit::SetAudioDelay(ms) => {
+            state.live_playback.audio_delay_ms = ms.clamp(-5000, 5000);
+            state.send_player_cmd(PlayerCommand::SetAudioDelay(
+                state.live_playback.audio_delay_ms as f64 / 1000.0,
+            ));
+        }
+        PlayOptionsHit::SetAudioDelayRatio => {
+            if hit_rect.width > 1 {
+                let rel = (click_col.saturating_sub(hit_rect.x) as f64
+                    / hit_rect.width.saturating_sub(1).max(1) as f64)
+                    .clamp(0.0, 1.0);
+                let raw = ((rel * 2.0 - 1.0) * 500.0).round() as i32;
+                let snapped = ((raw as f64 / 25.0).round() as i32 * 25).clamp(-500, 500);
+                state.live_playback.audio_delay_ms = snapped;
+                state.send_player_cmd(PlayerCommand::SetAudioDelay(snapped as f64 / 1000.0));
+            }
         }
         PlayOptionsHit::SelectAudioTrack(aid) => {
             state.live_playback.active_aid = Some(aid);
@@ -4068,9 +4124,26 @@ async fn apply_play_options_hit(
             state.config.subtitle_style.cycle_preset();
             let _ = state.config.save();
         }
+        PlayOptionsHit::SelectSubPreset(preset) => {
+            let keep_col = state.config.subtitle_style.collision_avoidance;
+            state.config.subtitle_style = SubtitleStyleConfig::from_preset(preset);
+            state.config.subtitle_style.collision_avoidance = keep_col;
+            let _ = state.config.save();
+        }
+        PlayOptionsHit::ToggleSubCollision => {
+            state.config.subtitle_style.collision_avoidance =
+                !state.config.subtitle_style.collision_avoidance;
+            let _ = state.config.save();
+        }
         PlayOptionsHit::SubDelayDelta(delta_ms) => {
             state.live_playback.sub_delay_ms =
                 (state.live_playback.sub_delay_ms + delta_ms).clamp(-10000, 10000);
+            state.send_player_cmd(PlayerCommand::SetSubDelay(
+                state.live_playback.sub_delay_ms as f64 / 1000.0,
+            ));
+        }
+        PlayOptionsHit::SetSubDelay(ms) => {
+            state.live_playback.sub_delay_ms = ms.clamp(-10000, 10000);
             state.send_player_cmd(PlayerCommand::SetSubDelay(
                 state.live_playback.sub_delay_ms as f64 / 1000.0,
             ));
@@ -4080,6 +4153,16 @@ async fn apply_play_options_hit(
             state.live_playback.sub_visible = true;
             state.send_player_cmd(PlayerCommand::SetSubTrack(sid));
         }
+        PlayOptionsHit::ScrollSubTracks(delta) => {
+            let total = state.live_playback.sub_tracks.len();
+            if total > 0 {
+                state.studio.sub_track_scroll = if delta > 0 {
+                    (state.studio.sub_track_scroll + delta as usize).min(total - 1)
+                } else {
+                    state.studio.sub_track_scroll.saturating_sub((-delta) as usize)
+                };
+            }
+        }
         PlayOptionsHit::SelectSponsorBlock(mode) => {
             state.config.sponsorblock_mode = mode;
             let _ = state.config.save();
@@ -4087,6 +4170,26 @@ async fn apply_play_options_hit(
         PlayOptionsHit::ToggleSkipOutro => {
             state.config.skip_outro = !state.config.skip_outro;
             let _ = state.config.save();
+        }
+        PlayOptionsHit::JumpSponsorSegment(start_secs) => {
+            if state.has_live_ipc() {
+                state.active_playback_pos = start_secs.max(0.0);
+                state.send_player_cmd(PlayerCommand::SeekAbsolute(start_secs.max(0.0)));
+                state.show_toast(format!("Jumped to segment at {:.0}s", start_secs));
+            } else {
+                state.show_toast("Launch playback first to seek to SponsorBlock segment");
+            }
+        }
+        PlayOptionsHit::ScrollSponsorSegments(delta) => {
+            let total = state.detail_sponsor_segments.len();
+            if total > 0 {
+                state.studio.sponsor_cursor = if delta > 0 {
+                    (state.studio.sponsor_cursor + delta as usize).min(total - 1)
+                } else {
+                    state.studio.sponsor_cursor.saturating_sub((-delta) as usize)
+                };
+                state.studio.sponsor_scroll = state.studio.sponsor_cursor.saturating_sub(4);
+            }
         }
         PlayOptionsHit::SelectShader(mode) => {
             apply_shader_mode(state, mode);
@@ -4115,6 +4218,16 @@ async fn apply_play_options_hit(
                 state.live_playback.audio_track_scroll = next;
             }
         }
+        PlayOptionsHit::ScrollEventLog(delta) => {
+            let total = state.live_playback.telemetry_history.events.len();
+            if total > 0 {
+                state.studio.event_log_scroll = if delta > 0 {
+                    (state.studio.event_log_scroll + delta as usize).min(total - 1)
+                } else {
+                    state.studio.event_log_scroll.saturating_sub((-delta) as usize)
+                };
+            }
+        }
         PlayOptionsHit::TogglePause => {
             state.live_playback.paused = !state.live_playback.paused;
             state.send_player_cmd(PlayerCommand::TogglePause);
@@ -4123,10 +4236,22 @@ async fn apply_play_options_hit(
             state.send_player_cmd(PlayerCommand::SeekRelative(delta));
         }
         PlayOptionsHit::SeekRatio(_) => {
-            if state.active_playback_dur > 0.0 && hit_rect.width > 12 {
-                let bar_span = hit_rect.width.saturating_sub(14).max(1) as f64;
+            let dur = if state.active_playback_dur > 0.0 {
+                state.active_playback_dur
+            } else {
+                state
+                    .active_selected_video()
+                    .and_then(|v| v.duration)
+                    .unwrap_or(0) as f64
+            };
+            if dur > 0.0 && hit_rect.width > 4 {
+                let bar_span = if hit_rect.width > 16 {
+                    hit_rect.width.saturating_sub(14).max(1) as f64
+                } else {
+                    hit_rect.width.max(1) as f64
+                };
                 let rel = (click_col.saturating_sub(hit_rect.x + 1) as f64 / bar_span).clamp(0.0, 0.99);
-                let target = state.active_playback_dur * rel;
+                let target = dur * rel;
                 state.active_playback_pos = target;
                 state.send_player_cmd(PlayerCommand::SeekAbsolute(target));
             }
@@ -4141,6 +4266,15 @@ async fn apply_play_options_hit(
         PlayOptionsHit::VolumeDelta(delta) => {
             state.live_playback.volume = (state.live_playback.volume + delta).clamp(0, 150);
             state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
+        }
+        PlayOptionsHit::SetVolumeRatio => {
+            if hit_rect.width > 2 {
+                let span = hit_rect.width.saturating_sub(2).max(1) as f64;
+                let rel = (click_col.saturating_sub(hit_rect.x + 1) as f64 / span).clamp(0.0, 1.0);
+                let vol = ((rel * 150.0 / 5.0).round() as i64 * 5).clamp(0, 150);
+                state.live_playback.volume = vol;
+                state.send_player_cmd(PlayerCommand::SetVolume(vol));
+            }
         }
         PlayOptionsHit::ToggleMute => {
             state.live_playback.muted = !state.live_playback.muted;
@@ -4171,6 +4305,21 @@ async fn apply_play_options_hit(
             };
             state.send_player_cmd(PlayerCommand::SetPictureProp { prop, value: next_val });
         }
+        PlayOptionsHit::SetPictureRatio(prop) => {
+            if hit_rect.width > 1 {
+                let rel = (click_col.saturating_sub(hit_rect.x) as f64
+                    / hit_rect.width.saturating_sub(1).max(1) as f64)
+                    .clamp(0.0, 1.0);
+                let val = (((rel * 2.0 - 1.0) * 50.0 / 5.0).round() as i64 * 5).clamp(-50, 50);
+                match prop {
+                    "brightness" => state.live_playback.brightness = val,
+                    "contrast" => state.live_playback.contrast = val,
+                    "saturation" => state.live_playback.saturation = val,
+                    _ => state.live_playback.gamma = val,
+                }
+                state.send_player_cmd(PlayerCommand::SetPictureProp { prop, value: val });
+            }
+        }
         PlayOptionsHit::ResetPicture => {
             state.live_playback.brightness = 0;
             state.live_playback.contrast = 0;
@@ -4199,6 +4348,22 @@ async fn apply_play_options_hit(
         }
         PlayOptionsHit::CycleNetworkMode => {
             cycle_network_mode(state);
+        }
+        PlayOptionsHit::ToggleForceIpv4 => {
+            state.config.force_ipv4 = !state.config.force_ipv4;
+            let _ = state.config.save();
+            state.show_toast(format!(
+                "Force IPv4: {} (applies on next stream launch)",
+                if state.config.force_ipv4 { "ON" } else { "OFF" }
+            ));
+        }
+        PlayOptionsHit::ToggleAutoAbr => {
+            state.config.auto_abr_downshift = !state.config.auto_abr_downshift;
+            let _ = state.config.save();
+            state.show_toast(format!(
+                "Auto-ABR Downshift: {}",
+                if state.config.auto_abr_downshift { "ON" } else { "OFF" }
+            ));
         }
         PlayOptionsHit::ToggleLiveCatchup => {
             state.config.live_auto_catchup = !state.config.live_auto_catchup;
@@ -4556,7 +4721,13 @@ async fn handle_mouse_event(
                     .live_playback
                     .play_hitboxes
                     .iter()
-                    .find(|(r, h)| in_rect(*r) && !matches!(h, PlayOptionsHit::FocusSection(_)))
+                    .find(|(r, h)| {
+                        in_rect(*r)
+                            && !matches!(
+                                h,
+                                PlayOptionsHit::FocusSection(_) | PlayOptionsHit::FocusPane(_)
+                            )
+                    })
                     .or_else(|| {
                         state
                             .live_playback
@@ -4571,17 +4742,23 @@ async fn handle_mouse_event(
                 }
             }
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
-                if let Some((rect, PlayOptionsHit::PictureDelta(prop, _))) = state
+                if let Some((rect, pic_prop)) = state
                     .live_playback
                     .play_hitboxes
                     .iter()
-                    .find(|(r, h)| {
-                        in_rect(*r) && matches!(h, PlayOptionsHit::PictureDelta(_, _))
+                    .find_map(|(r, h)| {
+                        if !in_rect(*r) {
+                            return None;
+                        }
+                        match h {
+                            PlayOptionsHit::PictureDelta(prop, _)
+                            | PlayOptionsHit::SetPictureRatio(prop) => Some((*r, *prop)),
+                            _ => None,
+                        }
                     })
-                    .cloned()
                 {
                     apply_play_options_hit(
-                        PlayOptionsHit::PictureDelta(prop, -5),
+                        PlayOptionsHit::PictureDelta(pic_prop, -5),
                         mouse.column,
                         rect,
                         state,
@@ -4596,17 +4773,29 @@ async fn handle_mouse_event(
                 return true;
             }
             if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
-                let over_audio_panel = state.live_playback.play_hitboxes.iter().any(|(r, h)| {
-                    in_rect(*r) && matches!(h, PlayOptionsHit::FocusSection(1))
-                });
-                if over_audio_panel {
-                    let delta = if matches!(mouse.kind, MouseEventKind::ScrollDown) {
-                        1
-                    } else {
-                        -1
-                    };
+                let delta = if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                    1
+                } else {
+                    -1
+                };
+                let scroll_hit = match state.studio.page {
+                    StudioPage::AudioSync => Some(PlayOptionsHit::ScrollAudioTracks(delta)),
+                    StudioPage::CaptionsSkip => {
+                        let in_left = state.live_playback.play_hitboxes.iter().any(|(r, h)| {
+                            in_rect(*r) && matches!(h, PlayOptionsHit::FocusPane(0))
+                        });
+                        Some(if in_left {
+                            PlayOptionsHit::ScrollSubTracks(delta)
+                        } else {
+                            PlayOptionsHit::ScrollSponsorSegments(delta)
+                        })
+                    }
+                    StudioPage::LiveTelemetry => Some(PlayOptionsHit::ScrollEventLog(delta)),
+                    _ => None,
+                };
+                if let Some(hit) = scroll_hit {
                     apply_play_options_hit(
-                        PlayOptionsHit::ScrollAudioTracks(delta),
+                        hit,
                         mouse.column,
                         ratatui::layout::Rect::default(),
                         state,
@@ -5841,16 +6030,112 @@ async fn handle_overlay_key(
         },
         ActiveOverlay::PlayOptions => match code {
             KeyCode::Esc | KeyCode::Char('p') => state.overlay = ActiveOverlay::None,
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
-                state.play_modal_section = (state.play_modal_section + 5) % 6;
+            KeyCode::Char('1') => {
+                state.studio.page = StudioPage::Deck;
+                state.studio.pane_focus = 0;
             }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-                state.play_modal_section = (state.play_modal_section + 1) % 6;
+            KeyCode::Char('2') => {
+                state.studio.page = StudioPage::StreamNet;
+                state.studio.pane_focus = 0;
+            }
+            KeyCode::Char('3') => {
+                state.studio.page = StudioPage::MasteringGpu;
+                state.studio.pane_focus = 0;
+            }
+            KeyCode::Char('4') => {
+                state.studio.page = StudioPage::AudioSync;
+                state.studio.pane_focus = 0;
+            }
+            KeyCode::Char('5') => {
+                state.studio.page = StudioPage::CaptionsSkip;
+                state.studio.pane_focus = 0;
+            }
+            KeyCode::Char('6') => {
+                state.studio.page = StudioPage::LiveTelemetry;
+                state.studio.pane_focus = 0;
+            }
+            KeyCode::Tab => {
+                state.studio.page = state.studio.page.next();
+                state.studio.pane_focus = 0;
+            }
+            KeyCode::BackTab => {
+                state.studio.page = state.studio.page.prev();
+                state.studio.pane_focus = 0;
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
+                let right = matches!(code, KeyCode::Right | KeyCode::Char('l'));
+                match (state.studio.page, state.studio.pane_focus) {
+                    (StudioPage::Deck, 1) => {
+                        let prop = match state.studio.eq_cursor {
+                            0 => "brightness",
+                            1 => "contrast",
+                            2 => "saturation",
+                            _ => "gamma",
+                        };
+                        let delta = if right { 5 } else { -5 };
+                        apply_play_options_hit(
+                            PlayOptionsHit::PictureDelta(prop, delta),
+                            0,
+                            ratatui::layout::Rect::default(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
+                    }
+                    (StudioPage::AudioSync, 1) => {
+                        let delta = if right { 50 } else { -50 };
+                        apply_play_options_hit(
+                            PlayOptionsHit::AudioDelayDelta(delta),
+                            0,
+                            ratatui::layout::Rect::default(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
+                    }
+                    (StudioPage::CaptionsSkip, 0) => {
+                        let delta = if right { 100 } else { -100 };
+                        apply_play_options_hit(
+                            PlayOptionsHit::SubDelayDelta(delta),
+                            0,
+                            ratatui::layout::Rect::default(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        state.studio.pane_focus = usize::from(state.studio.pane_focus == 0);
+                    }
+                }
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
                 let down = matches!(code, KeyCode::Down | KeyCode::Char('j'));
-                match state.play_modal_section {
-                    0 => {
+                let step = if down { 1 } else { -1 };
+                match (state.studio.page, state.studio.pane_focus) {
+                    (StudioPage::Deck, 1) => {
+                        state.studio.eq_cursor = if down {
+                            (state.studio.eq_cursor + 1) % 4
+                        } else {
+                            (state.studio.eq_cursor + 3) % 4
+                        };
+                    }
+                    (StudioPage::Deck, _) => {
+                        let delta = if down { -5 } else { 5 };
+                        state.live_playback.volume =
+                            (state.live_playback.volume + delta).clamp(0, 150);
+                        state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
+                    }
+                    (StudioPage::StreamNet, 1) => {
+                        cycle_network_mode(state);
+                    }
+                    (StudioPage::StreamNet, _) => {
                         let len = Quality::ALL.len();
                         state.play_quality_idx = if down {
                             (state.play_quality_idx + 1) % len
@@ -5858,13 +6143,17 @@ async fn handle_overlay_key(
                             (state.play_quality_idx + len - 1) % len
                         };
                         state.config.quality = Quality::ALL[state.play_quality_idx];
+                        let _ = state.config.save();
                     }
-                    1 => {
-                        toggle_dub_live_or_config(state, pool, tx, client).await;
-                        return;
+                    (StudioPage::MasteringGpu, 1) => {
+                        let n = ManualToggle::ALL.len();
+                        state.manual_mastering_cursor = if down {
+                            (state.manual_mastering_cursor + 1) % n
+                        } else {
+                            (state.manual_mastering_cursor + n - 1) % n
+                        };
                     }
-                    2 => state.config.sponsorblock_mode = state.config.sponsorblock_mode.next(),
-                    3 => {
+                    (StudioPage::MasteringGpu, _) => {
                         let next = if down {
                             state.config.shader_mode.next()
                         } else {
@@ -5875,28 +6164,88 @@ async fn handle_overlay_key(
                             cur
                         };
                         apply_shader_mode(state, next);
-                        return;
                     }
-                    4 => {
-                        let n = ManualToggle::ALL.len();
-                        state.manual_mastering_cursor = if down {
-                            (state.manual_mastering_cursor + 1) % n
-                        } else {
-                            (state.manual_mastering_cursor + n - 1) % n
-                        };
-                        return;
+                    (StudioPage::AudioSync, 0) => {
+                        apply_play_options_hit(
+                            PlayOptionsHit::ScrollAudioTracks(step),
+                            0,
+                            ratatui::layout::Rect::default(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
                     }
-                    _ => {
-                        let delta = if down { -5 } else { 5 };
-                        state.live_playback.volume =
-                            (state.live_playback.volume + delta).clamp(0, 150);
-                        state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
-                        return;
+                    (StudioPage::AudioSync, _) => {
+                        toggle_dub_live_or_config(state, pool, tx, client).await;
+                    }
+                    (StudioPage::CaptionsSkip, 0) => {
+                        apply_play_options_hit(
+                            PlayOptionsHit::ScrollSubTracks(step),
+                            0,
+                            ratatui::layout::Rect::default(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
+                    }
+                    (StudioPage::CaptionsSkip, _) => {
+                        apply_play_options_hit(
+                            PlayOptionsHit::ScrollSponsorSegments(step),
+                            0,
+                            ratatui::layout::Rect::default(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
+                    }
+                    (StudioPage::LiveTelemetry, _) => {
+                        apply_play_options_hit(
+                            PlayOptionsHit::ScrollEventLog(step),
+                            0,
+                            ratatui::layout::Rect::default(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
                     }
                 }
-                let _ = state.config.save();
             }
-            KeyCode::Char('a') => state.play_modal_section = 4,
+            KeyCode::Char('a') => {
+                state.studio.page = StudioPage::MasteringGpu;
+                state.studio.pane_focus = 1;
+            }
+            KeyCode::Char('i') => {
+                apply_play_options_hit(
+                    PlayOptionsHit::ToggleForceIpv4,
+                    0,
+                    ratatui::layout::Rect::default(),
+                    state,
+                    pool,
+                    tx,
+                    client,
+                )
+                .await;
+            }
+            KeyCode::Char('A') => {
+                apply_play_options_hit(
+                    PlayOptionsHit::ToggleAutoAbr,
+                    0,
+                    ratatui::layout::Rect::default(),
+                    state,
+                    pool,
+                    tx,
+                    client,
+                )
+                .await;
+            }
             KeyCode::Char('d') => toggle_dub_live_or_config(state, pool, tx, client).await,
             KeyCode::Char('L') => {
                 state.config.dub_lang = next_dub_lang(&state.config.dub_lang);
@@ -5948,7 +6297,7 @@ async fn handle_overlay_key(
                 cycle_network_mode(state);
             }
             KeyCode::Char(' ') => {
-                if state.play_modal_section == 4 {
+                if state.studio.page == StudioPage::MasteringGpu && state.studio.pane_focus == 1 {
                     if let Some(&toggle) = ManualToggle::ALL.get(state.manual_mastering_cursor) {
                         apply_manual_toggle(state, toggle);
                     }
