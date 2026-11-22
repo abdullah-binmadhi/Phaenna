@@ -1,21 +1,24 @@
 //! Page 3 — `[3] Mastering & GPU`: Live Signal-Flow Pipeline Visualizer,
-//! GPU / RAM / Thermal Impact Estimator, 4K Shaders, and 10-Point Manual Matrix.
+//! Engine Mode, Content Profiles, GPU / RAM / Thermal Impact Estimator,
+//! Active GLSL Chain Manifest, and 10-Point Manual Matrix with Wrapped Inspector.
 
 use crate::config::{
     CodecPriority, Config, DebandTier, DemuxerCachePreset, GlslStageMode, GpuScalerMode,
-    HwdecMode, MotionMode, PerformanceMode, SuperResMode, VideoShaderMode,
+    HwdecMode, ManualMasteringConfig, MotionMode, PerformanceMode, SuperResMode, VideoShaderMode,
 };
-use crate::services::shaders::neural_shader_installed;
-use crate::state::{AppState, ManualToggle, PlayOptionsHit};
+use crate::services::shaders::{
+    mpv_mastering_flags_with_manual, neural_shader_installed, VideoMasteringProfile,
+};
+use crate::state::{AppState, ContentProfile, ManualToggle, PlayOptionsHit};
 use crate::ui::studio::widgets::{
-    mode_badge_color, push_line_hit, push_pane_hit, section_block, segmented_gauge_line,
-    studio_kv_row, truncate_words,
+    mode_badge_color, push_line_hit, push_pane_hit, render_inline_pills, section_block,
+    segmented_gauge_line, studio_kv_row, truncate_words,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 
@@ -47,7 +50,9 @@ pub fn estimate_mastering_impact(cfg: &Config) -> StudioImpactEstimate {
                 SuperResMode::Auto1080p => 18,
                 SuperResMode::Always2x => 30,
             };
-            if cfg.shader_mode == VideoShaderMode::NeuralCinema && eff.super_res != SuperResMode::Off {
+            if cfg.shader_mode == VideoShaderMode::NeuralCinema
+                && eff.super_res != SuperResMode::Off
+            {
                 gpu += 10;
             }
         }
@@ -127,7 +132,11 @@ pub fn render_mastering_page(frame: &mut Frame, area: Rect, state: &mut AppState
 
 fn render_signal_flow_pipeline(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = *state.base_theme();
-    let blk = section_block(" Active GPU Signal-Flow Pipeline (vo=gpu-next · libplacebo) ", false, &theme);
+    let blk = section_block(
+        " Active GPU Signal-Flow Pipeline (vo=gpu-next · libplacebo) ",
+        false,
+        &theme,
+    );
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
     if inner.width < 30 || inner.height < 2 {
@@ -172,13 +181,22 @@ fn render_signal_flow_pipeline(frame: &mut Frame, area: Rect, state: &AppState) 
     };
 
     let line1 = Line::from(vec![
-        Span::styled(format!(" [{dec_tag}]"), stage_style(true, Color::Rgb(52, 211, 153))),
+        Span::styled(
+            format!(" [{dec_tag}]"),
+            stage_style(true, Color::Rgb(52, 211, 153)),
+        ),
         Span::styled(" ─▶ ", Style::default().fg(theme.text_dim)),
         Span::styled("[Deblock]", stage_style(deblock_on, theme.primary)),
         Span::styled(" ─▶ ", Style::default().fg(theme.text_dim)),
         Span::styled("[4:4:4 Chroma]", stage_style(chroma_on, theme.primary)),
         Span::styled(" ─▶ ", Style::default().fg(theme.text_dim)),
-        Span::styled(format!("[{sr_tag}]"), stage_style(sr_on || (shader_on && eff.glsl_stage == GlslStageMode::LightCas), theme.accent)),
+        Span::styled(
+            format!("[{sr_tag}]"),
+            stage_style(
+                sr_on || (shader_on && eff.glsl_stage == GlslStageMode::LightCas),
+                theme.accent,
+            ),
+        ),
         Span::styled(" ─▶ ", Style::default().fg(theme.text_dim)),
         Span::styled("[Deband]", stage_style(deband_on, theme.secondary)),
         Span::styled(" ─▶ ", Style::default().fg(theme.text_dim)),
@@ -195,11 +213,21 @@ fn render_signal_flow_pipeline(frame: &mut Frame, area: Rect, state: &AppState) 
 
     let line2 = Line::from(Span::styled(
         format!(
-            " Scaler: {} | Cache: {} | HDR Peak: {} | Codec Prio: {}",
-            eff.gpu_scaler.label(),
-            eff.demuxer_cache.label(),
-            if eff.hdr_compute_peak { "Dynamic" } else { "Cool Static" },
-            eff.codec_priority.label()
+            " {}",
+            truncate_words(
+                &format!(
+                    "Scaler: {} | Cache: {} | HDR Peak: {} | Codec Prio: {}",
+                    eff.gpu_scaler.label(),
+                    eff.demuxer_cache.label(),
+                    if eff.hdr_compute_peak {
+                        "Dynamic"
+                    } else {
+                        "Cool Static"
+                    },
+                    eff.codec_priority.label()
+                ),
+                inner.width.saturating_sub(1) as usize,
+            )
         ),
         Style::default().fg(theme.text_dim),
     ));
@@ -207,63 +235,138 @@ fn render_signal_flow_pipeline(frame: &mut Frame, area: Rect, state: &AppState) 
     frame.render_widget(Paragraph::new(vec![line1, line2]), inner);
 }
 
+fn active_glsl_manifest(shader: VideoShaderMode, eff: ManualMasteringConfig) -> (String, usize) {
+    if shader == VideoShaderMode::Off || eff.glsl_stage == GlslStageMode::Off {
+        return ("Bypass (raw native decoder output)".to_string(), 0);
+    }
+    if eff.glsl_stage == GlslStageMode::LightCas {
+        return ("00_light_cas.glsl".to_string(), 1);
+    }
+    let mut chain = vec!["01_deblock_dering.glsl", "02_chroma_guided.glsl"];
+    if eff.glsl_stage == GlslStageMode::FullMastering && eff.super_res != SuperResMode::Off {
+        match shader {
+            VideoShaderMode::Reference4K => {
+                chain.push(if eff.super_res == SuperResMode::Auto1080p {
+                    "03_superres_1080p_rcas.glsl"
+                } else {
+                    "03_superres_4k_rcas.glsl"
+                });
+            }
+            VideoShaderMode::NeuralCinema => {
+                if neural_shader_installed() {
+                    chain.push("fsrcnnx_x2_16_0_4_1.glsl");
+                } else {
+                    chain.push("03_superres_4k_rcas.glsl");
+                }
+            }
+            VideoShaderMode::Anime4K => {
+                chain.push(if eff.super_res == SuperResMode::Auto1080p {
+                    "04_anime4k_1080p_restore.glsl"
+                } else {
+                    "04_anime4k_restore.glsl"
+                });
+            }
+            VideoShaderMode::Balanced | VideoShaderMode::Off => {}
+        }
+    }
+    let count = chain.len();
+    (chain.join(" -> "), count)
+}
+
+fn active_content_profile(cfg: &Config) -> Option<ContentProfile> {
+    let eff = cfg.effective_mastering();
+    if cfg.shader_mode == VideoShaderMode::Off && cfg.performance_mode == PerformanceMode::Efficient
+    {
+        return Some(ContentProfile::CoolBattery);
+    }
+    if cfg.shader_mode == VideoShaderMode::Reference4K
+        && cfg.performance_mode == PerformanceMode::Quality
+        && cfg.motion_mode == MotionMode::Cadence
+    {
+        return Some(ContentProfile::Cinema24p);
+    }
+    if cfg.shader_mode == VideoShaderMode::Balanced
+        && cfg.motion_mode == MotionMode::Smooth120Hz
+        && eff.codec_priority == CodecPriority::Vp9HwFirst
+    {
+        return Some(ContentProfile::Sports60p);
+    }
+    if cfg.shader_mode == VideoShaderMode::Anime4K {
+        return Some(ContentProfile::Anime2x);
+    }
+    if cfg.performance_mode == PerformanceMode::Manual
+        && eff.glsl_stage == GlslStageMode::LightCas
+        && eff.deband == DebandTier::Off
+    {
+        return Some(ContentProfile::CrispCode);
+    }
+    None
+}
+
 fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = *state.base_theme();
     let focused = state.studio.pane_focus == 0;
-    let blk = section_block(" Engine Mode, Impact & 4K Shaders ", focused, &theme);
+    let blk = section_block(" Engine Mode, Profiles & 4K Shaders ", focused, &theme);
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
-    if inner.width < 24 || inner.height < 10 {
+    if inner.width < 24 || inner.height < 11 {
         return;
     }
 
     let impact = estimate_mastering_impact(&state.config);
-    let hits = &mut state.live_playback.play_hitboxes;
+    let eff = state.config.effective_mastering();
+    let active_prof = active_content_profile(&state.config);
+    let perf_now = state.config.performance_mode;
+    let shader_now = state.config.shader_mode;
+    let cnn_installed = neural_shader_installed();
+    let (chain_str, pass_count) = active_glsl_manifest(shader_now, eff);
+
+    let show_profiles = inner.height >= 16;
+    let show_manifest = inner.height >= 19;
+
+    let mut constraints = vec![
+        Constraint::Length(1), // 0: Mode pills
+        Constraint::Length(1), // 1: Seed pills
+    ];
+    if show_profiles {
+        constraints.push(Constraint::Length(1)); // Profile row 1
+        constraints.push(Constraint::Length(1)); // Profile row 2
+    }
+    constraints.extend([
+        Constraint::Length(1), // Impact header
+        Constraint::Length(1), // GPU Load
+        Constraint::Length(1), // Est RAM
+        Constraint::Length(1), // Thermal
+        Constraint::Length(1), // Shaders header
+        Constraint::Length(5), // 5 Shaders
+        Constraint::Length(1), // CNN pack
+    ]);
+    if show_manifest {
+        constraints.push(Constraint::Min(2)); // Active GLSL chain + Thermal verdict
+    } else {
+        constraints.push(Constraint::Min(0));
+    }
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // 0: Mode pills
-            Constraint::Length(1), // 1: Seed from pills
-            Constraint::Length(1), // 2: Impact header
-            Constraint::Length(1), // 3: GPU Load gauge
-            Constraint::Length(1), // 4: RAM gauge
-            Constraint::Length(1), // 5: Thermal gauge
-            Constraint::Length(1), // 6: Shaders header
-            Constraint::Min(5),    // 7: Shader list + CNN pack
-        ])
+        .constraints(constraints)
         .split(inner);
 
-    // Row 0: Mode pills
-    let pill_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(10),
-            Constraint::Percentage(19),
-            Constraint::Percentage(27),
-            Constraint::Percentage(27),
-            Constraint::Percentage(27),
-        ])
-        .split(rows[0]);
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            " Mode[m]: ",
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD),
-        )),
-        pill_cols[0],
-    );
-    for (idx, pm) in PerformanceMode::ALL.iter().enumerate() {
-        let active = *pm == state.config.performance_mode;
-        let col = mode_badge_color(*pm);
-        let lbl = if (pill_cols[idx + 1].width as usize) >= pm.label().len() + 2 {
-            format!(" {} ", pm.label())
-        } else {
-            format!(" {} ", pm.short_badge())
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
+    let hits = &mut state.live_playback.play_hitboxes;
+    let mut ri = 0usize;
+
+    // Mode pills via render_inline_pills
+    let mode_pills: Vec<(String, Style, PlayOptionsHit)> = PerformanceMode::ALL
+        .iter()
+        .map(|pm| {
+            let active = *pm == perf_now;
+            let col = mode_badge_color(*pm);
+            let lbl = if inner.width >= 50 {
+                format!("[{}]", pm.label())
+            } else {
+                format!("[{}]", pm.short_badge())
+            };
+            (
                 lbl,
                 if active {
                     Style::default()
@@ -273,37 +376,109 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
                 } else {
                     Style::default().fg(theme.text_dim)
                 },
-            )),
-            pill_cols[idx + 1],
-        );
-        hits.push((pill_cols[idx + 1], PlayOptionsHit::SetPerformanceMode(*pm)));
-    }
-
-    // Row 1: Seed from presets
-    let seed_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Min(10),
-        ])
-        .split(rows[1]);
-    frame.render_widget(
-        Paragraph::new(Span::styled(" Seed Man:", Style::default().fg(theme.text_dim))),
-        seed_cols[0],
+                PlayOptionsHit::SetPerformanceMode(*pm),
+            )
+        })
+        .collect();
+    render_inline_pills(
+        frame,
+        rows[ri],
+        Some((
+            " Mode[m]:",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        &mode_pills,
+        hits,
     );
-    let seeds = [
-        (PerformanceMode::Efficient, "[Seed ECO]", Color::Rgb(52, 211, 153)),
-        (PerformanceMode::Balanced, "[Seed BAL]", Color::Rgb(56, 189, 248)),
-        (PerformanceMode::Quality, "[Seed MAX]", Color::Rgb(251, 191, 36)),
+    ri += 1;
+
+    // Seed Man pills via render_inline_pills
+    let seed_pills = vec![
+        (
+            "[Seed ECO]".to_string(),
+            Style::default().fg(Color::Rgb(52, 211, 153)),
+            PlayOptionsHit::SeedManualFrom(PerformanceMode::Efficient),
+        ),
+        (
+            "[Seed BAL]".to_string(),
+            Style::default().fg(Color::Rgb(56, 189, 248)),
+            PlayOptionsHit::SeedManualFrom(PerformanceMode::Balanced),
+        ),
+        (
+            "[Seed MAX]".to_string(),
+            Style::default().fg(Color::Rgb(251, 191, 36)),
+            PlayOptionsHit::SeedManualFrom(PerformanceMode::Quality),
+        ),
     ];
-    for (idx, (pm, lbl, col)) in seeds.into_iter().enumerate() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(lbl, Style::default().fg(col))),
-            seed_cols[idx + 1],
+    render_inline_pills(
+        frame,
+        rows[ri],
+        Some((" Seed Man:", Style::default().fg(theme.text_dim))),
+        &seed_pills,
+        hits,
+    );
+    ri += 1;
+
+    if show_profiles {
+        let prof_r1 = [
+            ContentProfile::Cinema24p,
+            ContentProfile::Sports60p,
+            ContentProfile::Anime2x,
+        ]
+        .into_iter()
+        .map(|cp| {
+            let active = active_prof == Some(cp);
+            (
+                format!("[{}]", cp.short_label()),
+                if active {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.secondary)
+                },
+                PlayOptionsHit::ApplyContentProfile(cp),
+            )
+        })
+        .collect::<Vec<_>>();
+        render_inline_pills(
+            frame,
+            rows[ri],
+            Some((" Profiles:", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
+            &prof_r1,
+            hits,
         );
-        hits.push((seed_cols[idx + 1], PlayOptionsHit::SeedManualFrom(pm)));
+        ri += 1;
+
+        let prof_r2 = [ContentProfile::CrispCode, ContentProfile::CoolBattery]
+            .into_iter()
+            .map(|cp| {
+                let active = active_prof == Some(cp);
+                (
+                    format!("[{}]", cp.short_label()),
+                    if active {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.text)
+                    },
+                    PlayOptionsHit::ApplyContentProfile(cp),
+                )
+            })
+            .collect::<Vec<_>>();
+        render_inline_pills(
+            frame,
+            rows[ri],
+            Some(("          ", Style::default().fg(theme.text_dim))),
+            &prof_r2,
+            hits,
+        );
+        ri += 1;
     }
 
     // Impact Gauges
@@ -314,10 +489,12 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
                 .fg(theme.secondary)
                 .add_modifier(Modifier::BOLD),
         )),
-        rows[2],
+        rows[ri],
     );
+    ri += 1;
+
     let ram_pct = ((impact.ram_mb * 100) / 1600).min(100) as u8;
-    let w = rows[3].width as usize;
+    let w = rows[ri].width as usize;
     frame.render_widget(
         Paragraph::new(segmented_gauge_line(
             "GPU Load",
@@ -326,8 +503,10 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
             w,
             &theme,
         )),
-        rows[3],
+        rows[ri],
     );
+    ri += 1;
+
     frame.render_widget(
         Paragraph::new(segmented_gauge_line(
             "Est RAM",
@@ -336,8 +515,10 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
             w,
             &theme,
         )),
-        rows[4],
+        rows[ri],
     );
+    ri += 1;
+
     frame.render_widget(
         Paragraph::new(segmented_gauge_line(
             "Thermal",
@@ -346,8 +527,9 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
             w,
             &theme,
         )),
-        rows[5],
+        rows[ri],
     );
+    ri += 1;
 
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -356,9 +538,12 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
                 .fg(theme.secondary)
                 .add_modifier(Modifier::BOLD),
         )),
-        rows[6],
+        rows[ri],
     );
+    ri += 1;
 
+    let sh_area = rows[ri];
+    ri += 1;
     let all_shaders = [
         (VideoShaderMode::Reference4K, "Reference 4K", "Deblock+4:4:4+RCAS"),
         (VideoShaderMode::NeuralCinema, "Neural Cinema", "FSRCNNX CNN+4:4:4"),
@@ -368,10 +553,10 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
     ];
     let mut shader_lines = Vec::new();
     for (m, name, desc) in all_shaders {
-        let active = m == state.config.shader_mode;
+        let active = m == shader_now;
         let row = shader_lines.len() as u16;
         let name_w = 14usize;
-        let desc_budget = (rows[7].width as usize).saturating_sub(name_w + 6);
+        let desc_budget = (sh_area.width as usize).saturating_sub(name_w + 6);
         let d_fit = truncate_words(desc, desc_budget);
         shader_lines.push(Line::from(vec![
             Span::styled(
@@ -388,15 +573,17 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
             Span::styled(" │ ", Style::default().fg(theme.divider)),
             Span::styled(d_fit, Style::default().fg(theme.text_dim)),
         ]));
-        push_line_hit(hits, rows[7], row, PlayOptionsHit::SelectShader(m));
+        push_line_hit(hits, sh_area, row, PlayOptionsHit::SelectShader(m));
     }
+    frame.render_widget(Paragraph::new(shader_lines), sh_area);
 
-    if (shader_lines.len() as u16) < rows[7].height {
-        let row_cnn = shader_lines.len() as u16;
-        let installed = neural_shader_installed();
-        shader_lines.push(studio_kv_row(
+    // CNN Pack status row
+    let cnn_area = rows[ri];
+    ri += 1;
+    frame.render_widget(
+        Paragraph::new(studio_kv_row(
             "CNN Pack",
-            if installed {
+            if cnn_installed {
                 "FSRCNNX Installed (Ready)"
             } else {
                 "[Click to Download CNN]"
@@ -404,35 +591,131 @@ fn render_mode_shaders_pane(frame: &mut Frame, area: Rect, state: &mut AppState)
             None,
             10,
             false,
-            Style::default().fg(if installed {
+            Style::default().fg(if cnn_installed {
                 Color::Rgb(52, 211, 153)
             } else {
                 theme.accent
             }),
-            rows[7].width,
+            cnn_area.width,
             &theme,
-        ));
-        if !installed {
-            push_line_hit(hits, rows[7], row_cnn, PlayOptionsHit::DownloadNeuralShaders);
+        )),
+        cnn_area,
+    );
+    if !cnn_installed {
+        push_line_hit(hits, cnn_area, 0, PlayOptionsHit::DownloadNeuralShaders);
+    }
+
+fn pad_h(r: Rect, px: u16) -> Rect {
+    Rect::new(
+        r.x.saturating_add(px),
+        r.y,
+        r.width.saturating_sub(px * 2),
+        r.height,
+    )
+}
+
+    if show_manifest && ri < rows.len() && rows[ri].height >= 2 {
+        let (verdict_txt, v_col) = if impact.thermal_pct <= 35 {
+            ("Ultra-Cool Fanless / Peak Battery", Color::Rgb(52, 211, 153))
+        } else if impact.thermal_pct <= 60 {
+            ("Balanced Warm / Quiet Chassis", Color::Rgb(56, 189, 248))
+        } else {
+            ("High GPU Load / AC Adapter Rec", Color::Rgb(251, 191, 36))
+        };
+        let mut manifest_lines = vec![
+            Line::from(Span::styled(
+                "─".repeat(pad_h(rows[ri], 1).width as usize),
+                Style::default().fg(theme.divider),
+            )),
+            Line::from(vec![
+                Span::styled(
+                    format!("Chain ({pass_count} pass): "),
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(chain_str, Style::default().fg(theme.text)),
+            ]),
+            Line::from(vec![
+                Span::styled("Thermal Verdict: ", Style::default().fg(theme.text_dim)),
+                Span::styled(verdict_txt, Style::default().fg(v_col).add_modifier(Modifier::BOLD)),
+            ]),
+        ];
+        if rows[ri].height >= 5 {
+            manifest_lines.push(Line::from(Span::styled(
+                "Keys: [m] Mode [s] Shader [t] 120Hz [Enter] Apply",
+                Style::default().fg(theme.text_dim),
+            )));
         }
+        frame.render_widget(
+            Paragraph::new(manifest_lines).wrap(Wrap { trim: true }),
+            pad_h(rows[ri], 1),
+        );
     }
 
     push_pane_hit(hits, area, 0);
-    frame.render_widget(Paragraph::new(shader_lines), rows[7]);
 }
 
-fn manual_inspector_text(toggle: ManualToggle) -> &'static str {
+fn manual_inspector_meta(toggle: ManualToggle) -> (&'static str, &'static str, &'static str, bool) {
     match toggle {
-        ManualToggle::SuperRes => "2x Super-Res allocates 5K/8K 16-bit GPU FBOs. Use <=1080p for cool 4K streams.",
-        ManualToggle::CodecPriority => "VP9/HEVC decodes cooler in hardware; AV1 saves bandwidth. Press [Enter] to reload codec.",
-        ManualToggle::Hwdec => "VideoToolbox/Auto-Safe offloads decode to media silicon; CPU SW dramatically raises heat.",
-        ManualToggle::HdrComputePeak => "Dynamic HDR peak measures per-scene brightness; Cool Static avoids compute passes.",
-        ManualToggle::ToneMap => "libplacebo HDR-to-SDR curve: Spline (balanced), BT.2446a (broadcast), ST2094-40 (dynamic).",
-        ManualToggle::GlslStage => "Controls active GLSL depth: Light CAS -> Guided 4:4:4 chroma -> Full 4K 2x pipeline.",
-        ManualToggle::Deband => "16-bit gradient debander removes sky/shadow banding; 3-Pass adds temporal dithering.",
-        ManualToggle::GpuScaler => "EWA LanczosSharp adds antiring & linear/sigmoid scaling; Spline36 stays ultra cool.",
-        ManualToggle::Motion => "120Hz display-resample cadence or Catmull-Rom interpolation (hot-swaps live via [t]).",
-        ManualToggle::DemuxerCache => "Forward/back RAM ring budget (48M / 160M / 512M). Higher reduces Wi-Fi micro-stalls.",
+        ManualToggle::SuperRes => (
+            "5K 2x Upscale",
+            "glsl-shaders",
+            "2x Super-Res allocates 5K/8K 16-bit GPU FBOs. Use <=1080p for cool 4K streams.",
+            true,
+        ),
+        ManualToggle::CodecPriority => (
+            "Codec Prio",
+            "ytdl-raw-options",
+            "VP9/HEVC decodes cooler in hardware; AV1 saves bandwidth. Press [Enter] to reload codec.",
+            false,
+        ),
+        ManualToggle::Hwdec => (
+            "Hardware Dec",
+            "hwdec",
+            "VideoToolbox/Auto-Safe offloads decode to media silicon; CPU SW dramatically raises heat.",
+            true,
+        ),
+        ManualToggle::HdrComputePeak => (
+            "HDR Peak Comp",
+            "hdr-compute-peak",
+            "Dynamic HDR peak measures per-scene brightness; Cool Static avoids compute passes.",
+            true,
+        ),
+        ManualToggle::ToneMap => (
+            "HDR Tone Map",
+            "tone-mapping",
+            "libplacebo HDR-to-SDR curve: Spline (balanced), BT.2446a (broadcast), ST2094-40 (dynamic).",
+            true,
+        ),
+        ManualToggle::GlslStage => (
+            "4:4:4 & Deblk",
+            "glsl-shaders",
+            "Controls active GLSL depth: Light CAS -> Guided 4:4:4 chroma -> Full 4K 2x pipeline.",
+            true,
+        ),
+        ManualToggle::Deband => (
+            "Deband Filter",
+            "deband",
+            "16-bit gradient debander removes sky/shadow banding; 3-Pass adds temporal dithering.",
+            true,
+        ),
+        ManualToggle::GpuScaler => (
+            "GPU Scaler",
+            "scale / cscale",
+            "EWA LanczosSharp adds antiring & linear/sigmoid scaling; Spline36 stays ultra cool.",
+            true,
+        ),
+        ManualToggle::Motion => (
+            "120Hz Motion",
+            "tscale / video-sync",
+            "120Hz display-resample cadence or Catmull-Rom interpolation (hot-swaps live via [t]).",
+            true,
+        ),
+        ManualToggle::DemuxerCache => (
+            "Demuxer Cache",
+            "demuxer-max-bytes",
+            "Forward/back RAM ring budget (48M / 160M / 512M). Higher reduces Wi-Fi micro-stalls.",
+            true,
+        ),
     }
 }
 
@@ -452,7 +735,13 @@ fn heat_dots(toggle: ManualToggle, cfg: &Config) -> (&'static str, Color) {
             HwdecMode::VideoToolbox | HwdecMode::AutoSafe => 1,
             HwdecMode::Off => 3,
         },
-        ManualToggle::HdrComputePeak => if eff.hdr_compute_peak { 2 } else { 0 },
+        ManualToggle::HdrComputePeak => {
+            if eff.hdr_compute_peak {
+                2
+            } else {
+                0
+            }
+        }
         ManualToggle::ToneMap => 1,
         ManualToggle::GlslStage => match eff.glsl_stage {
             GlslStageMode::Off => 0,
@@ -489,6 +778,52 @@ fn heat_dots(toggle: ManualToggle, cfg: &Config) -> (&'static str, Color) {
     }
 }
 
+fn delta_vs_balanced_badges(cfg: &Config) -> Vec<&'static str> {
+    let eff = cfg.effective_mastering();
+    let bal = ManualMasteringConfig::from_preset(PerformanceMode::Balanced);
+    let mut diffs = Vec::new();
+    if eff.super_res != bal.super_res {
+        diffs.push(match eff.super_res {
+            SuperResMode::Off => "Up:Off",
+            SuperResMode::Auto1080p => "+1080p2x",
+            SuperResMode::Always2x => "+Always2x",
+        });
+    }
+    if eff.codec_priority != bal.codec_priority {
+        diffs.push("+AV1");
+    }
+    if eff.hwdec != bal.hwdec {
+        diffs.push("Dec:Mod");
+    }
+    if eff.hdr_compute_peak != bal.hdr_compute_peak {
+        diffs.push("+HDRDyn");
+    }
+    if eff.tone_map != bal.tone_map {
+        diffs.push("Tone:Mod");
+    }
+    if eff.glsl_stage != bal.glsl_stage {
+        diffs.push(match eff.glsl_stage {
+            GlslStageMode::Off => "GLSL:Off",
+            GlslStageMode::LightCas => "GLSL:CAS",
+            GlslStageMode::Guided444 => "GLSL:444",
+            GlslStageMode::FullMastering => "+FullGLSL",
+        });
+    }
+    if eff.deband != bal.deband {
+        diffs.push("+Deband3");
+    }
+    if eff.gpu_scaler != bal.gpu_scaler {
+        diffs.push("+Lanczos");
+    }
+    if cfg.motion_mode != MotionMode::Off {
+        diffs.push("+Motion");
+    }
+    if eff.demuxer_cache != bal.demuxer_cache {
+        diffs.push("RAM:Mod");
+    }
+    diffs
+}
+
 fn render_manual_matrix_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = *state.base_theme();
     let focused = state.studio.pane_focus == 1;
@@ -501,7 +836,7 @@ fn render_manual_matrix_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     let blk = section_block(title, focused, &theme);
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
-    if inner.width < 26 || inner.height < 8 {
+    if inner.width < 26 || inner.height < 14 {
         return;
     }
 
@@ -527,29 +862,106 @@ fn render_manual_matrix_pane(frame: &mut Frame, area: Rect, state: &mut AppState
     };
 
     let rows_spec: [(ManualToggle, &str, &str, &str, Color); 10] = [
-        (ManualToggle::SuperRes, "5K 2x Upscale", eff.super_res.label(), "GPU", superres_col),
-        (ManualToggle::CodecPriority, "Codec Prio", eff.codec_priority.label(), "CPU", codec_col),
-        (ManualToggle::Hwdec, "Hardware Dec", eff.hwdec.label(), "Dec", theme.secondary),
-        (ManualToggle::HdrComputePeak, "HDR Peak Comp", hdr_val, "HDR", hdr_col),
-        (ManualToggle::ToneMap, "HDR Tone Map", eff.tone_map.label(), "Map", theme.text),
-        (ManualToggle::GlslStage, "4:4:4 & Deblk", eff.glsl_stage.label(), "GLSL", theme.primary),
-        (ManualToggle::Deband, "Deband Filter", eff.deband.label(), "Band", theme.text),
-        (ManualToggle::GpuScaler, "GPU Scaler", eff.gpu_scaler.label(), "Scl", theme.text),
-        (ManualToggle::Motion, "120Hz Motion", state.config.motion_mode.label(), "Hz", theme.secondary),
-        (ManualToggle::DemuxerCache, "Demuxer Cache", eff.demuxer_cache.label(), "RAM", theme.accent),
+        (
+            ManualToggle::SuperRes,
+            "5K 2x Upscale",
+            eff.super_res.label(),
+            "GPU",
+            superres_col,
+        ),
+        (
+            ManualToggle::CodecPriority,
+            "Codec Prio",
+            eff.codec_priority.label(),
+            "CPU",
+            codec_col,
+        ),
+        (
+            ManualToggle::Hwdec,
+            "Hardware Dec",
+            eff.hwdec.label(),
+            "Dec",
+            theme.secondary,
+        ),
+        (
+            ManualToggle::HdrComputePeak,
+            "HDR Peak Comp",
+            hdr_val,
+            "HDR",
+            hdr_col,
+        ),
+        (
+            ManualToggle::ToneMap,
+            "HDR Tone Map",
+            eff.tone_map.label(),
+            "Map",
+            theme.text,
+        ),
+        (
+            ManualToggle::GlslStage,
+            "4:4:4 & Deblk",
+            eff.glsl_stage.label(),
+            "GLSL",
+            theme.primary,
+        ),
+        (
+            ManualToggle::Deband,
+            "Deband Filter",
+            eff.deband.label(),
+            "Band",
+            theme.text,
+        ),
+        (
+            ManualToggle::GpuScaler,
+            "GPU Scaler",
+            eff.gpu_scaler.label(),
+            "Scl",
+            theme.text,
+        ),
+        (
+            ManualToggle::Motion,
+            "120Hz Motion",
+            state.config.motion_mode.label(),
+            "Hz",
+            theme.secondary,
+        ),
+        (
+            ManualToggle::DemuxerCache,
+            "Demuxer Cache",
+            eff.demuxer_cache.label(),
+            "RAM",
+            theme.accent,
+        ),
     ];
 
-    let rows = Layout::default()
+    let outer_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),
-            Constraint::Length(3), // Inspector footer
+            Constraint::Length(10), // 10-point matrix (exact 10 lines)
+            Constraint::Min(4),     // Inspector + Flags + Delta stack
         ])
         .split(inner);
 
+    let active_toggle = ManualToggle::ALL
+        .get(state.manual_mastering_cursor)
+        .copied()
+        .unwrap_or(ManualToggle::SuperRes);
+    let (insp_name, mpv_prop, insp_desc, is_live_swap) = manual_inspector_meta(active_toggle);
+    let diffs = delta_vs_balanced_badges(&state.config);
+    let flags_preview = mpv_mastering_flags_with_manual(
+        state.config.shader_mode,
+        VideoMasteringProfile::StandardHd,
+        state.config.performance_mode,
+        Some(eff),
+    )
+    .into_iter()
+    .take(6)
+    .collect::<Vec<_>>()
+    .join(" ");
+
     let hits = &mut state.live_playback.play_hitboxes;
-    let label_w = if rows[0].width >= 48 { 14 } else { 11 };
-    let mut lines = Vec::new();
+    let label_w = if outer_rows[0].width >= 48 { 14 } else { 11 };
+    let mut lines = Vec::with_capacity(10);
     for (idx, (toggle, lbl, val, tag, col)) in rows_spec.into_iter().enumerate() {
         let row_off = lines.len() as u16;
         let highlighted = focused && state.manual_mastering_cursor == idx;
@@ -561,39 +973,139 @@ fn render_manual_matrix_pane(frame: &mut Frame, area: Rect, state: &mut AppState
             label_w,
             highlighted,
             Style::default().fg(col),
-            rows[0].width.saturating_sub(5),
+            outer_rows[0].width.saturating_sub(5),
             &theme,
         );
         line.spans
             .push(Span::styled(format!(" {dots}"), Style::default().fg(dot_col)));
         lines.push(line);
-        push_line_hit(hits, rows[0], row_off, PlayOptionsHit::ToggleManual(toggle));
+        push_line_hit(hits, outer_rows[0], row_off, PlayOptionsHit::ToggleManual(toggle));
     }
-    frame.render_widget(Paragraph::new(lines), rows[0]);
+    frame.render_widget(Paragraph::new(lines), outer_rows[0]);
 
-    let active_toggle = ManualToggle::ALL
-        .get(state.manual_mastering_cursor)
-        .copied()
-        .unwrap_or(ManualToggle::SuperRes);
-    let hint = manual_inspector_text(active_toggle);
-    let insp_lines = vec![
-        Line::from(Span::styled(
-            "─".repeat(rows[1].width as usize),
+    // Bottom Inspector + Flags + Delta stack (zero truncation, zero blank void)
+    let bot = outer_rows[1];
+    let show_flags = bot.height >= 7;
+    let show_delta = bot.height >= 8;
+    let mut b_constraints = vec![
+        Constraint::Length(1), // Divider
+        Constraint::Length(1), // Inspector Header + LIVE/RELAUNCH badge
+        Constraint::Min(2),    // Wrapped untruncated Inspector body
+    ];
+    if show_flags {
+        b_constraints.push(Constraint::Length(1)); // Divider before Flags
+        b_constraints.push(Constraint::Length(2)); // Effective mpv flags preview
+    }
+    if show_delta {
+        b_constraints.push(Constraint::Length(1)); // Delta vs BAL strip + [Seed BAL]
+    }
+    let bot_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(b_constraints)
+        .split(bot);
+
+    // Divider
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(bot.width as usize),
             Style::default().fg(theme.divider),
         )),
-        Line::from(vec![
+        bot_chunks[0],
+    );
+
+    // Header
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled(
-                " Inspector: ",
+                format!(" Inspector [{insp_name}] "),
                 Style::default()
                     .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(format!("· Prop: {mpv_prop} "), Style::default().fg(theme.text_dim)),
             Span::styled(
-                truncate_words(hint, rows[1].width.saturating_sub(13) as usize),
-                Style::default().fg(theme.text_dim),
+                if is_live_swap { "[LIVE]" } else { "[RELAUNCH]" },
+                Style::default()
+                    .fg(if is_live_swap {
+                        Color::Rgb(52, 211, 153)
+                    } else {
+                        Color::Rgb(251, 191, 36)
+                    })
+                    .add_modifier(Modifier::BOLD),
             ),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(insp_lines), rows[1]);
+        ])),
+        bot_chunks[1],
+    );
+
+    // Wrapped description with clean 1-cell horizontal padding (never truncates mid-sentence!)
+    frame.render_widget(
+        Paragraph::new(Span::styled(insp_desc, Style::default().fg(theme.text)))
+            .wrap(Wrap { trim: true }),
+        Rect::new(
+            bot_chunks[2].x.saturating_add(1),
+            bot_chunks[2].y,
+            bot_chunks[2].width.saturating_sub(2),
+            bot_chunks[2].height,
+        ),
+    );
+
+    let mut b_idx = 3usize;
+    if show_flags {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(bot.width as usize),
+                Style::default().fg(theme.divider),
+            )),
+            bot_chunks[b_idx],
+        );
+        b_idx += 1;
+        let flags_txt = if flags_preview.is_empty() {
+            "Flags: Raw native pass-through (zero scaler/deband overhead)".to_string()
+        } else {
+            format!("Flags: {flags_preview}")
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(flags_txt, Style::default().fg(theme.secondary)))
+                .wrap(Wrap { trim: true }),
+            Rect::new(
+                bot_chunks[b_idx].x.saturating_add(1),
+                bot_chunks[b_idx].y,
+                bot_chunks[b_idx].width.saturating_sub(2),
+                bot_chunks[b_idx].height,
+            ),
+        );
+        b_idx += 1;
+    }
+
+    if show_delta && b_idx < bot_chunks.len() {
+        let delta_summary = if diffs.is_empty() {
+            "Delta vs BAL: Exact Balanced cool baseline".to_string()
+        } else {
+            format!("Delta vs BAL: {}", diffs.join(", "))
+        };
+        let d_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(16), Constraint::Length(12)])
+            .split(bot_chunks[b_idx]);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {}", truncate_words(&delta_summary, d_cols[0].width.saturating_sub(1) as usize)),
+                Style::default().fg(theme.text_dim),
+            )),
+            d_cols[0],
+        );
+        render_inline_pills(
+            frame,
+            d_cols[1],
+            None,
+            &[(
+                "[Seed BAL]".to_string(),
+                Style::default().fg(Color::Rgb(56, 189, 248)),
+                PlayOptionsHit::SeedManualFrom(PerformanceMode::Balanced),
+            )],
+            hits,
+        );
+    }
+
     push_pane_hit(hits, area, 1);
 }

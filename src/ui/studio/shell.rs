@@ -102,6 +102,27 @@ pub fn render_studio_shell(frame: &mut Frame, state: &mut AppState) -> Option<Re
         ));
     }
 
+    if state.config.picture.preset != crate::config::PicturePreset::Neutral
+        || state.live_playback.picture_bypass
+    {
+        let lbl = if state.live_playback.picture_bypass {
+            " [EQ:BYPASS] ".to_string()
+        } else {
+            format!(" [EQ:{}] ", state.config.picture.preset.short_label().to_uppercase())
+        };
+        title_spans.push(Span::styled(
+            lbl,
+            Style::default()
+                .fg(Color::Black)
+                .bg(if state.live_playback.picture_bypass {
+                    Color::Rgb(148, 163, 184)
+                } else {
+                    theme.secondary
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if state.config.network_mode.is_congested() {
         let net_bg = match state.config.network_mode {
             NetworkMode::CongestedWifi => Color::Rgb(251, 191, 36),
@@ -485,39 +506,52 @@ fn render_transport_banner(frame: &mut Frame, area: Rect, state: &mut AppState) 
 fn render_footer_keybar(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = state.base_theme();
     let live = state.has_live_ipc();
+    let wide = area.width >= 118;
     let page_hint = match state.studio.page {
-        StudioPage::Deck => "[j/k] EQ Row | [h/l] EQ ±5 | [0] Reset EQ",
-        StudioPage::StreamNet => "[j/k] Tier | [w] Net Mode | [i] IPv4 | [A] Auto-ABR",
-        StudioPage::MasteringGpu => "[m] Mode | [s] Shader | [t] 120Hz | [j/k+Space] Manual",
-        StudioPage::AudioSync => "[d] Dub | [L] Lang | [n] Norm | [h/l] Delay ±50ms",
-        StudioPage::CaptionsSkip => "[c] Subs | [y] Style | [o] Outros | [j/k] Segment",
-        StudioPage::LiveTelemetry => "[v] Live Mode | [E] Edge | [S] Start | [R] Radio",
+        StudioPage::Deck => {
+            if wide {
+                "[g] Grade | [b] Bypass | [f] Full | [,/.] Frame | [T] Sleep | [0] Reset"
+            } else {
+                "[g] Grade | [b] Bypass | [f] Full | [T] Sleep"
+            }
+        }
+        StudioPage::StreamNet => "[j/k] Tier | [C] Codec | [w] Net | [r] Probe | [A] ABR",
+        StudioPage::MasteringGpu => "[m] Mode | [s] Shader | [t] 120Hz | [j/k+Space] Matrix",
+        StudioPage::AudioSync => "[d] Dub | [L] Lang | [n] Norm | [e] EQ | [h/l] Delay",
+        StudioPage::CaptionsSkip => "[c] Subs | [y] Style | [o] Outros | [u] Ch/SB | [h/l] Offset",
+        StudioPage::LiveTelemetry => "[v] Live | [E] Edge | [S] Start | [R] Radio | [F] Filter",
     };
 
+    let mut spans = vec![
+        Span::styled(" [1-6] Page ", Style::default().fg(theme.primary)),
+        Span::styled("| ", Style::default().fg(theme.divider)),
+        Span::styled("[Tab] Next ", Style::default().fg(theme.secondary)),
+        Span::styled("| ", Style::default().fg(theme.divider)),
+        Span::styled(page_hint, Style::default().fg(theme.text)),
+        Span::styled(" | ", Style::default().fg(theme.divider)),
+    ];
+    if wide {
+        spans.push(Span::styled(
+            "[a] Manual ",
+            Style::default().fg(Color::Rgb(192, 132, 252)),
+        ));
+        spans.push(Span::styled("| ", Style::default().fg(theme.divider)));
+    }
+    spans.push(Span::styled(
+        if live {
+            "[Enter] Relaunch/Apply "
+        } else {
+            "[Enter] Launch Video "
+        },
+        Style::default()
+            .fg(Color::Rgb(52, 211, 153))
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled("| ", Style::default().fg(theme.divider)));
+    spans.push(Span::styled("[Esc] Close ", Style::default().fg(theme.text_dim)));
+
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" [1-6] Page ", Style::default().fg(theme.primary)),
-            Span::styled("| ", Style::default().fg(theme.divider)),
-            Span::styled("[Tab] Next ", Style::default().fg(theme.secondary)),
-            Span::styled("| ", Style::default().fg(theme.divider)),
-            Span::styled(page_hint, Style::default().fg(theme.text)),
-            Span::styled(" | ", Style::default().fg(theme.divider)),
-            Span::styled("[a] Manual ", Style::default().fg(Color::Rgb(192, 132, 252))),
-            Span::styled("| ", Style::default().fg(theme.divider)),
-            Span::styled(
-                if live {
-                    "[Enter] Relaunch/Apply "
-                } else {
-                    "[Enter] Launch Video "
-                },
-                Style::default()
-                    .fg(Color::Rgb(52, 211, 153))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("| ", Style::default().fg(theme.divider)),
-            Span::styled("[Esc] Close ", Style::default().fg(theme.text_dim)),
-        ]))
-        .alignment(Alignment::Center),
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
         area,
     );
 }

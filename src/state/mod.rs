@@ -6,7 +6,7 @@ use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
 use crate::config::{
-    Config, PerformanceMode, Player, Quality, SponsorBlockMode, VideoShaderMode,
+    Config, PerformanceMode, PicturePreset, Player, Quality, SponsorBlockMode, VideoShaderMode,
 };
 use crate::db::cache::VideoItem;
 use crate::db::sync::{
@@ -402,6 +402,17 @@ impl AppState {
             .iter()
             .position(|&q| q == config.quality)
             .unwrap_or(0);
+        let init_pic = config.picture.active_grade();
+        let init_live_playback = LivePlaybackControlState {
+            sub_visible: config.subtitles_enabled,
+            brightness: init_pic.brightness,
+            contrast: init_pic.contrast,
+            saturation: init_pic.saturation,
+            gamma: init_pic.gamma,
+            hue: init_pic.hue,
+            sharpness: init_pic.sharpness,
+            ..Default::default()
+        };
 
         Self {
             screen: Screen::Home,
@@ -515,7 +526,7 @@ impl AppState {
             active_playback_dur: 0.0,
             active_session_id: 0,
             sponsor_skips_session: 0,
-            live_playback: LivePlaybackControlState::default(),
+            live_playback: init_live_playback,
             stream_ladder_cache: HashMap::new(),
 
             analytics: UserAnalytics::default(),
@@ -603,8 +614,15 @@ impl AppState {
     }
 
     pub fn reset_live_playback(&mut self) {
+        let pic = self.config.picture.active_grade();
         self.live_playback = LivePlaybackControlState {
             sub_visible: self.config.subtitles_enabled,
+            brightness: pic.brightness,
+            contrast: pic.contrast,
+            saturation: pic.saturation,
+            gamma: pic.gamma,
+            hue: pic.hue,
+            sharpness: pic.sharpness,
             ..Default::default()
         };
     }
@@ -624,10 +642,45 @@ impl AppState {
             }
             LiveIpcEvent::OnTop(v) => self.live_playback.ontop = v,
             LiveIpcEvent::LoopVideo(v) => self.live_playback.loop_video = v,
-            LiveIpcEvent::Brightness(v) => self.live_playback.brightness = v,
-            LiveIpcEvent::Contrast(v) => self.live_playback.contrast = v,
-            LiveIpcEvent::Saturation(v) => self.live_playback.saturation = v,
-            LiveIpcEvent::Gamma(v) => self.live_playback.gamma = v,
+            LiveIpcEvent::Brightness(v) => {
+                if !self.live_playback.picture_bypass {
+                    self.live_playback.brightness = v;
+                }
+            }
+            LiveIpcEvent::Contrast(v) => {
+                if !self.live_playback.picture_bypass {
+                    self.live_playback.contrast = v;
+                }
+            }
+            LiveIpcEvent::Saturation(v) => {
+                if !self.live_playback.picture_bypass {
+                    self.live_playback.saturation = v;
+                }
+            }
+            LiveIpcEvent::Gamma(v) => {
+                if !self.live_playback.picture_bypass {
+                    self.live_playback.gamma = v;
+                }
+            }
+            LiveIpcEvent::Hue(v) => {
+                if !self.live_playback.picture_bypass {
+                    self.live_playback.hue = v;
+                }
+            }
+            LiveIpcEvent::Sharpness(v) => {
+                if !self.live_playback.picture_bypass {
+                    self.live_playback.sharpness = v;
+                }
+            }
+            LiveIpcEvent::VideoZoom(z) => self.live_playback.video_zoom = z,
+            LiveIpcEvent::Panscan(p) => self.live_playback.panscan = p,
+            LiveIpcEvent::AspectOverride(a) => self.live_playback.aspect_override = a,
+            LiveIpcEvent::VideoRotate(deg) => self.live_playback.video_rotate = deg,
+            LiveIpcEvent::MirrorX(m) => self.live_playback.mirror_x = m,
+            LiveIpcEvent::Fullscreen(f) => self.live_playback.fullscreen = f,
+            LiveIpcEvent::PitchCorrection(p) => self.live_playback.pitch_correction = p,
+            LiveIpcEvent::AbLoopA(a) => self.live_playback.ab_loop_a = a,
+            LiveIpcEvent::AbLoopB(b) => self.live_playback.ab_loop_b = b,
             LiveIpcEvent::CacheBytes(b) => self.live_playback.cache_bytes = b,
             LiveIpcEvent::LiveCacheTelemetry {
                 cache_ahead_secs,
@@ -1708,6 +1761,87 @@ impl StudioPage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentProfile {
+    Cinema24p,
+    Sports60p,
+    Anime2x,
+    CrispCode,
+    CoolBattery,
+}
+
+#[allow(dead_code)]
+impl ContentProfile {
+    pub const ALL: [Self; 5] = [
+        Self::Cinema24p,
+        Self::Sports60p,
+        Self::Anime2x,
+        Self::CrispCode,
+        Self::CoolBattery,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cinema24p => "Cinema 24p (Reference 4K + Cadence)",
+            Self::Sports60p => "Sports 60p (VP9 + 120Hz Smooth)",
+            Self::Anime2x => "Anime 2x (Anime4K Line Restore)",
+            Self::CrispCode => "Crisp Code / Text (Light CAS)",
+            Self::CoolBattery => "Cool Battery (Zero Shaders)",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Cinema24p => "Cinema 24p",
+            Self::Sports60p => "Sports 60p",
+            Self::Anime2x => "Anime 2x",
+            Self::CrispCode => "Crisp Code",
+            Self::CoolBattery => "Cool Battery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventLogFilter {
+    #[default]
+    All,
+    Stalls,
+    Skips,
+    Changes,
+}
+
+#[allow(dead_code)]
+impl EventLogFilter {
+    pub const ALL: [Self; 4] = [Self::All, Self::Stalls, Self::Skips, Self::Changes];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Stalls => "Stalls",
+            Self::Skips => "Skips",
+            Self::Changes => "Changes",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Stalls,
+            Self::Stalls => Self::Skips,
+            Self::Skips => Self::Changes,
+            Self::Changes => Self::All,
+        }
+    }
+
+    pub fn matches(self, kind: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Stalls => matches!(kind, "STALL" | "ABR"),
+            Self::Skips => kind == "SKIP",
+            Self::Changes => !matches!(kind, "STALL" | "SKIP"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StudioNavState {
     pub page: StudioPage,
@@ -1716,7 +1850,11 @@ pub struct StudioNavState {
     pub sub_track_scroll: usize,
     pub sponsor_cursor: usize,
     pub sponsor_scroll: usize,
+    pub captions_use_chapters: Option<bool>,
+    pub chapter_cursor: usize,
+    pub chapter_scroll: usize,
     pub event_log_scroll: usize,
+    pub event_log_filter: EventLogFilter,
 }
 
 #[derive(Debug, Clone)]
@@ -1785,6 +1923,61 @@ impl TelemetryHistory {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SleepTimerMode {
+    #[default]
+    Off,
+    Mins15,
+    Mins30,
+    Mins45,
+    Mins60,
+    EndOfVideo,
+}
+
+#[allow(dead_code)]
+impl SleepTimerMode {
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Mins15,
+        Self::Mins30,
+        Self::Mins45,
+        Self::Mins60,
+        Self::EndOfVideo,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Mins15 => "15m",
+            Self::Mins30 => "30m",
+            Self::Mins45 => "45m",
+            Self::Mins60 => "60m",
+            Self::EndOfVideo => "EOF",
+        }
+    }
+
+    pub const fn duration_secs(self) -> Option<u64> {
+        match self {
+            Self::Off | Self::EndOfVideo => None,
+            Self::Mins15 => Some(15 * 60),
+            Self::Mins30 => Some(30 * 60),
+            Self::Mins45 => Some(45 * 60),
+            Self::Mins60 => Some(60 * 60),
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Mins15,
+            Self::Mins15 => Self::Mins30,
+            Self::Mins30 => Self::Mins45,
+            Self::Mins45 => Self::Mins60,
+            Self::Mins60 => Self::EndOfVideo,
+            Self::EndOfVideo => Self::Off,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PlayOptionsHit {
@@ -1793,11 +1986,20 @@ pub enum PlayOptionsHit {
     FocusSection(usize),
     SelectQuality(usize),
     SelectPlayer(Player),
+    CycleCodecPriority,
+    SetCodecPriority(crate::config::CodecPriority),
+    SetMaxFpsCap(Option<u16>),
+    RefreshStreamLadder,
+    SetNetworkMode(crate::config::NetworkMode),
     ToggleDub,
     CycleDubLang,
     SelectDubLang(String),
     ToggleMultistreams,
     ToggleLoudnorm,
+    SelectAudioEq(crate::config::AudioEqPreset),
+    CycleAudioEq,
+    ToggleAudioChannelMode,
+    ToggleAudioHighpass,
     AudioDelayDelta(i32),
     SetAudioDelay(i32),
     SetAudioDelayRatio,
@@ -1806,6 +2008,13 @@ pub enum PlayOptionsHit {
     CycleSubStyle,
     SelectSubPreset(SubtitlePreset),
     ToggleSubCollision,
+    SetDefaultSubLang(&'static str),
+    SubFontSizeDelta(i32),
+    SubBorderDelta(f32),
+    SubMarginYDelta(i32),
+    SetSubBackdrop(f32),
+    SetSubColor(&'static str),
+    SetCaptionsListTab(bool),
     SubDelayDelta(i32),
     SetSubDelay(i32),
     SelectSubTrack(i64),
@@ -1816,10 +2025,12 @@ pub enum PlayOptionsHit {
     ScrollSponsorSegments(i8),
     SelectShader(VideoShaderMode),
     SetPerformanceMode(PerformanceMode),
+    ApplyContentProfile(ContentProfile),
     ToggleManual(ManualToggle),
     SeedManualFrom(PerformanceMode),
     DownloadNeuralShaders,
     CycleLiveMode,
+    SetLiveMode(crate::config::LiveStreamMode),
     CycleNetworkMode,
     ToggleForceIpv4,
     ToggleAutoAbr,
@@ -1829,17 +2040,39 @@ pub enum PlayOptionsHit {
     LaunchAudioRadio,
     ScrollAudioTracks(i8),
     ScrollEventLog(i8),
+    SetEventLogFilter(EventLogFilter),
+    ClearEventLog,
     TogglePause,
     SeekDelta(f64),
     SeekRatio(f64),
+    FrameStep(i8),
     ChapterStep(i32),
     SetSpeed(f64),
+    SpeedDelta(f64),
+    TogglePitchCorrection,
     VolumeDelta(i64),
+    SetVolume(i64),
     SetVolumeRatio,
     ToggleMute,
+    MarkAbLoopA,
+    MarkAbLoopB,
+    ClearAbLoop,
+    TakeScreenshot,
+    SetSleepTimer(SleepTimerMode),
+    CycleSleepTimer,
+    ToggleFullscreen,
     PictureDelta(&'static str, i64),
     SetPictureRatio(&'static str),
+    SelectPicturePreset(PicturePreset),
+    SaveCustomPicturePreset,
+    TogglePictureBypass,
     ResetPicture,
+    ZoomDelta(f64),
+    SetAspectOverride(&'static str),
+    TogglePanscan,
+    CycleRotate,
+    ToggleMirrorX,
+    ResetGeometry,
     ToggleOnTop,
     ToggleLoop,
     LaunchOrRelaunch,
@@ -1877,11 +2110,25 @@ pub struct LivePlaybackControlState {
     pub active_aid: Option<i64>,
     pub active_sid: Option<i64>,
     pub ontop: bool,
+    pub fullscreen: bool,
     pub loop_video: bool,
+    pub pitch_correction: bool,
+    pub ab_loop_a: Option<f64>,
+    pub ab_loop_b: Option<f64>,
+    pub sleep_timer_mode: SleepTimerMode,
+    pub sleep_timer_deadline: Option<Instant>,
     pub brightness: i64,
     pub contrast: i64,
     pub saturation: i64,
     pub gamma: i64,
+    pub hue: i64,
+    pub sharpness: i64,
+    pub picture_bypass: bool,
+    pub video_zoom: f64,
+    pub panscan: f64,
+    pub aspect_override: String,
+    pub video_rotate: u16,
+    pub mirror_x: bool,
     pub cache_bytes: u64,
     pub cache_ahead_secs: f64,
     pub seekable_end_secs: f64,
@@ -1933,11 +2180,25 @@ impl Default for LivePlaybackControlState {
             active_aid: None,
             active_sid: None,
             ontop: false,
+            fullscreen: false,
             loop_video: false,
+            pitch_correction: true,
+            ab_loop_a: None,
+            ab_loop_b: None,
+            sleep_timer_mode: SleepTimerMode::Off,
+            sleep_timer_deadline: None,
             brightness: 0,
             contrast: 0,
             saturation: 0,
             gamma: 0,
+            hue: 0,
+            sharpness: 0,
+            picture_bypass: false,
+            video_zoom: 0.0,
+            panscan: 0.0,
+            aspect_override: "-1".to_string(),
+            video_rotate: 0,
+            mirror_x: false,
             cache_bytes: 0,
             cache_ahead_secs: 0.0,
             seekable_end_secs: 0.0,

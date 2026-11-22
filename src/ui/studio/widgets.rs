@@ -478,14 +478,151 @@ pub fn render_tone_curve_lines(
     lines
 }
 
-/// Interactive centered bipolar slider (`-max .. 0 .. +max`) rendered inside `area`.
+/// Braille compression transfer curve comparing 1:1 studio dynamic range vs `dynaudnorm`.
+pub fn render_loudnorm_curve_lines(
+    enabled: bool,
+    cols: usize,
+    rows: usize,
+    theme: &ThemePalette,
+) -> Vec<Line<'static>> {
+    let plot_cols = cols.saturating_sub(7).max(8);
+    let plot_rows = rows.clamp(3, 5);
+    let mut canvas = BrailleCanvas::new(plot_cols, plot_rows);
+
+    // 1:1 linear diagonal reference (dim tag 2)
+    for x in 0..canvas.px_w {
+        let nx = x as f64 / (canvas.px_w.saturating_sub(1).max(1)) as f64;
+        let y = ((1.0 - nx) * (canvas.px_h - 1) as f64).round() as usize;
+        canvas.plot_point(x, y, 2);
+    }
+
+    if enabled {
+        let mut prev_y = None;
+        for x in 0..canvas.px_w {
+            let nx = x as f64 / (canvas.px_w.saturating_sub(1).max(1)) as f64;
+            let comp = (nx.powf(0.58) * 0.90 + 0.06).clamp(0.0, 0.96);
+            let y = ((1.0 - comp) * (canvas.px_h - 1) as f64).round() as i32;
+            if let Some(py) = prev_y {
+                canvas.draw_segment((x - 1) as i32, py, x as i32, y, 1);
+            } else {
+                canvas.plot_point(x, (y as usize).min(canvas.px_h - 1), 1);
+            }
+            prev_y = Some(y);
+        }
+    }
+
+    let curve_col = if enabled {
+        Color::Rgb(52, 211, 153)
+    } else {
+        theme.text_dim
+    };
+
+    let mut lines = Vec::with_capacity(plot_rows);
+    for r in 0..plot_rows {
+        let lbl = if r == 0 {
+            "  0dB│"
+        } else if r == plot_rows / 2 {
+            "-18dB│"
+        } else if r == plot_rows - 1 {
+            "-36dB└"
+        } else {
+            "     │"
+        };
+        let mut spans = vec![Span::styled(
+            format!(" {lbl}"),
+            Style::default().fg(theme.text_dim),
+        )];
+        for c in 0..plot_cols {
+            let ch = char::from_u32(0x2800 + canvas.bits[r][c] as u32).unwrap_or(' ');
+            let fg = if (canvas.tags[r][c] & 1) != 0 {
+                curve_col
+            } else if (canvas.tags[r][c] & 2) != 0 {
+                if enabled {
+                    theme.divider
+                } else {
+                    theme.secondary
+                }
+            } else {
+                theme.divider
+            };
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(fg)));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Pre-launch Braille baseline chart displaying configured target ceiling instead of an empty void.
 #[allow(clippy::too_many_arguments)]
-pub fn render_bipolar_slider(
+pub fn render_braille_standby_chart_lines(
+    cols: usize,
+    rows: usize,
+    y_max: f64,
+    target_val: f64,
+    unit_suffix: &str,
+    target_caption: &str,
+    col: Color,
+    theme: &ThemePalette,
+) -> Vec<Line<'static>> {
+    let label_w = 6usize;
+    let plot_cols = cols.saturating_sub(label_w + 1).max(8);
+    let plot_rows = rows.max(2);
+    let max_v = y_max.max(target_val * 1.25).max(1.0);
+    let mut canvas = BrailleCanvas::new(plot_cols, plot_rows);
+
+    let y_px = ((1.0 - (target_val / max_v).clamp(0.05, 0.95)) * (canvas.px_h - 1) as f64).round()
+        as usize;
+    for x in 0..canvas.px_w {
+        if x % 4 < 2 {
+            canvas.plot_point(x, y_px, 1);
+        }
+    }
+
+    let caption_row = plot_rows / 2;
+    let cap_fit = truncate_words(target_caption, plot_cols.saturating_sub(2));
+    let mut out = Vec::with_capacity(plot_rows);
+    for r in 0..plot_rows {
+        let tick_lbl = if r == 0 {
+            format!("{:>4.0}{}", max_v, unit_suffix)
+        } else if r == plot_rows / 2 && plot_rows >= 3 {
+            format!("{:>4.0}{}", max_v * 0.5, unit_suffix)
+        } else if r == plot_rows - 1 {
+            format!("{:>4}{}", 0, unit_suffix)
+        } else {
+            String::new()
+        };
+        let axis_char = if r == plot_rows - 1 { '└' } else { '│' };
+        let mut spans = vec![Span::styled(
+            format!("{tick_lbl:>label_w$}{axis_char}"),
+            Style::default().fg(theme.text_dim),
+        )];
+        if r == caption_row && plot_cols > 12 {
+            spans.push(Span::styled(
+                format!(" {cap_fit}"),
+                Style::default().fg(col).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            for c in 0..plot_cols {
+                let mask = canvas.bits[r][c];
+                let ch = char::from_u32(0x2800 + mask as u32).unwrap_or(' ');
+                let fg = if mask == 0 { theme.divider } else { col };
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(fg)));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// Interactive slider (`min_val ..= max_val`) with center neutral mark and exact hitboxes.
+#[allow(clippy::too_many_arguments)]
+pub fn render_bipolar_slider_range(
     frame: &mut Frame,
     area: Rect,
     label: &str,
     value: i32,
-    max_abs: i32,
+    min_val: i32,
+    max_val: i32,
     focused: bool,
     bar_hit: PlayOptionsHit,
     dec_hit: PlayOptionsHit,
@@ -493,26 +630,27 @@ pub fn render_bipolar_slider(
     hitboxes: &mut Vec<(Rect, PlayOptionsHit)>,
     theme: &ThemePalette,
 ) {
-    if area.width < 22 || area.height == 0 {
+    if area.width < 28 || area.height == 0 {
         return;
     }
-    let lbl_w = 11usize;
-    let val_w = 6usize;
     let btn_w = 3usize; // "[-]" "[+]"
+    // Prefix: " " (1) + label (10) + " " (1) + value (4) + "  " (2) = 18 chars
+    let prefix_w = 18usize;
     let rail_w = (area.width as usize)
-        .saturating_sub(lbl_w + val_w + btn_w * 2 + 5)
-        .max(7);
+        .saturating_sub(prefix_w + btn_w * 2 + 3)
+        .max(5);
 
-    let x_lbl = area.x;
-    let x_val = x_lbl + lbl_w as u16 + 1;
-    let x_dec = x_val + val_w as u16 + 1;
+    let x_dec = area.x + prefix_w as u16;
     let x_rail = x_dec + btn_w as u16 + 1;
     let x_inc = x_rail + rail_w as u16 + 1;
 
-    let norm = ((value as f64 / max_abs.max(1) as f64) + 1.0) * 0.5;
-    let handle_pos = ((norm.clamp(0.0, 1.0) * (rail_w.saturating_sub(1)) as f64).round() as usize)
+    let span = (max_val - min_val).max(1) as f64;
+    let norm = ((value.clamp(min_val, max_val) - min_val) as f64 / span).clamp(0.0, 1.0);
+    let zero_norm = ((0 - min_val) as f64 / span).clamp(0.0, 1.0);
+    let handle_pos = ((norm * (rail_w.saturating_sub(1)) as f64).round() as usize)
         .min(rail_w.saturating_sub(1));
-    let mid = rail_w / 2;
+    let mid = ((zero_norm * (rail_w.saturating_sub(1)) as f64).round() as usize)
+        .min(rail_w.saturating_sub(1));
 
     let mut rail_spans = Vec::with_capacity(rail_w + 2);
     for i in 0..rail_w {
@@ -555,10 +693,14 @@ pub fn render_bipolar_slider(
     } else {
         Color::Rgb(251, 191, 36)
     };
+    let lbl_fit = truncate_words(label, 10);
 
     let mut spans = vec![
-        Span::styled(format!(" {label:<10}"), lbl_style),
-        Span::styled(format!(" {value:>+4}  "), Style::default().fg(val_col).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {lbl_fit:<10}"), lbl_style),
+        Span::styled(
+            format!(" {value:>+4}  "),
+            Style::default().fg(val_col).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("[-]", Style::default().fg(theme.secondary)),
         Span::raw(" "),
     ];
@@ -573,6 +715,92 @@ pub fn render_bipolar_slider(
     if x_inc + btn_w as u16 <= area.x + area.width {
         hitboxes.push((Rect::new(x_inc, area.y, btn_w as u16, 1), inc_hit));
     }
+}
+
+/// Interactive centered bipolar slider (`-max_abs .. 0 .. +max_abs`) rendered inside `area`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_bipolar_slider(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: i32,
+    max_abs: i32,
+    focused: bool,
+    bar_hit: PlayOptionsHit,
+    dec_hit: PlayOptionsHit,
+    inc_hit: PlayOptionsHit,
+    hitboxes: &mut Vec<(Rect, PlayOptionsHit)>,
+    theme: &ThemePalette,
+) {
+    render_bipolar_slider_range(
+        frame,
+        area,
+        label,
+        value,
+        -max_abs,
+        max_abs,
+        focused,
+        bar_hit,
+        dec_hit,
+        inc_hit,
+        hitboxes,
+        theme,
+    );
+}
+
+/// Render clickable `[pill]` items on a single row with guaranteed 1-space separation
+/// and zero mid-word cutoff or `][` concatenation.
+pub fn render_inline_pills(
+    frame: &mut Frame,
+    area: Rect,
+    prefix: Option<(&str, Style)>,
+    pills: &[(String, Style, PlayOptionsHit)],
+    hitboxes: &mut Vec<(Rect, PlayOptionsHit)>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let max_x = area.x + area.width;
+    let mut x_cur = area.x;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    if let Some((pfx, pfx_style)) = prefix {
+        let p_w = pfx.chars().count() as u16;
+        if x_cur + p_w <= max_x {
+            spans.push(Span::styled(pfx.to_string(), pfx_style));
+            x_cur += p_w;
+        }
+    }
+
+    for (idx, (label, style, hit)) in pills.iter().enumerate() {
+        if idx > 0 || prefix.is_some() {
+            if x_cur + 1 > max_x {
+                break;
+            }
+            spans.push(Span::raw(" "));
+            x_cur += 1;
+        }
+        let w = label.chars().count() as u16;
+        if x_cur + w > max_x {
+            break;
+        }
+        hitboxes.push((Rect::new(x_cur, area.y, w, 1), hit.clone()));
+        spans.push(Span::styled(label.clone(), *style));
+        x_cur += w;
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Compute normalized `(black_floor_pct, midtone_pct, white_clip_pct)` from Luma EQ params.
+pub fn compute_luma_scope(brightness: i64, contrast: i64, gamma: i64) -> (f64, f64, f64) {
+    let g_exp = (1.0 - (gamma as f64) / 100.0).clamp(0.35, 2.2);
+    let c_mul = (1.0 + (contrast as f64) / 100.0).clamp(0.35, 2.0);
+    let b_off = (brightness as f64) / 160.0;
+    let eval = |x: f64| -> f64 {
+        (((x.powf(g_exp) - 0.5) * c_mul + 0.5 + b_off).clamp(0.0, 1.0)) * 100.0
+    };
+    (eval(0.0), eval(0.5), eval(1.0))
 }
 
 pub fn segmented_gauge_line(
@@ -606,8 +834,9 @@ pub fn segmented_gauge_line(
     ])
 }
 
-pub fn sponsor_timeline_spans(
+pub fn sponsor_timeline_with_chapters_spans(
     segments: &[SponsorSegment],
+    chapter_starts: &[f64],
     pos_secs: f64,
     dur_secs: f64,
     width: usize,
@@ -622,8 +851,19 @@ pub fn sponsor_timeline_spans(
     let playhead_col = ((pos_secs / dur_secs).clamp(0.0, 1.0) * (width.saturating_sub(1)) as f64)
         .round() as usize;
 
+    let mut chapter_cols = vec![false; width];
+    for &st in chapter_starts {
+        if st > 1.0 && st < dur_secs {
+            let c = ((st / dur_secs).clamp(0.0, 1.0) * (width.saturating_sub(1)) as f64).round()
+                as usize;
+            if let Some(slot) = chapter_cols.get_mut(c) {
+                *slot = true;
+            }
+        }
+    }
+
     let mut out = Vec::with_capacity(width);
-    for col in 0..width {
+    for (col, &has_chapter) in chapter_cols.iter().enumerate().take(width) {
         if col == playhead_col {
             out.push(Span::styled(
                 "▼",
@@ -640,6 +880,8 @@ pub fn sponsor_timeline_spans(
             .map(|s| s.category.as_str());
         if let Some(cat) = seg_cat {
             out.push(Span::styled("█", Style::default().fg(sponsor_color(cat))));
+        } else if has_chapter {
+            out.push(Span::styled("┆", Style::default().fg(theme.secondary)));
         } else {
             out.push(Span::styled("─", Style::default().fg(theme.divider)));
         }

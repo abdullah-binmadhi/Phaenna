@@ -361,7 +361,7 @@ mod tests {
         }
 
         let expected_markers = [
-            (StudioPage::Deck, "Picture Equalizer & Live Tone Curve"),
+            (StudioPage::Deck, "Picture Equalizer, Presets & Geometry"),
             (StudioPage::StreamNet, "Resolved Bitrate Ladder vs Throughput"),
             (StudioPage::MasteringGpu, "Active GPU Signal-Flow Pipeline"),
             (StudioPage::AudioSync, "Live Audio Track Explorer"),
@@ -420,5 +420,225 @@ mod tests {
         }
         assert_eq!(st.live_playback.telemetry_history.cache_speed_kbps.len(), TELEMETRY_CAPACITY);
         assert_eq!(st.live_playback.telemetry_history.events.len(), 32);
+    }
+
+    #[test]
+    fn test_deck_zero_concatenation_zero_dead_space_and_all_new_features() {
+        for (w, h) in [(100, 28), (136, 36), (156, 40)] {
+            let mut st = seed_rich_live_state();
+            st.studio.page = StudioPage::Deck;
+            st.config.picture.preset = crate::config::PicturePreset::Cinema;
+            st.live_playback.sleep_timer_mode = crate::state::SleepTimerMode::Mins30;
+            st.live_playback.ab_loop_a = Some(120.0);
+            st.live_playback.ab_loop_b = Some(156.0);
+
+            let modal = play_options_modal_rect(Rect::new(0, 0, w, h));
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| render_studio_modal(f, &mut st)).unwrap();
+
+            let buf = term.backend().buffer();
+            let mut rows_text = Vec::new();
+            for y in modal.y..modal.y + modal.height {
+                let line: String = (modal.x..modal.x + modal.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect();
+                assert!(
+                    !line.contains("]["),
+                    "Found concatenated pills '][' at {w}x{h} y={y}: {line:?}"
+                );
+                rows_text.push(line);
+            }
+
+            let full = rows_text.join("\n");
+            for needle in [
+                "Presets [g]:",
+                "[Cinema]",
+                "[OLED]",
+                "[Daylight]",
+                "[Noir]",
+                "Brightness",
+                "Saturation",
+                "Grade Scope",
+                "Set A",
+                "Sleep Timer",
+            ] {
+                assert!(
+                    full.contains(needle) || full.contains("A:02:00"),
+                    "Missing '{needle}' on Deck at {w}x{h}"
+                );
+            }
+
+            if h >= 36 {
+                for needle in ["Hue / Tint", "Sharpness", "Zoom:", "[Reset Geom]", "[Save Custom]", "Screenshot"] {
+                    assert!(
+                        full.contains(needle),
+                        "Missing expanded Deck control '{needle}' at {w}x{h}"
+                    );
+                }
+
+                // Verify bottom action rows of both Deck panes sit at bottom (no trailing empty rows)
+                let save_row = rows_text
+                    .iter()
+                    .position(|l| l.contains("[Save Custom]"))
+                    .expect("Missing [Save Custom] row");
+                let launch_row = rows_text
+                    .iter()
+                    .position(|l| l.contains("[Enter Relaunch / Apply]"))
+                    .expect("Missing [Enter Relaunch / Apply] row");
+                assert_eq!(
+                    save_row, launch_row,
+                    "Left and Right pane bottom action rows should align flush at {w}x{h}"
+                );
+                // Immediately below the shared bottom action row is the pane bottom border (`╰` / `─`)
+                assert!(
+                    rows_text[save_row + 1].contains('╰') || rows_text[save_row + 1].contains('─'),
+                    "Unexpected dead rows below Deck panes at {w}x{h}: {:?}",
+                    &rows_text[save_row..rows_text.len().min(save_row + 4)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pages_2_to_6_zero_concatenation_zero_cutoff_and_new_features() {
+        use crate::db::cache::{VideoChapter, VideoItem};
+        let pages_with_markers = [
+            (
+                StudioPage::StreamNet,
+                vec!["Codec [C]:", "FPS Cap :", "Data Est :", "Audio:", "Auth Vault", "[Refresh Ladder (r)]"],
+            ),
+            (
+                StudioPage::MasteringGpu,
+                vec!["Profiles:", "[Cinema 24p]", "Chain (", "Thermal Verdict:", "Inspector [5K 2x Upscale]", "Use <=1080p for cool 4K streams.", "Flags:", "Delta vs BAL:"],
+            ),
+            (
+                StudioPage::AudioSync,
+                vec!["EQ [e]:", "60Hz", "250Hz", "Route :", "Transfer:", "Quick Offset:", "Device Sync :"],
+            ),
+            (
+                StudioPage::CaptionsSkip,
+                vec!["Default Lang:", "Font:", "Margin:", "Ink :", "Sponsor", "Outros [o]:", "Jump List [u]:"],
+            ),
+            (
+                StudioPage::LiveTelemetry,
+                vec!["Pipeline :", "Render Spec :", "Session IPC :", "Live [v]:", "DVR Cmd :", "Events [F]:"],
+            ),
+        ];
+
+        for is_live in [false, true] {
+            for (w, h) in [(100, 28), (136, 36), (156, 40)] {
+                let mut st = if is_live {
+                    seed_rich_live_state()
+                } else {
+                    let mut pre = AppState::new(Config::default());
+                    pre.detail_video = Some(VideoItem {
+                        id: "dQw4w9WgXcQ".into(),
+                        title: "Shooting with an old MFT camera.".into(),
+                        duration: Some(1444),
+                        chapters: Some(vec![
+                            VideoChapter { start_time: 0.0, end_time: 310.0, title: "01 Intro & Setup".into() },
+                            VideoChapter { start_time: 310.0, end_time: 740.0, title: "02 Sensor Test".into() },
+                            VideoChapter { start_time: 740.0, end_time: 1444.0, title: "03 Verdict".into() },
+                        ]),
+                        ..Default::default()
+                    });
+                    pre.screen = crate::state::Screen::Detail;
+                    pre
+                };
+                if is_live {
+                    st.detail_video = Some(VideoItem {
+                        id: "dQw4w9WgXcQ".into(),
+                        title: "Shooting with an old MFT camera.".into(),
+                        duration: Some(1444),
+                        chapters: Some(vec![
+                            VideoChapter { start_time: 0.0, end_time: 310.0, title: "01 Intro & Setup".into() },
+                            VideoChapter { start_time: 310.0, end_time: 1444.0, title: "02 Sensor Test".into() },
+                        ]),
+                        ..Default::default()
+                    });
+                    st.screen = crate::state::Screen::Detail;
+                }
+
+                let modal = play_options_modal_rect(Rect::new(0, 0, w, h));
+                for (page, needles) in &pages_with_markers {
+                    st.studio.page = *page;
+                    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| render_studio_modal(f, &mut st)).unwrap();
+
+                    let buf = term.backend().buffer();
+                    let mut rows_text = Vec::new();
+                    let mut split_char_col = modal.width as usize / 2;
+                    for y in modal.y..modal.y + modal.height {
+                        let line: String = (modal.x..modal.x + modal.width)
+                            .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                            .collect();
+                        if y > modal.y + 4 {
+                            if let Some(byte_pos) = line.find("╮╭").or_else(|| line.find("╯╭")) {
+                                split_char_col = line[..byte_pos].chars().count() + 1;
+                            }
+                        }
+                        assert!(
+                            !line.contains("]["),
+                            "Concatenated '][' on {page:?} live={is_live} at {w}x{h} y={y}: {line:?}"
+                        );
+                        assert!(
+                            !line.contains(":["),
+                            "Concatenated ':[' on {page:?} live={is_live} at {w}x{h} y={y}: {line:?}"
+                        );
+                        rows_text.push(line);
+                    }
+                    let full = rows_text.join("\n");
+                    let mut left_rows = Vec::new();
+                    let mut right_rows = Vec::new();
+                    for line in &rows_text {
+                        let chars: Vec<char> = line.chars().collect();
+                        let cut = split_char_col.min(chars.len());
+                        left_rows.push(chars[..cut].iter().collect::<String>());
+                        right_rows.push(chars[cut..].iter().collect::<String>());
+                    }
+                    let strip_borders = |s: String| -> String {
+                        s.chars()
+                            .map(|c| {
+                                if matches!(c, '│' | '╭' | '╮' | '╰' | '╯') {
+                                    ' '
+                                } else {
+                                    c
+                                }
+                            })
+                            .collect::<String>()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    let left_norm = strip_borders(left_rows.join(" "));
+                    let right_norm = strip_borders(right_rows.join(" "));
+                    let normalized: String = format!("{left_norm} {right_norm}");
+                    assert!(
+                        !full.contains("Use <=1080p for..."),
+                        "Broken truncation returned on {page:?} at {w}x{h}"
+                    );
+                    if !is_live && *page == StudioPage::CaptionsSkip {
+                        assert!(
+                            full.contains("01 Intro & Setup"),
+                            "Missing automatic Chapters fallback when 0 SB segments at {w}x{h}"
+                        );
+                    }
+                    if !is_live && *page == StudioPage::LiveTelemetry {
+                        assert!(
+                            full.contains("Standby"),
+                            "Missing pre-launch Standby target baseline on Page 6 at {w}x{h}"
+                        );
+                    }
+                    if h >= 36 {
+                        for needle in needles {
+                            assert!(
+                                full.contains(needle) || normalized.contains(needle),
+                                "Missing '{needle}' on {page:?} live={is_live} at {w}x{h}\nRendered:\n{full}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

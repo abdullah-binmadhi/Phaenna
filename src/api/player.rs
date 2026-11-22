@@ -2,8 +2,8 @@
 
 use crate::api::ytdlp::SelectedStreamPair;
 use crate::config::{
-    Config, DubPreference, LiveStreamMode, ManualMasteringConfig, MotionMode, NetworkMode,
-    PerformanceMode, Player, VideoShaderMode,
+    AudioChannelMode, AudioEqPreset, Config, DubPreference, LiveStreamMode, ManualMasteringConfig,
+    MotionMode, NetworkMode, PerformanceMode, PictureGrade, Player, VideoShaderMode,
 };
 use crate::error::{AppError, Result};
 use crate::services::shaders::{
@@ -131,16 +131,52 @@ pub struct PlayOptions {
     pub dub_lang: String,
     pub audio_multistreams: bool,
     pub audio_loudnorm: bool,
+    pub audio_filter_chain: Option<String>,
     pub is_live: bool,
     pub live_mode: LiveStreamMode,
     pub live_from_start: bool,
     pub live_auto_catchup: bool,
     pub network_mode: NetworkMode,
     pub force_ipv4: bool,
+    pub picture: PictureGrade,
     pub direct_stream: Option<SelectedStreamPair>,
 }
 
 pub const LOUDNORM_FILTER: &str = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]";
+
+/// Compose one non-destructive FFmpeg/mpv `af` filter chain combining Highpass,
+/// 5-band parametric EQ, Night Loudnorm (`dynaudnorm`), and Mono downmix.
+pub fn build_mpv_audio_filter_chain(
+    eq: AudioEqPreset,
+    channel_mode: AudioChannelMode,
+    voice_highpass: bool,
+    loudnorm: bool,
+) -> Option<String> {
+    let mut nodes: Vec<String> = Vec::new();
+    if voice_highpass {
+        nodes.push("highpass=f=80".to_string());
+    }
+    if eq != AudioEqPreset::Flat {
+        const FREQS: [u32; 5] = [60, 250, 1000, 4000, 12000];
+        let gains = eq.band_gains_db();
+        for (freq, gain) in FREQS.into_iter().zip(gains) {
+            if gain != 0 {
+                nodes.push(format!("equalizer=f={freq}:t=q:w=1.2:g={gain}"));
+            }
+        }
+    }
+    if loudnorm {
+        nodes.push("dynaudnorm=f=150:g=15:p=0.9".to_string());
+    }
+    if channel_mode == AudioChannelMode::Mono {
+        nodes.push("pan=mono|c0=0.5*c0+0.5*c1".to_string());
+    }
+    if nodes.is_empty() {
+        None
+    } else {
+        Some(format!("lavfi=[{}]", nodes.join(",")))
+    }
+}
 
 const YOUTUBE_INPUT_CONF: &str = r#"# Phaenna YouTube-Parity Player Keybindings (works windowed & fullscreen)
 k cycle pause
@@ -616,7 +652,11 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     };
     flags.push(format!("alang={alang}"));
 
-    if opts.audio_loudnorm {
+    if let Some(ref af) = opts.audio_filter_chain {
+        if !af.trim().is_empty() {
+            flags.push(format!("af={af}"));
+        }
+    } else if opts.audio_loudnorm {
         flags.push(format!("af={LOUDNORM_FILTER}"));
     }
 
@@ -664,6 +704,26 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         ) {
             flags.push(flag.trim_start_matches("--").to_string());
         }
+    }
+
+    let g = opts.picture.clamped();
+    if g.brightness != 0 {
+        flags.push(format!("brightness={}", g.brightness));
+    }
+    if g.contrast != 0 {
+        flags.push(format!("contrast={}", g.contrast));
+    }
+    if g.saturation != 0 {
+        flags.push(format!("saturation={}", g.saturation));
+    }
+    if g.gamma != 0 {
+        flags.push(format!("gamma={}", g.gamma));
+    }
+    if g.hue != 0 {
+        flags.push(format!("hue={}", g.hue));
+    }
+    if g.sharpness != 0 {
+        flags.push(format!("sharpen={:.2}", g.sharpness as f64 / 50.0));
     }
 
     flags
@@ -868,12 +928,14 @@ mod tests {
             dub_lang: "en".to_string(),
             audio_multistreams: true,
             audio_loudnorm: true,
+            audio_filter_chain: None,
             is_live: false,
             live_mode: LiveStreamMode::BalancedLive,
             live_from_start: false,
             live_auto_catchup: true,
             network_mode: NetworkMode::Normal,
             force_ipv4: false,
+            picture: PictureGrade::default(),
             direct_stream: None,
         };
 
@@ -944,12 +1006,14 @@ mod tests {
             dub_lang: "ar".to_string(),
             audio_multistreams: true,
             audio_loudnorm: false,
+            audio_filter_chain: None,
             is_live: false,
             live_mode: LiveStreamMode::BalancedLive,
             live_from_start: false,
             live_auto_catchup: true,
             network_mode: NetworkMode::Normal,
             force_ipv4: false,
+            picture: PictureGrade::default(),
             direct_stream: None,
         };
 
@@ -987,12 +1051,14 @@ mod tests {
             dub_lang: "en".to_string(),
             audio_multistreams: true,
             audio_loudnorm: false,
+            audio_filter_chain: None,
             is_live: true,
             live_mode: LiveStreamMode::LowLatency,
             live_from_start: false,
             live_auto_catchup: true,
             network_mode: NetworkMode::Normal,
             force_ipv4: false,
+            picture: PictureGrade::default(),
             direct_stream: None,
         };
 
@@ -1033,12 +1099,14 @@ mod tests {
             dub_lang: "en".to_string(),
             audio_multistreams: true,
             audio_loudnorm: false,
+            audio_filter_chain: None,
             is_live: false,
             live_mode: LiveStreamMode::BalancedLive,
             live_from_start: false,
             live_auto_catchup: true,
             network_mode: NetworkMode::CongestedWifi,
             force_ipv4: true,
+            picture: PictureGrade::default(),
             direct_stream: None,
         };
 
@@ -1075,5 +1143,29 @@ mod tests {
             direct_args.last().unwrap(),
             "https://cdn.example.com/video_720p.webm"
         );
+    }
+
+    #[test]
+    fn test_build_mpv_audio_filter_chain_composition() {
+        assert!(build_mpv_audio_filter_chain(
+            AudioEqPreset::Flat,
+            AudioChannelMode::Stereo,
+            false,
+            false
+        )
+        .is_none());
+
+        let chain = build_mpv_audio_filter_chain(
+            AudioEqPreset::VoiceClarity,
+            AudioChannelMode::Mono,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(chain.starts_with("lavfi=["));
+        assert!(chain.contains("highpass=f=80"));
+        assert!(chain.contains("equalizer=f=4000:t=q:w=1.2:g=5"));
+        assert!(chain.contains("dynaudnorm=f=150:g=15:p=0.9"));
+        assert!(chain.contains("pan=mono|c0=0.5*c0+0.5*c1"));
     }
 }

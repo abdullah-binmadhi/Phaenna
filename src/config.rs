@@ -214,6 +214,45 @@ impl Quality {
         format!("{video_chain}+{primary_audio}/best[height<=?{h}]/best")
     }
 
+    /// Build a `yt-dlp` format selector honoring network profile AND optional explicit max FPS cap.
+    pub fn ytdl_format_for_network_and_fps(
+        self,
+        dub: DubPreference,
+        dub_lang: &str,
+        multistreams: bool,
+        codec: CodecPriority,
+        net: NetworkMode,
+        max_fps_cap: Option<u16>,
+    ) -> String {
+        if net.is_congested() || self == Quality::AudioOnly {
+            return self.ytdl_format_for_network(dub, dub_lang, multistreams, codec, net);
+        }
+        let Some(cap) = max_fps_cap.filter(|&f| f > 0 && f <= 120) else {
+            return self.ytdl_format_for_network(dub, dub_lang, multistreams, codec, net);
+        };
+        let lang = sanitize_dub_lang(dub_lang);
+        let primary_audio = match dub {
+            DubPreference::OriginalOnly => {
+                "(bestaudio[format_note*=original][format_note!*=dubbed][format_note!*=DRC]/bestaudio[format_note*=original][format_note!*=dubbed]/bestaudio[language_preference>=0][format_note!*=dubbed][format_note!*=DRC]/bestaudio[format_note!*=dubbed]/bestaudio)"
+            }
+            DubPreference::PreferDubbed => return self.ytdl_format_for_network(dub, dub_lang, multistreams, codec, net),
+        };
+        let h = self.max_height_or_default(4320);
+        let v_order = match codec {
+            CodecPriority::Vp9HwFirst => ["vp9", "hev", "avc"],
+            CodecPriority::Av1First => ["av01", "vp9", "avc"],
+        };
+        let mut v_parts: Vec<String> = v_order
+            .iter()
+            .map(|vc| format!("bestvideo[height<=?{h}][fps<=?{cap}][vcodec^={vc}]"))
+            .collect();
+        v_parts.push(format!("bestvideo[height<=?{h}][fps<=?{cap}]"));
+        v_parts.push(format!("bestvideo[height<=?{h}]"));
+        let v_chain = format!("({})", v_parts.join("/"));
+        let _ = lang;
+        format!("{v_chain}+{primary_audio}/{v_chain}+bestaudio/best")
+    }
+
     pub fn max_height_or_default(self, default_max: u16) -> u16 {
         match self {
             Quality::Best | Quality::P2160 => default_max.min(2160),
@@ -1338,6 +1377,292 @@ impl Default for AnalysisConfig {
     }
 }
 
+/// Color-grade equalizer preset for `mpv` picture controls (`brightness`, `contrast`,
+/// `saturation`, `gamma`, `hue`, `sharpen`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PicturePreset {
+    #[default]
+    Neutral,
+    Cinema,
+    OledPunch,
+    Daylight,
+    NightWarm,
+    NoirBw,
+    Custom,
+}
+
+#[allow(dead_code)]
+impl PicturePreset {
+    pub const ALL: [Self; 7] = [
+        Self::Neutral,
+        Self::Cinema,
+        Self::OledPunch,
+        Self::Daylight,
+        Self::NightWarm,
+        Self::NoirBw,
+        Self::Custom,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Neutral => "Neutral",
+            Self::Cinema => "Cinema",
+            Self::OledPunch => "OLED Punch",
+            Self::Daylight => "Daylight",
+            Self::NightWarm => "Night Warm",
+            Self::NoirBw => "Noir B&W",
+            Self::Custom => "Custom",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Neutral => "Neutral",
+            Self::Cinema => "Cinema",
+            Self::OledPunch => "OLED",
+            Self::Daylight => "Daylight",
+            Self::NightWarm => "Night",
+            Self::NoirBw => "Noir",
+            Self::Custom => "Custom",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Neutral => "Reference creator output (all sliders zeroed)",
+            Self::Cinema => "Filmic contrast curve + subtle highlight roll-off",
+            Self::OledPunch => "Deepened true blacks + vibrant color punch for OLED",
+            Self::Daylight => "Shadow & gamma lift for bright daytime rooms",
+            Self::NightWarm => "Low-glare darkened whites + warm late-night tint",
+            Self::NoirBw => "High-contrast monochrome cinema (-100% saturation)",
+            Self::Custom => "User-customized 6-channel color grade",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Neutral => Self::Cinema,
+            Self::Cinema => Self::OledPunch,
+            Self::OledPunch => Self::Daylight,
+            Self::Daylight => Self::NightWarm,
+            Self::NightWarm => Self::NoirBw,
+            Self::NoirBw => Self::Custom,
+            Self::Custom => Self::Neutral,
+        }
+    }
+
+    pub const fn grade(self) -> PictureGrade {
+        match self {
+            Self::Neutral | Self::Custom => PictureGrade {
+                brightness: 0,
+                contrast: 0,
+                saturation: 0,
+                gamma: 0,
+                hue: 0,
+                sharpness: 0,
+            },
+            Self::Cinema => PictureGrade {
+                brightness: -2,
+                contrast: 6,
+                saturation: 4,
+                gamma: -4,
+                hue: 0,
+                sharpness: 8,
+            },
+            Self::OledPunch => PictureGrade {
+                brightness: -3,
+                contrast: 10,
+                saturation: 12,
+                gamma: -6,
+                hue: 0,
+                sharpness: 12,
+            },
+            Self::Daylight => PictureGrade {
+                brightness: 10,
+                contrast: 6,
+                saturation: 4,
+                gamma: 8,
+                hue: 0,
+                sharpness: 10,
+            },
+            Self::NightWarm => PictureGrade {
+                brightness: -8,
+                contrast: -4,
+                saturation: -8,
+                gamma: -6,
+                hue: 6,
+                sharpness: 0,
+            },
+            Self::NoirBw => PictureGrade {
+                brightness: 0,
+                contrast: 14,
+                saturation: -100,
+                gamma: -4,
+                hue: 0,
+                sharpness: 15,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PictureGrade {
+    #[serde(default)]
+    pub brightness: i64,
+    #[serde(default)]
+    pub contrast: i64,
+    #[serde(default)]
+    pub saturation: i64,
+    #[serde(default)]
+    pub gamma: i64,
+    #[serde(default)]
+    pub hue: i64,
+    #[serde(default)]
+    pub sharpness: i64,
+}
+
+#[allow(dead_code)]
+impl PictureGrade {
+    pub fn clamped(self) -> Self {
+        Self {
+            brightness: self.brightness.clamp(-50, 50),
+            contrast: self.contrast.clamp(-50, 50),
+            saturation: self.saturation.clamp(-100, 50),
+            gamma: self.gamma.clamp(-50, 50),
+            hue: self.hue.clamp(-50, 50),
+            sharpness: self.sharpness.clamp(-50, 50),
+        }
+    }
+
+    pub const fn is_neutral(self) -> bool {
+        self.brightness == 0
+            && self.contrast == 0
+            && self.saturation == 0
+            && self.gamma == 0
+            && self.hue == 0
+            && self.sharpness == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PictureConfig {
+    #[serde(default)]
+    pub preset: PicturePreset,
+    #[serde(default)]
+    pub custom_grade: PictureGrade,
+}
+
+impl PictureConfig {
+    pub fn active_grade(&self) -> PictureGrade {
+        match self.preset {
+            PicturePreset::Custom => self.custom_grade.clamped(),
+            preset => preset.grade(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioEqPreset {
+    #[default]
+    Flat,
+    VoiceClarity,
+    Podcast,
+    BassBoost,
+    TrebleCrisp,
+    LateNight,
+}
+
+#[allow(dead_code)]
+impl AudioEqPreset {
+    pub const ALL: [Self; 6] = [
+        Self::Flat,
+        Self::VoiceClarity,
+        Self::Podcast,
+        Self::BassBoost,
+        Self::TrebleCrisp,
+        Self::LateNight,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "Flat (Reference 0dB)",
+            Self::VoiceClarity => "Voice Clarity (Presence +5dB)",
+            Self::Podcast => "Podcast Studio (Warm Vocal)",
+            Self::BassBoost => "Bass Boost (+6dB Low End)",
+            Self::TrebleCrisp => "Treble Crisp (+6dB Air)",
+            Self::LateNight => "Late Night (Soft Bass / Peaks)",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Flat => "Flat",
+            Self::VoiceClarity => "Voice",
+            Self::Podcast => "Podcast",
+            Self::BassBoost => "Bass+",
+            Self::TrebleCrisp => "Treble+",
+            Self::LateNight => "Night",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Flat => Self::VoiceClarity,
+            Self::VoiceClarity => Self::Podcast,
+            Self::Podcast => Self::BassBoost,
+            Self::BassBoost => Self::TrebleCrisp,
+            Self::TrebleCrisp => Self::LateNight,
+            Self::LateNight => Self::Flat,
+        }
+    }
+
+    /// 5-band parametric EQ gains (dB) centered at `[60Hz, 250Hz, 1kHz, 4kHz, 12kHz]`.
+    pub const fn band_gains_db(self) -> [i8; 5] {
+        match self {
+            Self::Flat => [0, 0, 0, 0, 0],
+            Self::VoiceClarity => [-4, -2, 3, 5, 2],
+            Self::Podcast => [-3, 1, 4, 3, 1],
+            Self::BassBoost => [6, 4, 0, -1, 1],
+            Self::TrebleCrisp => [-1, 0, 1, 4, 6],
+            Self::LateNight => [-5, -2, 2, 1, -3],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioChannelMode {
+    #[default]
+    Stereo,
+    Mono,
+}
+
+#[allow(dead_code)]
+impl AudioChannelMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo 2.0 (Native)",
+            Self::Mono => "Mono Downmix (Centered)",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo 2.0",
+            Self::Mono => "Mono Mix",
+        }
+    }
+
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::Stereo => Self::Mono,
+            Self::Mono => Self::Stereo,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -1378,6 +1703,14 @@ pub struct Config {
     pub force_ipv4: bool,
     #[serde(default = "default_true")]
     pub auto_abr_downshift: bool,
+    #[serde(default)]
+    pub max_fps_cap: Option<u16>,
+    #[serde(default)]
+    pub audio_eq_preset: AudioEqPreset,
+    #[serde(default)]
+    pub audio_channel_mode: AudioChannelMode,
+    #[serde(default)]
+    pub audio_voice_highpass: bool,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
     #[serde(default = "default_theme_index")]
@@ -1398,6 +1731,8 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     #[serde(default)]
     pub subtitle_style: crate::services::substyler::SubtitleStyleConfig,
+    #[serde(default)]
+    pub picture: PictureConfig,
 }
 
 impl Default for Config {
@@ -1422,6 +1757,10 @@ impl Default for Config {
             network_mode: NetworkMode::default(),
             force_ipv4: false,
             auto_abr_downshift: true,
+            max_fps_cap: None,
+            audio_eq_preset: AudioEqPreset::default(),
+            audio_channel_mode: AudioChannelMode::default(),
+            audio_voice_highpass: false,
             ambilight_enabled: true,
             theme_index: default_theme_index(),
             google_oauth: GoogleOAuthConfig::default(),
@@ -1432,6 +1771,7 @@ impl Default for Config {
             update: UpdateConfig::default(),
             analysis: AnalysisConfig::default(),
             subtitle_style: crate::services::substyler::SubtitleStyleConfig::default(),
+            picture: PictureConfig::default(),
         }
     }
 }
@@ -1737,5 +2077,66 @@ mod tests {
         );
         assert!(low_cap_fmt.contains("height<=?360"));
         assert!(!low_cap_fmt.contains("height<=?720"));
+    }
+
+    #[test]
+    fn test_picture_presets_and_toml_roundtrip() {
+        assert_eq!(PicturePreset::ALL.len(), 7);
+        assert!(PicturePreset::Neutral.grade().is_neutral());
+        assert_eq!(PicturePreset::NoirBw.grade().saturation, -100);
+        assert_eq!(PicturePreset::Cinema.next(), PicturePreset::OledPunch);
+
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("pic_config.toml");
+        let mut cfg = Config::default();
+        cfg.picture.preset = PicturePreset::Custom;
+        cfg.picture.custom_grade = PictureGrade {
+            brightness: 5,
+            contrast: 12,
+            saturation: -20,
+            gamma: -4,
+            hue: 8,
+            sharpness: 15,
+        };
+        cfg.save_to_path(&cfg_path).unwrap();
+
+        let loaded = Config::load_from_path(&cfg_path).unwrap();
+        assert_eq!(loaded.picture.preset, PicturePreset::Custom);
+        assert_eq!(loaded.picture.active_grade(), cfg.picture.custom_grade);
+    }
+
+    #[test]
+    fn test_audio_eq_channel_and_fps_config_roundtrip() {
+        assert_eq!(AudioEqPreset::ALL.len(), 6);
+        assert_eq!(AudioEqPreset::Flat.band_gains_db(), [0, 0, 0, 0, 0]);
+        assert_eq!(AudioEqPreset::VoiceClarity.band_gains_db(), [-4, -2, 3, 5, 2]);
+        assert_eq!(AudioEqPreset::LateNight.next(), AudioEqPreset::Flat);
+        assert_eq!(AudioChannelMode::Stereo.toggle(), AudioChannelMode::Mono);
+
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("audio_fps_config.toml");
+        let cfg = Config {
+            max_fps_cap: Some(30),
+            audio_eq_preset: AudioEqPreset::Podcast,
+            audio_channel_mode: AudioChannelMode::Mono,
+            audio_voice_highpass: true,
+            ..Default::default()
+        };
+        cfg.save_to_path(&cfg_path).unwrap();
+        let loaded = Config::load_from_path(&cfg_path).unwrap();
+        assert_eq!(loaded.max_fps_cap, Some(30));
+        assert_eq!(loaded.audio_eq_preset, AudioEqPreset::Podcast);
+        assert_eq!(loaded.audio_channel_mode, AudioChannelMode::Mono);
+        assert!(loaded.audio_voice_highpass);
+
+        let fps_sel = Quality::P1080.ytdl_format_for_network_and_fps(
+            DubPreference::OriginalOnly,
+            "en",
+            false,
+            CodecPriority::Av1First,
+            NetworkMode::Normal,
+            Some(30),
+        );
+        assert!(fps_sel.contains("fps<=?30"));
     }
 }

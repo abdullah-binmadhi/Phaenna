@@ -2,15 +2,15 @@
 //! Tracks live `time-pos` & `duration`, persists playback resume state every 4s,
 //! triggers 85% completion watch logging, and performs automatic SponsorBlock segment skipping.
 
-use crate::api::player::LOUDNORM_FILTER;
 use crate::api::sponsorblock::{
     category_label, fetch_sponsor_segments, filter_segments_for_mode_with_outro, from_db_rows,
     SponsorSegment,
 };
 use crate::config::{
     DebandTier, GpuScalerMode, ManualMasteringConfig, MotionMode, NetworkMode, PerformanceMode,
-    SponsorBlockMode, VideoShaderMode,
+    PictureGrade, SponsorBlockMode, VideoShaderMode,
 };
+use crate::services::substyler::SubtitleStyleConfig;
 use crate::db;
 use crate::messages::AppMessage;
 use crate::services::shaders::{prepare_video_shaders_with_mastering, VideoMasteringProfile};
@@ -163,6 +163,17 @@ pub enum LiveIpcEvent {
     DelayedFrames(i64),
     AudioSampleRate(u32),
     AudioChannels(String),
+    Hue(i64),
+    Sharpness(i64),
+    VideoZoom(f64),
+    Panscan(f64),
+    AspectOverride(String),
+    VideoRotate(u16),
+    MirrorX(bool),
+    Fullscreen(bool),
+    PitchCorrection(bool),
+    AbLoopA(Option<f64>),
+    AbLoopB(Option<f64>),
     Tracks {
         audio: Vec<LiveMediaTrack>,
         sub: Vec<LiveMediaTrack>,
@@ -183,13 +194,29 @@ pub enum PlayerCommand {
     SetSubVisible(bool),
     SetSubDelay(f64),
     SetAudioDelay(f64),
-    SetLoudnorm(bool),
+    SetAudioFilterChain(String),
+    ApplySubtitleStyle(SubtitleStyleConfig),
     SetShaderMode(VideoShaderMode, VideoMasteringProfile, PerformanceMode),
     SetPerformanceMode(PerformanceMode, VideoShaderMode, VideoMasteringProfile),
     ApplyManualMastering(ManualMasteringConfig, VideoShaderMode, VideoMasteringProfile),
     SetMotionMode(MotionMode),
     SetPictureProp { prop: &'static str, value: i64 },
+    SetSharpness(i64),
+    ApplyPictureGrade(PictureGrade),
     ResetPicture,
+    FrameStep,
+    FrameBackStep,
+    SetPitchCorrection(bool),
+    SetFullscreen(bool),
+    SetAbLoopPoint { is_b: bool, pos_secs: Option<f64> },
+    ClearAbLoop,
+    TakeScreenshot,
+    SetVideoZoom(f64),
+    SetPanscan(f64),
+    SetAspectOverride(&'static str),
+    SetVideoRotate(u16),
+    SetMirrorX(bool),
+    ResetGeometry,
     SetOnTop(bool),
     SetLoop(bool),
     JumpToLiveEdge,
@@ -304,9 +331,29 @@ impl PlayerCommand {
             Self::SetAudioDelay(secs) => {
                 vec![json!({"command": ["set_property", "audio-delay", secs]}).to_string()]
             }
-            Self::SetLoudnorm(enabled) => {
-                let val = if *enabled { LOUDNORM_FILTER } else { "" };
-                vec![json!({"command": ["set_property", "af", val]}).to_string()]
+            Self::SetAudioFilterChain(chain) => {
+                vec![json!({"command": ["set_property", "af", chain]}).to_string()]
+            }
+            Self::ApplySubtitleStyle(cfg) => {
+                let border = (cfg.border_size * 10.0).round() / 10.0;
+                let shadow = (cfg.shadow_offset * 10.0).round() / 10.0;
+                let (back_col, border_style) = if cfg.backdrop_opacity > 0.05 {
+                    let alpha_u8 = (cfg.backdrop_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    (format!("#{:02X}000000", alpha_u8), "background-box")
+                } else {
+                    ("#00000000".to_string(), "outline-and-shadow")
+                };
+                vec![
+                    json!({"command": ["set_property", "sub-font", cfg.font_family]}).to_string(),
+                    json!({"command": ["set_property", "sub-font-size", cfg.font_size]}).to_string(),
+                    json!({"command": ["set_property", "sub-border-size", border]}).to_string(),
+                    json!({"command": ["set_property", "sub-shadow-offset", shadow]}).to_string(),
+                    json!({"command": ["set_property", "sub-margin-y", cfg.margin_y]}).to_string(),
+                    json!({"command": ["set_property", "sub-color", cfg.primary_color]}).to_string(),
+                    json!({"command": ["set_property", "sub-border-color", cfg.border_color]}).to_string(),
+                    json!({"command": ["set_property", "sub-back-color", back_col]}).to_string(),
+                    json!({"command": ["set_property", "sub-border-style", border_style]}).to_string(),
+                ]
             }
             Self::SetShaderMode(mode, _profile, perf) => {
                 let mut cmds = Vec::new();
@@ -357,12 +404,87 @@ impl PlayerCommand {
                 ],
             },
             Self::SetPictureProp { prop, value } => {
-                vec![json!({"command": ["set_property", prop, (*value).clamp(-100, 100)]}).to_string()]
+                if *prop == "saturation" {
+                    vec![json!({"command": ["set_property", prop, (*value).clamp(-100, 100)]}).to_string()]
+                } else {
+                    vec![json!({"command": ["set_property", prop, (*value).clamp(-50, 50)]}).to_string()]
+                }
             }
-            Self::ResetPicture => ["brightness", "contrast", "saturation", "gamma"]
-                .iter()
-                .map(|p| json!({"command": ["set_property", p, 0]}).to_string())
-                .collect(),
+            Self::SetSharpness(val) => {
+                let s = ((*val).clamp(-50, 50) as f64 / 50.0 * 100.0).round() / 100.0;
+                vec![json!({"command": ["set_property", "sharpen", s]}).to_string()]
+            }
+            Self::ApplyPictureGrade(grade) => {
+                let g = grade.clamped();
+                let sharpen = ((g.sharpness as f64 / 50.0) * 100.0).round() / 100.0;
+                vec![
+                    json!({"command": ["set_property", "brightness", g.brightness]}).to_string(),
+                    json!({"command": ["set_property", "contrast", g.contrast]}).to_string(),
+                    json!({"command": ["set_property", "saturation", g.saturation]}).to_string(),
+                    json!({"command": ["set_property", "gamma", g.gamma]}).to_string(),
+                    json!({"command": ["set_property", "hue", g.hue]}).to_string(),
+                    json!({"command": ["set_property", "sharpen", sharpen]}).to_string(),
+                ]
+            }
+            Self::ResetPicture => vec![
+                json!({"command": ["set_property", "brightness", 0]}).to_string(),
+                json!({"command": ["set_property", "contrast", 0]}).to_string(),
+                json!({"command": ["set_property", "saturation", 0]}).to_string(),
+                json!({"command": ["set_property", "gamma", 0]}).to_string(),
+                json!({"command": ["set_property", "hue", 0]}).to_string(),
+                json!({"command": ["set_property", "sharpen", 0.0]}).to_string(),
+            ],
+            Self::FrameStep => vec![json!({"command": ["frame-step"]}).to_string()],
+            Self::FrameBackStep => vec![json!({"command": ["frame-back-step"]}).to_string()],
+            Self::SetPitchCorrection(on) => {
+                vec![json!({"command": ["set_property", "audio-pitch-correction", on]}).to_string()]
+            }
+            Self::SetFullscreen(on) => {
+                vec![json!({"command": ["set_property", "fullscreen", on]}).to_string()]
+            }
+            Self::SetAbLoopPoint { is_b, pos_secs } => {
+                let prop = if *is_b { "ab-loop-b" } else { "ab-loop-a" };
+                match pos_secs {
+                    Some(pos) => vec![json!({"command": ["set_property", prop, pos.max(0.0)]}).to_string()],
+                    None => vec![json!({"command": ["set_property", prop, "no"]}).to_string()],
+                }
+            }
+            Self::ClearAbLoop => vec![
+                json!({"command": ["set_property", "ab-loop-a", "no"]}).to_string(),
+                json!({"command": ["set_property", "ab-loop-b", "no"]}).to_string(),
+            ],
+            Self::TakeScreenshot => vec![json!({"command": ["screenshot", "video"]}).to_string()],
+            Self::SetVideoZoom(zoom) => {
+                let z = (zoom.clamp(-1.0, 1.5) * 100.0).round() / 100.0;
+                vec![json!({"command": ["set_property", "video-zoom", z]}).to_string()]
+            }
+            Self::SetPanscan(val) => {
+                let p = (val.clamp(0.0, 1.0) * 100.0).round() / 100.0;
+                vec![json!({"command": ["set_property", "panscan", p]}).to_string()]
+            }
+            Self::SetAspectOverride(aspect) => {
+                vec![json!({"command": ["set_property", "video-aspect-override", aspect]}).to_string()]
+            }
+            Self::SetVideoRotate(deg) => {
+                let d = match deg % 360 {
+                    90 => 90,
+                    180 => 180,
+                    270 => 270,
+                    _ => 0,
+                };
+                vec![json!({"command": ["set_property", "video-rotate", d]}).to_string()]
+            }
+            Self::SetMirrorX(mirror) => {
+                let scale = if *mirror { -1.0 } else { 1.0 };
+                vec![json!({"command": ["set_property", "video-scale-x", scale]}).to_string()]
+            }
+            Self::ResetGeometry => vec![
+                json!({"command": ["set_property", "video-zoom", 0.0]}).to_string(),
+                json!({"command": ["set_property", "panscan", 0.0]}).to_string(),
+                json!({"command": ["set_property", "video-aspect-override", "-1"]}).to_string(),
+                json!({"command": ["set_property", "video-rotate", 0]}).to_string(),
+                json!({"command": ["set_property", "video-scale-x", 1.0]}).to_string(),
+            ],
             Self::SetOnTop(on) => {
                 vec![json!({"command": ["set_property", "ontop", on]}).to_string()]
             }
@@ -533,6 +655,31 @@ pub fn parse_live_ipc_event(line: &str) -> Option<LiveIpcEvent> {
         "contrast" => Some(LiveIpcEvent::Contrast(data.as_f64()?.round() as i64)),
         "saturation" => Some(LiveIpcEvent::Saturation(data.as_f64()?.round() as i64)),
         "gamma" => Some(LiveIpcEvent::Gamma(data.as_f64()?.round() as i64)),
+        "hue" => Some(LiveIpcEvent::Hue(data.as_f64()?.round() as i64)),
+        "sharpen" => Some(LiveIpcEvent::Sharpness(
+            (data.as_f64()?.clamp(-1.0, 1.0) * 50.0).round() as i64,
+        )),
+        "video-zoom" => Some(LiveIpcEvent::VideoZoom(data.as_f64()?)),
+        "panscan" => Some(LiveIpcEvent::Panscan(data.as_f64()?)),
+        "video-aspect-override" => {
+            if let Some(s) = data.as_str() {
+                Some(LiveIpcEvent::AspectOverride(s.to_string()))
+            } else {
+                data.as_f64().map(|n| {
+                    LiveIpcEvent::AspectOverride(if n < 0.0 {
+                        "-1".to_string()
+                    } else {
+                        format!("{n:.2}")
+                    })
+                })
+            }
+        }
+        "video-rotate" => Some(LiveIpcEvent::VideoRotate((data.as_i64()? % 360) as u16)),
+        "video-scale-x" => Some(LiveIpcEvent::MirrorX(data.as_f64()? < 0.0)),
+        "fullscreen" => Some(LiveIpcEvent::Fullscreen(data.as_bool()?)),
+        "audio-pitch-correction" => Some(LiveIpcEvent::PitchCorrection(data.as_bool()?)),
+        "ab-loop-a" => Some(LiveIpcEvent::AbLoopA(data.as_f64())),
+        "ab-loop-b" => Some(LiveIpcEvent::AbLoopB(data.as_f64())),
         "frame-drop-count" => Some(LiveIpcEvent::DroppedFrames(data.as_i64()?)),
         "paused-for-cache" => Some(LiveIpcEvent::PausedForCache(data.as_bool()?)),
         "cache-speed" => Some(LiveIpcEvent::CacheSpeed(data.as_f64()?.max(0.0).round() as u64)),
@@ -714,6 +861,17 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             (34, "vo-delayed-frame-count"),
             (35, "audio-params/samplerate"),
             (36, "audio-params/hr-channels"),
+            (37, "hue"),
+            (38, "sharpen"),
+            (39, "video-zoom"),
+            (40, "panscan"),
+            (41, "video-aspect-override"),
+            (42, "video-rotate"),
+            (43, "video-scale-x"),
+            (44, "fullscreen"),
+            (45, "audio-pitch-correction"),
+            (46, "ab-loop-a"),
+            (47, "ab-loop-b"),
         ];
         for (id, prop) in observe_props {
             let msg = format!("{{\"command\":[\"observe_property\",{id},\"{prop}\"]}}\n");
@@ -1195,5 +1353,57 @@ mod tests {
             Some(LiveIpcEvent::AudioChannels(ref s)) if s == "stereo"
         ));
         assert!(parse_live_ipc_event(r#"{"event":"property-change","id":28,"name":"hwdec-current","data":null}"#).is_none());
+
+        let grade_cmds = PlayerCommand::ApplyPictureGrade(PictureGrade {
+            brightness: -2,
+            contrast: 6,
+            saturation: -100,
+            gamma: -4,
+            hue: 5,
+            sharpness: 10,
+        })
+        .to_mpv_json_commands();
+        assert!(grade_cmds.iter().any(|c| c.contains("\"saturation\",-100")));
+        assert!(grade_cmds.iter().any(|c| c.contains("\"sharpen\",0.2")));
+
+        let mirror_cmds = PlayerCommand::SetMirrorX(true).to_mpv_json_commands();
+        assert!(mirror_cmds[0].contains("\"video-scale-x\",-1.0"));
+        let zoom_cmds = PlayerCommand::SetVideoZoom(0.32).to_mpv_json_commands();
+        assert!(zoom_cmds[0].contains("\"video-zoom\",0.32"));
+        let ab_cmds = PlayerCommand::SetAbLoopPoint {
+            is_b: false,
+            pos_secs: Some(42.5),
+        }
+        .to_mpv_json_commands();
+        assert!(ab_cmds[0].contains("\"ab-loop-a\",42.5"));
+        assert!(PlayerCommand::TakeScreenshot.to_mpv_json_commands()[0].contains("\"screenshot\""));
+        assert_eq!(PlayerCommand::ResetGeometry.to_mpv_json_commands().len(), 5);
+
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":38,"name":"sharpen","data":0.4}"#),
+            Some(LiveIpcEvent::Sharpness(20))
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":43,"name":"video-scale-x","data":-1.0}"#),
+            Some(LiveIpcEvent::MirrorX(true))
+        ));
+        assert!(matches!(
+            parse_live_ipc_event(r#"{"event":"property-change","id":46,"name":"ab-loop-a","data":"no"}"#),
+            Some(LiveIpcEvent::AbLoopA(None))
+        ));
+
+        let af_cmds = PlayerCommand::SetAudioFilterChain(
+            "lavfi=[highpass=f=80,dynaudnorm=f=150:g=15:p=0.9]".to_string(),
+        )
+        .to_mpv_json_commands();
+        assert!(af_cmds[0].contains("\"set_property\",\"af\",\"lavfi=[highpass=f=80"));
+
+        let sub_cmds =
+            PlayerCommand::ApplySubtitleStyle(SubtitleStyleConfig::from_preset(
+                crate::services::substyler::SubtitlePreset::OledPlate,
+            ))
+            .to_mpv_json_commands();
+        assert!(sub_cmds.iter().any(|c| c.contains("\"sub-font-size\",44")));
+        assert!(sub_cmds.iter().any(|c| c.contains("\"background-box\"")));
     }
 }
