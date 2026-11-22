@@ -20,6 +20,14 @@ use crate::state::{active_modal_rect, ActiveOverlay, AppState, Screen};
 use ratatui::Frame;
 
 pub fn render_app(frame: &mut Frame, state: &mut AppState) {
+    if state.overlay == ActiveOverlay::Search {
+        search::render_search_modal(frame, state);
+        if let Some((ref msg, _)) = state.toast {
+            help::render_toast(frame, msg, state);
+        }
+        return;
+    }
+
     let modal_rect = active_modal_rect(frame.area(), state.overlay);
 
     match state.screen {

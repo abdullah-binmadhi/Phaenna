@@ -56,6 +56,99 @@ pub struct VideoItem {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub is_live: Option<bool>,
+    #[serde(default)]
+    pub search_snippet: Option<String>,
+    #[serde(default)]
+    pub channel_verified: bool,
+    #[serde(default)]
+    pub yt_rank: Option<usize>,
+}
+
+/// Returns true if `id` is a valid 11-character YouTube video ID.
+pub fn is_valid_yt_video_id(id: &str) -> bool {
+    let clean = id.trim();
+    clean.len() == 11
+        && clean
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Extract an 11-character YouTube video ID from a pasted YouTube watch/shorts/live/embed URL.
+pub fn extract_yt_url_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if !(trimmed.contains("youtube.com") || trimmed.contains("youtu.be")) {
+        return None;
+    }
+    if let Some(pos) = trimmed.find("v=") {
+        let cand: String = trimmed[pos + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if is_valid_yt_video_id(&cand) {
+            return Some(cand);
+        }
+    }
+    for prefix in ["youtu.be/", "/shorts/", "/live/", "/embed/"] {
+        if let Some(pos) = trimmed.find(prefix) {
+            let cand: String = trimmed[pos + prefix.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if is_valid_yt_video_id(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Normalize protocol-relative (`//...`) and whitespace-padded thumbnail URLs.
+pub fn normalize_thumb_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("//") {
+        format!("https:{trimmed}")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        if rest.contains("ytimg.com") || rest.contains("ggpht.com") || rest.contains("googleusercontent.com") {
+            format!("https://{rest}")
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build ordered, deduplicated fallback candidate URLs for a YouTube video thumbnail.
+pub fn build_thumb_candidate_urls(
+    video_id: &str,
+    primary_url: &str,
+    prefer_compact: bool,
+) -> Vec<String> {
+    let clean_id = video_id.trim().trim_start_matches("RD");
+    let norm_primary = normalize_thumb_url(primary_url);
+    let mut raw: Vec<String> = Vec::with_capacity(6);
+    if is_valid_yt_video_id(clean_id) {
+        let mq = format!("https://i.ytimg.com/vi/{clean_id}/mqdefault.jpg");
+        let hq = format!("https://i.ytimg.com/vi/{clean_id}/hqdefault.jpg");
+        let sd = format!("https://i.ytimg.com/vi/{clean_id}/sddefault.jpg");
+        let hd = format!("https://i.ytimg.com/vi/{clean_id}/hq720.jpg");
+        let mirror = format!("https://i1.ytimg.com/vi/{clean_id}/0.jpg");
+        if prefer_compact {
+            raw.extend([mq, norm_primary, hq, sd, mirror]);
+        } else {
+            raw.extend([norm_primary, hd, sd, hq, mq, mirror]);
+        }
+    } else if !norm_primary.is_empty() {
+        raw.push(norm_primary);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .filter(|u| !u.is_empty() && seen.insert(u.clone()))
+        .collect()
 }
 
 #[allow(dead_code)]
@@ -87,7 +180,7 @@ impl VideoItem {
         }
         match self.duration {
             Some(secs) if secs > 0 => format_duration_secs(secs),
-            _ => "LIVE".to_string(),
+            _ => "—".to_string(),
         }
     }
 
@@ -104,23 +197,41 @@ impl VideoItem {
         if let Some(ref t) = self.thumbnails {
             if let Some(th) = t
                 .iter()
-                .find(|th| th.url.contains("maxresdefault") || th.url.contains("hq720"))
+                .find(|th| th.url.contains("hq720") || th.url.contains("sddefault"))
             {
-                return th.url.clone();
+                let u = normalize_thumb_url(&th.url);
+                if !u.is_empty() {
+                    return u;
+                }
             }
             if let Some(th) = t
                 .iter()
                 .find(|th| th.url.contains("hqdefault") || th.url.contains("mqdefault"))
             {
-                return th.url.clone();
+                let u = normalize_thumb_url(&th.url);
+                if !u.is_empty() {
+                    return u;
+                }
+            }
+            if let Some(th) = t.iter().find(|th| th.url.contains("maxresdefault")) {
+                let u = normalize_thumb_url(&th.url);
+                if !u.is_empty() {
+                    return u;
+                }
             }
             if let Some(last) = t.last() {
-                if !last.url.is_empty() {
-                    return last.url.clone();
+                let u = normalize_thumb_url(&last.url);
+                if !u.is_empty() {
+                    return u;
                 }
             }
         }
-        format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", self.clean_id())
+        let cid = self.clean_id();
+        if is_valid_yt_video_id(cid) {
+            format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", cid)
+        } else {
+            String::new()
+        }
     }
 
     pub fn watch_url(&self) -> String {
@@ -467,6 +578,9 @@ pub(crate) fn row_to_video(row: &sqlx::sqlite::SqliteRow) -> VideoItem {
         chapters,
         tags,
         is_live: Some(is_live_num != 0),
+        search_snippet: None,
+        channel_verified: false,
+        yt_rank: None,
     }
 }
 
@@ -504,16 +618,42 @@ pub async fn get_all_cached_videos(pool: &SqlitePool, limit: i64) -> Result<Vec<
 
 pub async fn store_thumb_blob(pool: &SqlitePool, id: &str, blob: &[u8]) -> Result<()> {
     let clean = id.trim_start_matches("RD");
-    sqlx::query("UPDATE videos SET thumb_blob = ? WHERE id = ?")
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    sqlx::query(
+        "INSERT INTO thumb_blobs (video_id, blob, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(video_id) DO UPDATE SET
+             blob = excluded.blob,
+             updated_at = excluded.updated_at",
+    )
+    .bind(clean)
+    .bind(blob)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query("UPDATE videos SET thumb_blob = ? WHERE id = ?")
         .bind(blob)
         .bind(clean)
         .execute(pool)
-        .await?;
+        .await;
     Ok(())
 }
 
 pub async fn get_thumb_blob(pool: &SqlitePool, id: &str) -> Result<Option<Vec<u8>>> {
     let clean = id.trim_start_matches("RD");
+    if let Some(blob) =
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT blob FROM thumb_blobs WHERE video_id = ?")
+            .bind(clean)
+            .fetch_optional(pool)
+            .await?
+    {
+        if !blob.is_empty() {
+            return Ok(Some(blob));
+        }
+    }
     let blob: Option<Option<Vec<u8>>> =
         sqlx::query_scalar("SELECT thumb_blob FROM videos WHERE id = ?")
             .bind(clean)
@@ -523,18 +663,40 @@ pub async fn get_thumb_blob(pool: &SqlitePool, id: &str) -> Result<Option<Vec<u8
 }
 
 pub async fn search_cached_videos(pool: &SqlitePool, query: &str) -> Result<Vec<VideoItem>> {
-    let pat = format!("%{}%", query.trim());
-    let rows = sqlx::query(
-        "SELECT * FROM videos
-         WHERE title LIKE ? OR channel_name LIKE ? OR tags_json LIKE ?
-         ORDER BY COALESCE(view_count, 0) DESC, updated_at DESC
-         LIMIT 25",
-    )
-    .bind(&pat)
-    .bind(&pat)
-    .bind(&pat)
-    .fetch_all(pool)
-    .await?;
+    let cleaned_tokens: Vec<String> = query
+        .split_whitespace()
+        .filter(|tok| {
+            let low = tok.to_ascii_lowercase();
+            !low.starts_with('-') && !low.starts_with("is:")
+        })
+        .map(|tok| {
+            let t = tok.trim_matches('"').trim();
+            let t = t.strip_prefix("ch:").or_else(|| t.strip_prefix("channel:")).unwrap_or(t);
+            t.trim_start_matches('@').to_string()
+        })
+        .filter(|t| !t.is_empty())
+        .take(6)
+        .collect();
+
+    if cleaned_tokens.is_empty() {
+        return get_all_cached_videos(pool, 30).await;
+    }
+
+    let mut sql = String::from("SELECT * FROM videos WHERE ");
+    for i in 0..cleaned_tokens.len() {
+        if i > 0 {
+            sql.push_str(" AND ");
+        }
+        sql.push_str("(title LIKE ? OR channel_name LIKE ? OR tags_json LIKE ? OR description LIKE ?)");
+    }
+    sql.push_str(" ORDER BY COALESCE(view_count, 0) DESC, updated_at DESC LIMIT 40");
+
+    let mut q = sqlx::query(&sql);
+    for tok in &cleaned_tokens {
+        let pat = format!("%{tok}%");
+        q = q.bind(pat.clone()).bind(pat.clone()).bind(pat.clone()).bind(pat);
+    }
+    let rows = q.fetch_all(pool).await?;
     Ok(rows.iter().map(row_to_video).collect())
 }
 
@@ -648,5 +810,26 @@ mod tests {
         let hits = search_cached_videos(&pool, "Arena").await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "vid00000002");
+
+        // Multi-word out-of-order search & Search thumbnail persistence for non-cached IDs
+        let multi = search_cached_videos(&pool, "Allocators Zig").await.unwrap();
+        assert_eq!(multi.len(), 1);
+        assert_eq!(multi[0].id, "vid00000002");
+
+        store_thumb_blob(&pool, "dQw4w9WgXcQ", &[9, 8, 7]).await.unwrap();
+        assert_eq!(
+            get_thumb_blob(&pool, "dQw4w9WgXcQ").await.unwrap().unwrap(),
+            vec![9, 8, 7]
+        );
+
+        let no_dur = VideoItem {
+            id: "dQw4w9WgXcQ".into(),
+            title: "Unknown dur".into(),
+            ..Default::default()
+        };
+        assert_eq!(no_dur.display_duration(), "—");
+        let urls = build_thumb_candidate_urls("dQw4w9WgXcQ", "//i.ytimg.com/vi/dQw4w9WgXcQ/hq720.jpg", false);
+        assert!(urls[0].starts_with("https://"));
+        assert!(build_thumb_candidate_urls("PL1234567890", "", false).is_empty());
     }
 }

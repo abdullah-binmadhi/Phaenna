@@ -787,6 +787,9 @@ pub async fn get_continue_watching(pool: &SqlitePool) -> Result<Vec<VideoItem>> 
             )
             .ok(),
             is_live: Some(row.try_get::<i64, _>("is_live").unwrap_or(0) != 0),
+            search_snippet: None,
+            channel_verified: false,
+            yt_rank: None,
         })
         .collect())
 }

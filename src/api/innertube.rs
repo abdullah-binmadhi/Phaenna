@@ -1,7 +1,7 @@
 //! Fast HTTP/RSS client for zero-subprocess YouTube channel feed refreshes.
 //! Fetches public Atom XML feeds in <150ms for the 7-day Upload Radar & channel checks.
 
-use crate::db::cache::{Thumbnail, VideoItem};
+use crate::db::cache::{is_valid_yt_video_id, normalize_thumb_url, Thumbnail, VideoItem};
 use crate::error::{AppError, Result};
 use crate::services::auth::{compute_sapisidhash, now_unix_secs, GoogleAccountSession, PHAENNA_USER_AGENT};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -27,6 +27,31 @@ pub struct InnerTubeShelfPage {
     pub videos: Vec<VideoItem>,
     pub continuation: Option<String>,
     pub watched_progress: Vec<(String, u8)>,
+}
+
+/// Spotlight channel metadata extracted from YouTube InnerTube search `channelRenderer`.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct SearchChannelCard {
+    pub channel_id: String,
+    pub title: String,
+    pub handle: Option<String>,
+    pub subscriber_text: Option<String>,
+    pub video_count_text: Option<String>,
+    pub description: Option<String>,
+    pub verified: bool,
+    pub avatar_url: Option<String>,
+}
+
+/// Structured InnerTube `/youtubei/v1/search` page preserving native `yt_rank` order and isolating Shorts & noise shelves.
+#[derive(Debug, Clone, Default)]
+pub struct InnerTubeSearchPage {
+    pub videos: Vec<VideoItem>,
+    pub shorts: Vec<VideoItem>,
+    pub channels: Vec<SearchChannelCard>,
+    pub did_you_mean: Option<String>,
+    pub estimated_results: Option<u64>,
+    pub continuation: Option<String>,
 }
 
 /// Apply either isolated `SAPISIDHASH` + cookie headers or OAuth `Bearer` authorization to an InnerTube request.
@@ -498,8 +523,14 @@ fn extract_video_from_renderer(r: &serde_json::Value) -> Option<VideoItem> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    let duration_string = extract_yt_text(r.get("lengthText"));
-    let duration = duration_string.as_deref().and_then(parse_duration_text);
+    let duration_string_raw = extract_yt_text(r.get("lengthText"));
+    let duration = duration_string_raw.as_deref().and_then(parse_duration_text);
+    let is_reel = r.pointer("/navigationEndpoint/reelWatchEndpoint").is_some();
+    let duration_string = if duration_string_raw.is_none() && is_reel {
+        Some("SHORT".to_string())
+    } else {
+        duration_string_raw
+    };
 
     let view_count = extract_yt_text(r.get("viewCountText"))
         .or_else(|| extract_yt_text(r.get("shortViewCountText")))
@@ -526,6 +557,31 @@ fn extract_video_from_renderer(r: &serde_json::Value) -> Option<VideoItem> {
         })
         .unwrap_or(false);
 
+    let channel_verified = r
+        .get("ownerBadges")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|b| {
+                let st = b
+                    .pointer("/metadataBadgeRenderer/style")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let tip = b
+                    .pointer("/metadataBadgeRenderer/tooltip")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                st.contains("VERIFIED") || tip.eq_ignore_ascii_case("Verified")
+            })
+        })
+        .unwrap_or(false);
+
+    let search_snippet = r
+        .pointer("/detailedMetadataSnippets/0/snippetText")
+        .and_then(|v| extract_yt_text(Some(v)))
+        .or_else(|| extract_yt_text(r.get("descriptionSnippet")))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let mut published_text = extract_yt_text(r.get("publishedTimeText"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -542,7 +598,10 @@ fn extract_video_from_renderer(r: &serde_json::Value) -> Option<VideoItem> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|t| {
-                    let url = t.get("url")?.as_str()?.to_string();
+                    let url = normalize_thumb_url(t.get("url")?.as_str()?);
+                    if url.is_empty() {
+                        return None;
+                    }
                     let width = t.get("width").and_then(|w| w.as_u64()).map(|n| n as u32);
                     let height = t.get("height").and_then(|h| h.as_u64()).map(|n| n as u32);
                     Some(Thumbnail { url, width, height })
@@ -551,8 +610,14 @@ fn extract_video_from_renderer(r: &serde_json::Value) -> Option<VideoItem> {
         })
         .filter(|v| !v.is_empty());
 
+    let webpage_url = if is_reel {
+        Some(format!("https://www.youtube.com/shorts/{id}"))
+    } else {
+        Some(format!("https://www.youtube.com/watch?v={id}"))
+    };
+
     Some(VideoItem {
-        id: id.clone(),
+        id,
         title,
         uploader: uploader.clone(),
         channel: uploader,
@@ -562,9 +627,11 @@ fn extract_video_from_renderer(r: &serde_json::Value) -> Option<VideoItem> {
         timestamp,
         published_text,
         view_count,
-        webpage_url: Some(format!("https://www.youtube.com/watch?v={id}")),
+        webpage_url,
         thumbnails,
         is_live,
+        search_snippet,
+        channel_verified,
         ..Default::default()
     })
 }
@@ -605,8 +672,21 @@ fn classify_metadata_segment(
 }
 
 fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
+    if let Some(ct) = l.get("contentType").and_then(|v| v.as_str()) {
+        if ct != "LOCKUP_CONTENT_TYPE_VIDEO" {
+            return None;
+        }
+    }
     let id = l.get("contentId").and_then(|v| v.as_str())?.trim().to_string();
-    if id.is_empty() {
+    if id.is_empty()
+        || id.starts_with("PL")
+        || id.starts_with("OLAK")
+        || id.starts_with("UU")
+        || id.starts_with("LL")
+        || id.starts_with("WL")
+        || id.starts_with("FL")
+        || (id.starts_with("RD") && id.len() > 13)
+    {
         return None;
     }
     let title = l
@@ -702,7 +782,10 @@ fn extract_video_from_lockup(l: &serde_json::Value) -> Option<VideoItem> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|t| {
-                    let url = t.get("url")?.as_str()?.to_string();
+                    let url = normalize_thumb_url(t.get("url")?.as_str()?);
+                    if url.is_empty() {
+                        return None;
+                    }
                     let width = t.get("width").and_then(|w| w.as_u64()).map(|n| n as u32);
                     let height = t.get("height").and_then(|h| h.as_u64()).map(|n| n as u32);
                     Some(Thumbnail { url, width, height })
@@ -1694,36 +1777,58 @@ pub async fn fetch_suggested_shorts(
     Ok(page)
 }
 
-/// Encode YouTube InnerTube `search` protobuf `params` token for server-side Sort / Upload Date / Duration.
+/// Encode YouTube InnerTube `search` protobuf `params` token for server-side Sort / Upload Date / Duration / Feature flags.
 /// `sort_code`: 0=Relevance, 1=Rating, 2=Newest, 3=Views
-/// `date_code`: 0=Any, 2=Today, 3=Week, 4=Month, 5=Year
+/// `date_code`: 0=Any, 1=Hour, 2=Today, 3=Week, 4=Month, 5=Year
 /// `dur_code`: 0=Any, 1=<4m, 3=4-20m, 2=>20m
-pub fn encode_search_params(
+pub fn encode_search_params_ex(
     sort_code: u8,
     date_code: u8,
     dur_code: u8,
     videos_only: bool,
+    is_hd: bool,
+    is_4k: bool,
+    is_live: bool,
 ) -> Option<String> {
-    if sort_code == 0 && date_code == 0 && dur_code == 0 && !videos_only {
+    if sort_code == 0
+        && date_code == 0
+        && dur_code == 0
+        && !videos_only
+        && !is_hd
+        && !is_4k
+        && !is_live
+    {
         return None;
     }
     let mut sub = Vec::new();
     if date_code > 0 {
-        sub.push(1 << 3); // field 1, wire type 0 (varint)
+        sub.push(1 << 3); // field 1, varint: upload date
         sub.push(date_code);
     }
-    if videos_only || date_code > 0 || dur_code > 0 {
-        sub.push(2 << 3); // field 2, wire type 0 (varint)
-        sub.push(1); // type = Video
+    if videos_only || date_code > 0 || dur_code > 0 || is_hd || is_4k || is_live {
+        sub.push(2 << 3); // field 2, varint: type = Video
+        sub.push(1);
     }
     if dur_code > 0 {
-        sub.push(3 << 3); // field 3, wire type 0 (varint)
+        sub.push(3 << 3); // field 3, varint: duration bucket
         sub.push(dur_code);
+    }
+    if is_hd {
+        sub.push(4 << 3); // field 4, varint: HD
+        sub.push(1);
+    }
+    if is_live {
+        sub.push(8 << 3); // field 8, varint: Live stream
+        sub.push(1);
+    }
+    if is_4k {
+        sub.push(14 << 3); // field 14, varint: 4K
+        sub.push(1);
     }
 
     let mut msg = Vec::new();
     if sort_code > 0 {
-        msg.push(1 << 3); // field 1, wire type 0 (varint)
+        msg.push(1 << 3); // field 1, varint
         msg.push(sort_code);
     }
     if !sub.is_empty() {
@@ -1734,6 +1839,289 @@ pub fn encode_search_params(
     Some(URL_SAFE_NO_PAD.encode(msg))
 }
 
+#[allow(dead_code)]
+pub fn encode_search_params(
+    sort_code: u8,
+    date_code: u8,
+    dur_code: u8,
+    videos_only: bool,
+) -> Option<String> {
+    encode_search_params_ex(sort_code, date_code, dur_code, videos_only, false, false, false)
+}
+
+fn is_noise_search_shelf(title: &str) -> bool {
+    let low = title.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    [
+        "people also watched",
+        "for you",
+        "previously watched",
+        "channels new to you",
+        "related to your search",
+        "explore more",
+        "from related searches",
+        "others watched",
+    ]
+    .iter()
+    .any(|pat| low.contains(pat))
+}
+
+fn extract_channel_from_renderer(c: &serde_json::Value) -> Option<SearchChannelCard> {
+    let channel_id = c.get("channelId")?.as_str()?.trim().to_string();
+    if channel_id.is_empty() {
+        return None;
+    }
+    let title = extract_yt_text(c.get("title")).unwrap_or_else(|| "Channel".to_string());
+    let canonical = c
+        .pointer("/navigationEndpoint/browseEndpoint/canonicalBaseUrl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches('/').to_string());
+
+    // InnerTube swapped subscriberCountText / videoCountText across layout experiments
+    let raw_sub = extract_yt_text(c.get("subscriberCountText"));
+    let raw_vid = extract_yt_text(c.get("videoCountText"));
+    let (handle, subscriber_text) = match (raw_sub, canonical) {
+        (Some(s), can) if s.starts_with('@') => (Some(s), raw_vid.clone().or(can)),
+        (sub, can) => (can, sub),
+    };
+    let video_count_text = if subscriber_text.as_deref() == raw_vid.as_deref() {
+        None
+    } else {
+        raw_vid
+    };
+    let description = extract_yt_text(c.get("descriptionSnippet"));
+    let verified = c
+        .get("ownerBadges")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|b| {
+                let st = b
+                    .pointer("/metadataBadgeRenderer/style")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                st.contains("VERIFIED")
+            })
+        })
+        .unwrap_or(false);
+    let avatar_url = c
+        .pointer("/thumbnail/thumbnails")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|t| t.get("url"))
+        .and_then(|u| u.as_str())
+        .map(normalize_thumb_url)
+        .filter(|s| !s.is_empty());
+
+    Some(SearchChannelCard {
+        channel_id,
+        title,
+        handle,
+        subscriber_text,
+        video_count_text,
+        description,
+        verified,
+        avatar_url,
+    })
+}
+
+fn collect_search_container_items(
+    items: &[serde_json::Value],
+    page: &mut InnerTubeSearchPage,
+    seen_videos: &mut HashSet<String>,
+    seen_shorts: &mut HashSet<String>,
+    seen_channels: &mut HashSet<String>,
+) {
+    for entry in items {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+
+        // Skip promoted ads / unrelated recommendation cards
+        if obj.contains_key("adSlotRenderer")
+            || obj.contains_key("promotedSparklesWebRenderer")
+            || obj.contains_key("promotedSparklesTextSearchRenderer")
+            || obj.contains_key("searchPyvRenderer")
+        {
+            continue;
+        }
+
+        if let Some(did) = obj.get("didYouMeanRenderer") {
+            if page.did_you_mean.is_none() {
+                page.did_you_mean = extract_yt_text(did.get("correctedQuery"));
+            }
+            continue;
+        }
+        if let Some(showing) = obj.get("showingResultsForRenderer") {
+            if page.did_you_mean.is_none() {
+                page.did_you_mean = extract_yt_text(showing.get("correctedQuery"));
+            }
+            continue;
+        }
+
+        if let Some(ch) = obj.get("channelRenderer").and_then(extract_channel_from_renderer) {
+            if seen_channels.insert(ch.channel_id.clone()) {
+                page.channels.push(ch);
+            }
+            continue;
+        }
+
+        if let Some(vr) = obj.get("videoRenderer") {
+            if let Some(mut v) = extract_video_from_renderer(vr) {
+                if is_valid_yt_video_id(v.clean_id()) {
+                    if v.is_shorts() {
+                        if seen_shorts.insert(v.id.clone()) {
+                            page.shorts.push(v);
+                        }
+                    } else if seen_videos.insert(v.id.clone()) {
+                        v.yt_rank = Some(page.videos.len());
+                        page.videos.push(v);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(lk) = obj.get("lockupViewModel") {
+            if let Some(mut v) = extract_video_from_lockup(lk) {
+                if is_valid_yt_video_id(v.clean_id()) {
+                    if v.is_shorts() {
+                        if seen_shorts.insert(v.id.clone()) {
+                            page.shorts.push(v);
+                        }
+                    } else if seen_videos.insert(v.id.clone()) {
+                        v.yt_rank = Some(page.videos.len());
+                        page.videos.push(v);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(sl) = obj.get("shortsLockupViewModel") {
+            if let Some(v) = extract_video_from_shorts_lockup(sl) {
+                if is_valid_yt_video_id(v.clean_id()) && seen_shorts.insert(v.id.clone()) {
+                    page.shorts.push(v);
+                }
+            }
+            continue;
+        }
+
+        if let Some(ri) = obj.get("reelItemRenderer") {
+            if let Some(v) = extract_video_from_reel_item(ri) {
+                if is_valid_yt_video_id(v.clean_id()) && seen_shorts.insert(v.id.clone()) {
+                    page.shorts.push(v);
+                }
+            }
+            continue;
+        }
+
+        // Isolate Shorts carousels (`reelShelfRenderer` / `gridShelfViewModel`) into `page.shorts`
+        if let Some(reel) = obj.get("reelShelfRenderer") {
+            if let Some(arr) = reel.get("items").and_then(|v| v.as_array()) {
+                collect_search_container_items(arr, page, seen_videos, seen_shorts, seen_channels);
+            }
+            continue;
+        }
+        if let Some(grid_shelf) = obj.get("gridShelfViewModel") {
+            if let Some(arr) = grid_shelf.pointer("/contents/gridShelfViewModel/contents")
+                .or_else(|| grid_shelf.get("contents"))
+                .and_then(|v| v.as_array())
+            {
+                collect_search_container_items(arr, page, seen_videos, seen_shorts, seen_channels);
+            }
+            continue;
+        }
+
+        // Filter out algorithmic noise shelves ("People also watched", "For you", "Previously watched")
+        if let Some(shelf) = obj.get("shelfRenderer") {
+            let shelf_title = extract_yt_text(shelf.get("title")).unwrap_or_default();
+            if is_noise_search_shelf(&shelf_title) {
+                continue;
+            }
+            if let Some(arr) = shelf
+                .pointer("/content/verticalListRenderer/items")
+                .or_else(|| shelf.pointer("/content/horizontalListRenderer/items"))
+                .and_then(|v| v.as_array())
+            {
+                collect_search_container_items(arr, page, seen_videos, seen_shorts, seen_channels);
+            }
+            continue;
+        }
+
+        if let Some(sec) = obj.get("itemSectionRenderer") {
+            if let Some(arr) = sec.get("contents").and_then(|v| v.as_array()) {
+                collect_search_container_items(arr, page, seen_videos, seen_shorts, seen_channels);
+            }
+            continue;
+        }
+
+        if page.continuation.is_none() {
+            if let Some(cont) = obj.get("continuationItemRenderer") {
+                if let Some(tok) = cont
+                    .pointer("/continuationEndpoint/continuationCommand/token")
+                    .and_then(|v| v.as_str())
+                {
+                    page.continuation = Some(tok.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Structured parser for `/youtubei/v1/search` responses:
+/// preserves YouTube ranking order (`yt_rank`), rejects playlists & recommendation noise,
+/// isolates Shorts into `page.shorts`, and extracts channel spotlight + match snippets.
+pub fn parse_innertube_search_json(root: &serde_json::Value) -> InnerTubeSearchPage {
+    let mut page = InnerTubeSearchPage {
+        estimated_results: root
+            .get("estimatedResults")
+            .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64())),
+        ..Default::default()
+    };
+    let mut seen_videos = HashSet::new();
+    let mut seen_shorts = HashSet::new();
+    let mut seen_channels = HashSet::new();
+
+    if let Some(sections) = root
+        .pointer("/contents/twoColumnSearchResultsRenderer/primaryContents/sectionListRenderer/contents")
+        .and_then(|v| v.as_array())
+    {
+        collect_search_container_items(
+            sections,
+            &mut page,
+            &mut seen_videos,
+            &mut seen_shorts,
+            &mut seen_channels,
+        );
+    }
+
+    if let Some(cmds) = root
+        .get("onResponseReceivedCommands")
+        .and_then(|v| v.as_array())
+    {
+        for cmd in cmds {
+            if let Some(cont_items) = cmd
+                .pointer("/appendContinuationItemsAction/continuationItems")
+                .and_then(|v| v.as_array())
+            {
+                collect_search_container_items(
+                    cont_items,
+                    &mut page,
+                    &mut seen_videos,
+                    &mut seen_shorts,
+                    &mut seen_channels,
+                );
+            }
+        }
+    }
+
+    page
+}
+
 /// Fast HTTP InnerTube `/youtubei/v1/search` with server-side filters and continuation pagination (~150-350ms).
 pub async fn search_innertube(
     client: &reqwest::Client,
@@ -1741,10 +2129,10 @@ pub async fn search_innertube(
     query: &str,
     params: Option<&str>,
     continuation: Option<&str>,
-) -> Result<InnerTubeShelfPage> {
+) -> Result<InnerTubeSearchPage> {
     let trimmed = query.trim();
     if trimmed.is_empty() && continuation.is_none() {
-        return Ok(InnerTubeShelfPage::default());
+        return Ok(InnerTubeSearchPage::default());
     }
     let mut payload = serde_json::json!({
         "context": {
@@ -1777,7 +2165,7 @@ pub async fn search_innertube(
         .json()
         .await
         .map_err(|e| AppError::Parse(format!("Invalid search JSON: {e}")))?;
-    Ok(parse_innertube_browse_json(&root))
+    Ok(parse_innertube_search_json(&root))
 }
 
 /// Fetch YouTube live search autocomplete suggestions cleanly (`<120ms`).
@@ -2668,5 +3056,113 @@ mod tests {
         assert!(encode_search_params(0, 0, 0, false).is_none());
         let sp = encode_search_params(2, 3, 1, true).unwrap();
         assert!(!sp.is_empty());
+        assert!(encode_search_params_ex(0, 0, 0, false, false, true, false).is_some());
+    }
+
+    #[test]
+    fn test_parse_innertube_search_json_filters_playlists_shelves_and_ranks() {
+        let search_json = serde_json::json!({
+            "estimatedResults": "42000",
+            "contents": {
+                "twoColumnSearchResultsRenderer": {
+                    "primaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [
+                                {
+                                    "itemSectionRenderer": {
+                                        "contents": [
+                                            {
+                                                "didYouMeanRenderer": {
+                                                    "correctedQuery": { "simpleText": "system architecture patterns" }
+                                                }
+                                            },
+                                            {
+                                                "channelRenderer": {
+                                                    "channelId": "UCn1f2k3m4n5p",
+                                                    "title": { "simpleText": "Gaurav Sen" },
+                                                    "subscriberCountText": { "simpleText": "612K subscribers" },
+                                                    "ownerBadges": [{ "metadataBadgeRenderer": { "style": "BADGE_STYLE_TYPE_VERIFIED" } }]
+                                                }
+                                            },
+                                            {
+                                                "lockupViewModel": {
+                                                    "contentId": "PLMC9KNkIncKtPzgY-5rmhvj7fax8XcWcQ",
+                                                    "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                                                    "metadata": { "lockupMetadataViewModel": { "title": { "content": "System Design Playlist" } } }
+                                                }
+                                            },
+                                            {
+                                                "videoRenderer": {
+                                                    "videoId": "dQw4w9WgXcQ",
+                                                    "title": { "simpleText": "System Architecture Patterns Explained" },
+                                                    "ownerText": { "simpleText": "ByteByteGo" },
+                                                    "lengthText": { "simpleText": "18:42" },
+                                                    "viewCountText": { "simpleText": "1.4M views" },
+                                                    "ownerBadges": [{ "metadataBadgeRenderer": { "style": "BADGE_STYLE_TYPE_VERIFIED" } }],
+                                                    "detailedMetadataSnippets": [{
+                                                        "snippetText": { "runs": [{ "text": "Compare layered and hexagonal architecture." }] }
+                                                    }]
+                                                }
+                                            },
+                                            {
+                                                "reelShelfRenderer": {
+                                                    "items": [{
+                                                        "shortsLockupViewModel": {
+                                                            "onTap": { "innertubeCommand": { "reelWatchEndpoint": { "videoId": "V8rT6UI3Crg" } } },
+                                                            "overlayMetadata": {
+                                                                "primaryText": { "content": "Uber Architecture in 50s" },
+                                                                "secondaryText": { "content": "959K views" }
+                                                            }
+                                                        }
+                                                    }]
+                                                }
+                                            },
+                                            {
+                                                "shelfRenderer": {
+                                                    "title": { "simpleText": "People also watched" },
+                                                    "content": {
+                                                        "verticalListRenderer": {
+                                                            "items": [{
+                                                                "videoRenderer": {
+                                                                    "videoId": "9bZkp7q19f0",
+                                                                    "title": { "simpleText": "Unrelated Noise Video" }
+                                                                }
+                                                            }]
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "continuationItemRenderer": {
+                                        "continuationEndpoint": { "continuationCommand": { "token": "SEARCH_CONT_2" } }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let page = parse_innertube_search_json(&search_json);
+        assert_eq!(page.estimated_results, Some(42_000));
+        assert_eq!(page.did_you_mean.as_deref(), Some("system architecture patterns"));
+        assert_eq!(page.channels.len(), 1);
+        assert_eq!(page.channels[0].title, "Gaurav Sen");
+        assert!(page.channels[0].verified);
+        assert_eq!(page.videos.len(), 1);
+        assert_eq!(page.videos[0].id, "dQw4w9WgXcQ");
+        assert_eq!(page.videos[0].yt_rank, Some(0));
+        assert!(page.videos[0].channel_verified);
+        assert_eq!(
+            page.videos[0].search_snippet.as_deref(),
+            Some("Compare layered and hexagonal architecture.")
+        );
+        assert_eq!(page.shorts.len(), 1);
+        assert_eq!(page.shorts[0].id, "V8rT6UI3Crg");
+        assert_eq!(page.continuation.as_deref(), Some("SEARCH_CONT_2"));
     }
 }

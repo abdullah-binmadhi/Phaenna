@@ -15,7 +15,7 @@ use crate::api::innertube::{
     fetch_innertube_shelf, fetch_search_suggestions, fetch_suggested_shorts,
     fetch_video_card_enrichment, fetch_video_comments, innertube_edit_watch_later,
     post_comment_reply, post_video_comment, report_youtube_watch_progress, search_innertube,
-    send_video_vote, VideoComment, VideoVote,
+    send_video_vote, SearchChannelCard, VideoComment, VideoVote,
 };
 use crate::api::player::{
     build_mpv_audio_filter_chain, detect_dependencies, ipc_socket_path, spawn_player,
@@ -38,8 +38,9 @@ use crate::config::{
 };
 use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
-    batch_upsert_feed, enrich_video_stats, get_all_cached_videos, get_feed_videos, get_thumb_blob,
-    search_cached_videos, store_thumb_blob, upsert_video, VideoItem,
+    batch_upsert_feed, build_thumb_candidate_urls, enrich_video_stats, extract_yt_url_id,
+    get_all_cached_videos, get_feed_videos, get_thumb_blob, search_cached_videos,
+    store_thumb_blob, upsert_video, VideoItem,
 };
 use crate::db::sync::{
     is_stale, last_synced, mark_synced, HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED,
@@ -75,12 +76,13 @@ use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
 };
 use crate::state::{
-    ActiveOverlay, AnalysisHit, AppState, CaptionsTab, Category, CommentTranslation,
-    ContentFilter, ContentProfile, DetailHit, DetailViewMode, DownloadJobState, HelpHit,
-    ManualToggle, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen, SearchHit, SearchScope,
-    SearchSortOrder, SearchTypeFilter, ShortsSource, SleepTimerMode, SortOrder, StudioPage,
+    parse_search_query, ActiveOverlay, AnalysisHit, AppState, CaptionsTab, Category,
+    CommentTranslation, ContentFilter, ContentProfile, DetailHit, DetailViewMode, DownloadJobState,
+    FailedThumbEntry, HelpHit, ManualToggle, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen,
+    SearchFocus, SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter, SearchViewMode,
+    ShortsSource, SleepTimerMode, SortOrder, StudioPage, ThumbPriority,
 };
-use crate::ui::components::cover::prepare_16_9_thumbnail;
+use crate::ui::components::cover::{is_yt_grey_placeholder, prepare_16_9_thumbnail};
 use crate::ui::help::confirm_quit_button_rects;
 use crate::ui::home::{
     compute_grid_metrics, continue_watching_row_at, effective_grid_area, footer_action_at,
@@ -230,8 +232,14 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(12))
         .user_agent(concat!("phaenna/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let thumb_sem = Arc::new(Semaphore::new(12));
-    let congested_thumb_sem = Arc::new(Semaphore::new(2));
+    let thumb_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(2500))
+        .timeout(Duration::from_millis(4500))
+        .user_agent(crate::services::auth::PHAENNA_USER_AGENT)
+        .build()?;
+    let focused_thumb_sem = Arc::new(Semaphore::new(4));
+    let thumb_sem = Arc::new(Semaphore::new(8));
+    let congested_thumb_sem = Arc::new(Semaphore::new(3));
 
     // 4. Start LAN Companion Remote Server if configured
     if state.config.remote.enabled {
@@ -292,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
                         && matches!(state.search_scope, SearchScope::All | SearchScope::LiveYt)
                     {
                         state.push_search_history(&q);
+                        state.search_last_executed_query = q.clone();
                         spawn_remote_search(
                             &client,
                             state.auth_vault.active_account().cloned(),
@@ -351,36 +360,51 @@ async fn main() -> anyhow::Result<()> {
         if needs_redraw {
             let mut out_handle = io::stdout();
             let _ = execute!(out_handle, BeginSynchronizedUpdate);
+            if state.kitty_flush_needed {
+                state.kitty_flush_needed = false;
+                state.image_cache.clear();
+                state.image_cache_order.clear();
+                let is_kitty = std::env::var("KITTY_WINDOW_ID").is_ok()
+                    || std::env::var("TERM")
+                        .map(|t| t.contains("kitty"))
+                        .unwrap_or(false);
+                if is_kitty {
+                    let _ = std::io::Write::write_all(&mut out_handle, b"\x1b_Ga=d,d=A\x1b\\");
+                }
+            }
             terminal.draw(|frame| ui::render_app(frame, &mut state))?;
             let _ = execute!(out_handle, EndSynchronizedUpdate);
             needs_redraw = false;
+        }
 
-            // Dispatch pending lazy thumbnail fetches; pause network thumbnails while mpv is rebuffering
-            if !(state.has_live_ipc() && state.live_playback.paused_for_cache) {
-                let pending = std::mem::take(&mut state.pending_thumb_requests);
-                let active_sem = if state.config.network_mode.is_congested() || state.has_live_ipc()
-                {
+        // Dispatch priority-sorted thumbnail fetches whenever not actively rebuffering
+        if !state.pending_thumb_requests.is_empty()
+            && !(state.has_live_ipc() && state.live_playback.paused_for_cache)
+        {
+            let mut pending = std::mem::take(&mut state.pending_thumb_requests);
+            pending.sort_by_key(|req| req.priority);
+            let prefer_compact = state.config.network_mode.prefer_compact_thumbs();
+            for req in pending {
+                if state.loading_thumbs.contains(&req.video_id) {
+                    continue;
+                }
+                state.loading_thumbs.insert(req.video_id.clone());
+                let active_sem = if req.priority == ThumbPriority::Focused {
+                    focused_thumb_sem.clone()
+                } else if state.config.network_mode.is_congested() {
                     congested_thumb_sem.clone()
                 } else {
                     thumb_sem.clone()
                 };
-                let prefer_compact =
-                    state.config.network_mode.prefer_compact_thumbs() || state.has_live_ipc();
-                for (vid, url) in pending {
-                    if state.loading_thumbs.contains(&vid) {
-                        continue;
-                    }
-                    state.loading_thumbs.insert(vid.clone());
-                    spawn_thumb_loader(
-                        vid,
-                        url,
-                        pool.clone(),
-                        client.clone(),
-                        active_sem.clone(),
-                        tx.clone(),
-                        prefer_compact,
-                    );
-                }
+                spawn_thumb_loader(
+                    req.video_id,
+                    req.url,
+                    pool.clone(),
+                    thumb_client.clone(),
+                    active_sem,
+                    tx.clone(),
+                    prefer_compact,
+                );
             }
         }
 
@@ -1020,6 +1044,22 @@ fn spawn_card_metadata_enrichment(
     });
 }
 
+struct LoadingThumbGuard {
+    video_id: String,
+    tx: mpsc::Sender<AppMessage>,
+    completed: bool,
+}
+
+impl Drop for LoadingThumbGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.tx.try_send(AppMessage::ThumbnailFailed {
+                video_id: self.video_id.clone(),
+            });
+        }
+    }
+}
+
 fn spawn_thumb_loader(
     video_id: String,
     url: String,
@@ -1030,19 +1070,28 @@ fn spawn_thumb_loader(
     prefer_compact: bool,
 ) {
     tokio::spawn(async move {
+        let mut guard = LoadingThumbGuard {
+            video_id: video_id.clone(),
+            tx: tx.clone(),
+            completed: false,
+        };
         let Ok(_permit) = sem.acquire().await else {
             return;
         };
 
-        // 1. Instant SQLite thumb_blob check before hitting network
+        // 1. Instant SQLite thumb_blobs/videos cache check before network
         if let Ok(Some(bytes)) = get_thumb_blob(&pool, &video_id).await {
             let dec = tokio::task::spawn_blocking(move || {
-                image::load_from_memory(&bytes).ok().map(prepare_16_9_thumbnail)
+                image::load_from_memory(&bytes)
+                    .ok()
+                    .filter(|img| !is_yt_grey_placeholder(img))
+                    .map(prepare_16_9_thumbnail)
             })
             .await
             .ok()
             .flatten();
             if let Some(img) = dec {
+                guard.completed = true;
                 let _ = tx
                     .send(AppMessage::ThumbnailReady {
                         video_id,
@@ -1054,27 +1103,23 @@ fn spawn_thumb_loader(
             }
         }
 
-        // 2. Network fetch + fallback chain (prefer compact ~12KB mqdefault on congested Wi-Fi / active playback)
-        let clean_id = video_id.trim_start_matches("RD");
-        let hq = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", clean_id);
-        let mq = format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", clean_id);
-        let candidates: Vec<String> = if prefer_compact {
-            [mq, hq, url]
-        } else {
-            [url, hq, mq]
-        }
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-
+        // 2. Normalized multi-tier fallback ladder (skips 404 & 120x90 grey placeholders)
+        let candidates = build_thumb_candidate_urls(&video_id, &url, prefer_compact);
         for cand in candidates {
-            if let Ok(resp) = client.get(&cand).send().await {
+            if let Ok(resp) = client
+                .get(&cand)
+                .header("Referer", "https://www.youtube.com/")
+                .header("Accept", "image/jpeg,image/webp,*/*")
+                .send()
+                .await
+            {
                 if resp.status().is_success() {
                     if let Ok(bytes) = resp.bytes().await {
                         let raw_vec = bytes.to_vec();
                         let dec = tokio::task::spawn_blocking(move || {
                             image::load_from_memory(&raw_vec)
                                 .ok()
+                                .filter(|img| !is_yt_grey_placeholder(img))
                                 .map(|img| (prepare_16_9_thumbnail(img), raw_vec))
                         })
                         .await
@@ -1083,6 +1128,7 @@ fn spawn_thumb_loader(
 
                         if let Some((img, raw)) = dec {
                             let _ = store_thumb_blob(&pool, &video_id, &raw).await;
+                            guard.completed = true;
                             let _ = tx
                                 .send(AppMessage::ThumbnailReady {
                                     video_id,
@@ -1097,6 +1143,7 @@ fn spawn_thumb_loader(
             }
         }
 
+        guard.completed = true;
         let _ = tx.send(AppMessage::ThumbnailFailed { video_id }).await;
     });
 }
@@ -1114,27 +1161,59 @@ fn spawn_remote_search(
     let tx_clone = tx.clone();
     let client_clone = client.clone();
     tokio::spawn(async move {
+        let started = Instant::now();
+        let parsed = parse_search_query(&query);
+        let api_q = if parsed.api_query.trim().is_empty() {
+            query.trim().to_string()
+        } else {
+            parsed.api_query
+        };
         let mut continuation = None;
+        let mut shorts = Vec::new();
+        let mut channels: Vec<SearchChannelCard> = Vec::new();
+        let mut did_you_mean = None;
+        let mut estimated_results = None;
+
         let items = match search_innertube(
             &client_clone,
             session.as_ref(),
-            &query,
+            &api_q,
             params.as_deref(),
             None,
         )
         .await
         {
-            Ok(page) if !page.videos.is_empty() => {
+            Ok(page)
+                if !page.videos.is_empty()
+                    || !page.shorts.is_empty()
+                    || !page.channels.is_empty() =>
+            {
                 continuation = page.continuation;
+                shorts = page.shorts;
+                channels = page.channels;
+                did_you_mean = page.did_you_mean;
+                estimated_results = page.estimated_results;
                 page.videos
             }
-            _ => search_youtube(cookies.as_deref(), &query, 18).await,
+            _ => {
+                let mut fb = search_youtube(cookies.as_deref(), &api_q, 18).await;
+                for (i, v) in fb.iter_mut().enumerate() {
+                    v.yt_rank = Some(i);
+                }
+                fb
+            }
         };
+        let latency_ms = started.elapsed().as_millis() as u64;
         let _ = tx_clone
             .send(AppMessage::SearchResults {
                 generation,
                 query,
                 items,
+                shorts,
+                channels,
+                did_you_mean,
+                estimated_results,
+                latency_ms,
                 continuation,
             })
             .await;
@@ -1153,10 +1232,16 @@ fn spawn_more_search_results(
     let tx_clone = tx.clone();
     let client_clone = client.clone();
     tokio::spawn(async move {
+        let parsed = parse_search_query(&query);
+        let api_q = if parsed.api_query.trim().is_empty() {
+            query
+        } else {
+            parsed.api_query
+        };
         let page = search_innertube(
             &client_clone,
             session.as_ref(),
-            &query,
+            &api_q,
             params.as_deref(),
             Some(&continuation),
         )
@@ -1166,6 +1251,7 @@ fn spawn_more_search_results(
             .send(AppMessage::MoreSearchResults {
                 generation,
                 items: page.videos,
+                shorts: page.shorts,
                 continuation: page.continuation,
             })
             .await;
@@ -1233,31 +1319,7 @@ fn open_channel_for_video(
 }
 
 fn extract_youtube_video_id(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    if !(trimmed.contains("youtube.com") || trimmed.contains("youtu.be")) {
-        return None;
-    }
-    if let Some(pos) = trimmed.find("v=") {
-        let cand: String = trimmed[pos + 2..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        if cand.len() == 11 {
-            return Some(cand);
-        }
-    }
-    for prefix in ["youtu.be/", "/shorts/", "/live/", "/embed/"] {
-        if let Some(pos) = trimmed.find(prefix) {
-            let cand: String = trimmed[pos + prefix.len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if cand.len() == 11 {
-                return Some(cand);
-            }
-        }
-    }
-    None
+    extract_yt_url_id(input)
 }
 
 async fn handle_app_message(
@@ -1498,18 +1560,30 @@ async fn handle_app_message(
             generation,
             query: _,
             items,
+            shorts,
+            channels,
+            did_you_mean,
+            estimated_results,
+            latency_ms,
             continuation,
         } => {
             if generation == state.search_generation {
                 state.is_searching_remote = false;
                 state.search_results = items;
+                state.search_shorts = shorts;
+                state.search_channels = channels;
+                state.search_did_you_mean = did_you_mean;
+                state.search_estimated_results = estimated_results;
+                state.search_latency_ms = Some(latency_ms);
                 state.search_continuation = continuation;
                 state.search_cursor = 0;
+                state.kitty_flush_needed = true;
             }
         }
         AppMessage::MoreSearchResults {
             generation,
             items,
+            shorts,
             continuation,
         } => {
             if generation == state.search_generation {
@@ -1520,9 +1594,20 @@ async fn handle_app_message(
                     .iter()
                     .map(|v| v.clean_id().to_string())
                     .collect();
-                for item in items {
+                for mut item in items {
                     if seen.insert(item.clean_id().to_string()) {
+                        item.yt_rank = Some(state.search_results.len());
                         state.search_results.push(item);
+                    }
+                }
+                let mut seen_shorts: std::collections::HashSet<String> = state
+                    .search_shorts
+                    .iter()
+                    .map(|v| v.clean_id().to_string())
+                    .collect();
+                for s in shorts {
+                    if seen_shorts.insert(s.clean_id().to_string()) {
+                        state.search_shorts.push(s);
                     }
                 }
             }
@@ -1744,7 +1829,17 @@ async fn handle_app_message(
         }
         AppMessage::ThumbnailFailed { video_id } => {
             state.loading_thumbs.remove(&video_id);
-            *state.failed_thumbs.entry(video_id).or_insert(0) += 1;
+            let entry = state.failed_thumbs.entry(video_id).or_insert(FailedThumbEntry {
+                attempts: 0,
+                next_retry_at: Instant::now(),
+            });
+            entry.attempts = entry.attempts.saturating_add(1);
+            let delay_secs = match entry.attempts {
+                1 => 4,
+                2 => 10,
+                _ => 30,
+            };
+            entry.next_retry_at = Instant::now() + Duration::from_secs(delay_secs);
         }
         AppMessage::AuthDeviceCodeReady(dev) => {
             state.login_ui.busy = false;
@@ -5357,9 +5452,18 @@ async fn open_search_overlay(state: &mut AppState, pool: &SqlitePool) {
     state.overlay = ActiveOverlay::Search;
     state.search_query.clear();
     state.search_results.clear();
+    state.search_shorts.clear();
+    state.search_channels.clear();
+    state.search_did_you_mean = None;
+    state.search_estimated_results = None;
+    state.search_latency_ms = None;
+    state.search_last_executed_query.clear();
     state.search_suggestions.clear();
     state.search_continuation = None;
-    state.search_local_results = get_all_cached_videos(pool, 16).await.unwrap_or_default();
+    state.search_focus = SearchFocus::Query;
+    state.return_to_search = false;
+    state.kitty_flush_needed = true;
+    state.search_local_results = get_all_cached_videos(pool, 24).await.unwrap_or_default();
     state.search_cursor = 0;
 }
 
@@ -5380,14 +5484,22 @@ async fn trigger_search_update(
     let q = state.search_query.trim().to_string();
     if q.is_empty() {
         state.search_results.clear();
+        state.search_shorts.clear();
+        state.search_channels.clear();
+        state.search_did_you_mean = None;
+        state.search_estimated_results = None;
+        state.search_latency_ms = None;
+        state.search_last_executed_query.clear();
         state.search_suggestions.clear();
         state.search_pending_remote = false;
         state.is_searching_remote = false;
+        state.kitty_flush_needed = true;
         return;
     }
 
     if remote_now {
         state.search_pending_remote = false;
+        state.search_last_executed_query = q.clone();
         spawn_search_suggestions(client, q.clone(), state.search_generation, tx);
         if matches!(state.search_scope, SearchScope::All | SearchScope::LiveYt) {
             state.push_search_history(&q);
@@ -5426,6 +5538,7 @@ async fn apply_search_hit(
             if state.search_scope != sc {
                 state.search_scope = sc;
                 state.search_cursor = 0;
+                state.kitty_flush_needed = true;
                 if matches!(sc, SearchScope::All | SearchScope::LiveYt)
                     && !state.search_query.trim().is_empty()
                     && state.search_results.is_empty()
@@ -5437,10 +5550,11 @@ async fn apply_search_hit(
         SearchHit::SetType(tf) => {
             if state.search_type_filter != tf {
                 let server_changed =
-                    matches!(state.search_type_filter, SearchTypeFilter::Videos)
-                        || matches!(tf, SearchTypeFilter::Videos);
+                    matches!(state.search_type_filter, SearchTypeFilter::Videos | SearchTypeFilter::Live)
+                        || matches!(tf, SearchTypeFilter::Videos | SearchTypeFilter::Live);
                 state.search_type_filter = tf;
                 state.search_cursor = 0;
+                state.kitty_flush_needed = true;
                 if server_changed && !state.search_query.trim().is_empty() {
                     trigger_search_update(state, pool, tx, client, true).await;
                 }
@@ -5450,6 +5564,7 @@ async fn apply_search_hit(
             if state.search_date_filter != df {
                 state.search_date_filter = df;
                 state.search_cursor = 0;
+                state.kitty_flush_needed = true;
                 if !state.search_query.trim().is_empty() {
                     trigger_search_update(state, pool, tx, client, true).await;
                 }
@@ -5459,6 +5574,7 @@ async fn apply_search_hit(
             if state.search_duration_filter != df {
                 state.search_duration_filter = df;
                 state.search_cursor = 0;
+                state.kitty_flush_needed = true;
                 if !state.search_query.trim().is_empty() {
                     trigger_search_update(state, pool, tx, client, true).await;
                 }
@@ -5474,6 +5590,7 @@ async fn apply_search_hit(
                         );
                 state.search_sort_order = so;
                 state.search_cursor = 0;
+                state.kitty_flush_needed = true;
                 if server_changed && !state.search_query.trim().is_empty() {
                     trigger_search_update(state, pool, tx, client, true).await;
                 }
@@ -5482,6 +5599,25 @@ async fn apply_search_hit(
         SearchHit::ToggleHideWatched => {
             state.search_hide_watched = !state.search_hide_watched;
             state.search_cursor = 0;
+            state.kitty_flush_needed = true;
+        }
+        SearchHit::ToggleHd4k => {
+            state.search_hd_4k_only = !state.search_hd_4k_only;
+            state.search_cursor = 0;
+            state.kitty_flush_needed = true;
+            if !state.search_query.trim().is_empty() {
+                trigger_search_update(state, pool, tx, client, true).await;
+            }
+        }
+        SearchHit::ToggleViewMode => {
+            state.search_view_mode = state.search_view_mode.toggle();
+            state.kitty_flush_needed = true;
+        }
+        SearchHit::SetViewMode(mode) => {
+            if state.search_view_mode != mode {
+                state.search_view_mode = mode;
+                state.kitty_flush_needed = true;
+            }
         }
         SearchHit::SelectRow(idx) => {
             let total = state.combined_search_items().len();
@@ -5494,9 +5630,12 @@ async fn apply_search_hit(
                     })
                     .unwrap_or(false);
                 state.search_cursor = idx;
+                state.search_focus = SearchFocus::Results;
                 state.search_last_click = Some((idx, now));
                 if is_double {
                     if let Some(v) = state.combined_search_items().get(idx).cloned() {
+                        state.return_to_search = true;
+                        state.kitty_flush_needed = true;
                         open_detail_for_video(v, state, pool, tx, client);
                     }
                 }
@@ -5505,11 +5644,14 @@ async fn apply_search_hit(
         SearchHit::ActionPlay => {
             if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
                 state.overlay = ActiveOverlay::None;
+                state.kitty_flush_needed = true;
                 start_nonblocking_playback(&v, None, state, pool, tx, client).await;
             }
         }
         SearchHit::ActionDetail => {
             if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
+                state.return_to_search = true;
+                state.kitty_flush_needed = true;
                 open_detail_for_video(v, state, pool, tx, client);
             }
         }
@@ -5525,9 +5667,81 @@ async fn apply_search_hit(
         }
         SearchHit::ActionChannel => {
             if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
-                state.overlay = ActiveOverlay::None;
+                state.return_to_search = true;
+                state.kitty_flush_needed = true;
                 open_channel_for_video(&v, state, tx, client);
             }
+        }
+        SearchHit::OpenSpotlightChannel(idx) => {
+            if let Some(ch) = state.search_channels.get(idx).cloned() {
+                let stub = VideoItem {
+                    id: ch.channel_id.clone(),
+                    title: ch.title.clone(),
+                    uploader: Some(ch.title.clone()),
+                    channel: Some(ch.title),
+                    channel_id: Some(ch.channel_id),
+                    ..Default::default()
+                };
+                state.return_to_search = true;
+                state.kitty_flush_needed = true;
+                open_channel_for_video(&stub, state, tx, client);
+            }
+        }
+        SearchHit::FilterByChannel(handle_or_name) => {
+            let clean = handle_or_name.trim().trim_start_matches('@');
+            let tok = clean.split_whitespace().next().unwrap_or(clean);
+            if !tok.is_empty() {
+                let cur = state.search_query.trim();
+                let op = format!("@{tok}");
+                if !cur.to_ascii_lowercase().contains(&op.to_ascii_lowercase()) {
+                    state.search_query = if cur.is_empty() {
+                        op
+                    } else {
+                        format!("{cur} {op}")
+                    };
+                }
+                trigger_search_update(state, pool, tx, client, true).await;
+            }
+        }
+        SearchHit::RetryThumbs => {
+            state.retry_failed_thumbs();
+            state.kitty_flush_needed = true;
+            state.show_toast("Retrying failed thumbnails...");
+        }
+        SearchHit::ExecuteQueryNow => {
+            if !state.search_query.trim().is_empty() {
+                trigger_search_update(state, pool, tx, client, true).await;
+                state.search_focus = SearchFocus::Results;
+            }
+        }
+        SearchHit::FocusQuery => {
+            state.search_focus = SearchFocus::Query;
+        }
+        SearchHit::DirectJumpDetail(vid) => {
+            let stub = VideoItem {
+                id: vid.clone(),
+                title: format!("YouTube Video ({vid})"),
+                webpage_url: Some(format!("https://www.youtube.com/watch?v={vid}")),
+                ..Default::default()
+            };
+            state.return_to_search = true;
+            state.kitty_flush_needed = true;
+            open_detail_for_video(stub, state, pool, tx, client);
+        }
+        SearchHit::DirectJumpPlay(vid) => {
+            let stub = VideoItem {
+                id: vid.clone(),
+                title: format!("YouTube Video ({vid})"),
+                webpage_url: Some(format!("https://www.youtube.com/watch?v={vid}")),
+                ..Default::default()
+            };
+            state.overlay = ActiveOverlay::None;
+            state.kitty_flush_needed = true;
+            start_nonblocking_playback(&stub, None, state, pool, tx, client).await;
+        }
+        SearchHit::CloseSearch => {
+            state.overlay = ActiveOverlay::None;
+            state.kitty_flush_needed = true;
         }
         SearchHit::LoadMore => {
             if let Some(cont) = state.search_continuation.clone() {
@@ -5716,28 +5930,36 @@ async fn handle_mouse_event(
                 {
                     if !in_rect(modal) {
                         state.overlay = ActiveOverlay::None;
+                        state.kitty_flush_needed = true;
                         return true;
                     }
                 }
             }
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
                 state.overlay = ActiveOverlay::None;
+                state.kitty_flush_needed = true;
                 return true;
             }
             if matches!(mouse.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
                 let total = state.combined_search_items().len();
                 if total > 0 {
+                    let step = if state.search_view_mode == SearchViewMode::Grid {
+                        state.search_grid_cols.max(1)
+                    } else {
+                        1
+                    };
                     if matches!(mouse.kind, MouseEventKind::ScrollDown) {
-                        state.search_cursor = (state.search_cursor + 1).min(total - 1);
-                        if state.search_cursor + 3 >= total
+                        state.search_cursor = (state.search_cursor + step).min(total - 1);
+                        if state.search_cursor + step * 2 >= total
                             && state.search_continuation.is_some()
                             && !state.is_searching_remote
                         {
                             apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
                         }
                     } else {
-                        state.search_cursor = state.search_cursor.saturating_sub(1);
+                        state.search_cursor = state.search_cursor.saturating_sub(step);
                     }
+                    state.kitty_flush_needed = true;
                     return true;
                 }
             }
@@ -6387,6 +6609,11 @@ async fn handle_key_event(
                 KeyCode::Esc | KeyCode::Backspace => {
                     if let Some(prev) = state.detail_history.pop() {
                         open_detail_for_video(prev, state, pool, tx, client);
+                    } else if state.return_to_search {
+                        state.return_to_search = false;
+                        state.screen = Screen::Home;
+                        state.overlay = ActiveOverlay::Search;
+                        state.kitty_flush_needed = true;
                     } else {
                         state.screen = Screen::Home;
                     }
@@ -6566,7 +6793,16 @@ async fn handle_key_event(
         }
         Screen::Channel => {
             match code {
-                KeyCode::Esc | KeyCode::Backspace => state.screen = state.channel_return_screen,
+                KeyCode::Esc | KeyCode::Backspace => {
+                    if state.return_to_search {
+                        state.return_to_search = false;
+                        state.screen = Screen::Home;
+                        state.overlay = ActiveOverlay::Search;
+                        state.kitty_flush_needed = true;
+                    } else {
+                        state.screen = state.channel_return_screen;
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     if !state.channel_videos.is_empty() {
                         state.channel_cursor =
@@ -7445,38 +7681,104 @@ async fn handle_overlay_key(
             _ => {}
         },
         ActiveOverlay::Search => match code {
-            KeyCode::Esc => state.overlay = ActiveOverlay::None,
-            KeyCode::Tab => {
-                let candidate = state
-                    .search_suggestions
-                    .first()
-                    .or_else(|| state.search_history.first())
-                    .cloned();
-                if let Some(s) = candidate {
-                    apply_search_hit(SearchHit::ApplySuggestion(s), state, pool, tx, client).await;
+            KeyCode::Esc => {
+                if state.search_focus == SearchFocus::Results {
+                    state.search_focus = SearchFocus::Query;
+                } else {
+                    state.overlay = ActiveOverlay::None;
+                    state.kitty_flush_needed = true;
                 }
             }
-            KeyCode::Up => state.search_cursor = state.search_cursor.saturating_sub(1),
+            KeyCode::Tab => {
+                if state.search_focus == SearchFocus::Results {
+                    state.search_focus = SearchFocus::Query;
+                } else {
+                    let candidate = state
+                        .search_did_you_mean
+                        .as_ref()
+                        .or_else(|| state.search_suggestions.first())
+                        .or_else(|| state.search_history.first())
+                        .cloned();
+                    if let Some(s) = candidate {
+                        apply_search_hit(SearchHit::ApplySuggestion(s), state, pool, tx, client)
+                            .await;
+                    }
+                }
+            }
+            KeyCode::Up => {
+                let cols = if state.search_view_mode == SearchViewMode::Grid {
+                    state.search_grid_cols.max(1)
+                } else {
+                    1
+                };
+                if state.search_focus == SearchFocus::Results {
+                    if state.search_cursor < cols {
+                        state.search_focus = SearchFocus::Query;
+                    } else {
+                        state.search_cursor -= cols;
+                        state.kitty_flush_needed = true;
+                    }
+                }
+            }
             KeyCode::Down => {
                 let total = state.combined_search_items().len();
+                let cols = if state.search_view_mode == SearchViewMode::Grid {
+                    state.search_grid_cols.max(1)
+                } else {
+                    1
+                };
                 if total > 0 {
-                    state.search_cursor = (state.search_cursor + 1).min(total - 1);
-                    if state.search_cursor + 3 >= total
-                        && state.search_continuation.is_some()
-                        && !state.is_searching_remote
-                    {
-                        apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
+                    if state.search_focus == SearchFocus::Query {
+                        state.search_focus = SearchFocus::Results;
+                        state.search_cursor = state.search_cursor.min(total - 1);
+                    } else {
+                        let prev = state.search_cursor;
+                        state.search_cursor = (state.search_cursor + cols).min(total - 1);
+                        if state.search_cursor != prev {
+                            state.kitty_flush_needed = true;
+                        }
+                        if state.search_cursor + cols * 2 >= total
+                            && state.search_continuation.is_some()
+                            && !state.is_searching_remote
+                        {
+                            apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
+                        }
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if state.search_focus == SearchFocus::Results && state.search_cursor > 0 {
+                    state.search_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if state.search_focus == SearchFocus::Results {
+                    let total = state.combined_search_items().len();
+                    if state.search_cursor + 1 < total {
+                        state.search_cursor += 1;
                     }
                 }
             }
             KeyCode::PageUp => {
-                state.search_cursor = state.search_cursor.saturating_sub(5);
+                let step = if state.search_view_mode == SearchViewMode::Grid {
+                    state.search_grid_cols.max(1) * 2
+                } else {
+                    5
+                };
+                state.search_cursor = state.search_cursor.saturating_sub(step);
+                state.kitty_flush_needed = true;
             }
             KeyCode::PageDown => {
                 let total = state.combined_search_items().len();
                 if total > 0 {
-                    state.search_cursor = (state.search_cursor + 5).min(total - 1);
-                    if state.search_cursor + 3 >= total
+                    let step = if state.search_view_mode == SearchViewMode::Grid {
+                        state.search_grid_cols.max(1) * 2
+                    } else {
+                        5
+                    };
+                    state.search_cursor = (state.search_cursor + step).min(total - 1);
+                    state.kitty_flush_needed = true;
+                    if state.search_cursor + step >= total
                         && state.search_continuation.is_some()
                         && !state.is_searching_remote
                     {
@@ -7487,17 +7789,19 @@ async fn handle_overlay_key(
             KeyCode::Enter => {
                 let q = state.search_query.trim().to_string();
                 if let Some(vid) = extract_youtube_video_id(&q) {
-                    let stub = VideoItem {
-                        id: vid.clone(),
-                        title: format!("YouTube Video ({vid})"),
-                        webpage_url: Some(format!("https://www.youtube.com/watch?v={vid}")),
-                        ..VideoItem::default()
-                    };
-                    open_detail_for_video(stub, state, pool, tx, client);
+                    apply_search_hit(SearchHit::DirectJumpDetail(vid), state, pool, tx, client)
+                        .await;
+                } else if !q.is_empty()
+                    && (state.search_pending_remote || q != state.search_last_executed_query)
+                {
+                    trigger_search_update(state, pool, tx, client, true).await;
+                    state.search_focus = SearchFocus::Results;
                 } else if let Some(v) = state.combined_search_items().get(state.search_cursor).cloned() {
                     if !q.is_empty() {
                         state.push_search_history(&q);
                     }
+                    state.return_to_search = true;
+                    state.kitty_flush_needed = true;
                     open_detail_for_video(v, state, pool, tx, client);
                 } else if !q.is_empty() {
                     trigger_search_update(state, pool, tx, client, true).await;
@@ -7526,6 +7830,9 @@ async fn handle_overlay_key(
                 let next = state.search_scope.next();
                 apply_search_hit(SearchHit::SetScope(next), state, pool, tx, client).await;
             }
+            KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+                apply_search_hit(SearchHit::ToggleViewMode, state, pool, tx, client).await;
+            }
             KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
                 apply_search_hit(SearchHit::LoadMore, state, pool, tx, client).await;
             }
@@ -7535,20 +7842,33 @@ async fn handle_overlay_key(
             KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
                 apply_search_hit(SearchHit::ActionWatchLater, state, pool, tx, client).await;
             }
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
                 apply_search_hit(SearchHit::ActionChannel, state, pool, tx, client).await;
             }
             KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                apply_search_hit(SearchHit::ActionPlay, state, pool, tx, client).await;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R')
+                if state.search_focus == SearchFocus::Results =>
+            {
+                apply_search_hit(SearchHit::RetryThumbs, state, pool, tx, client).await;
+            }
+            KeyCode::Char('/') if state.search_focus == SearchFocus::Results => {
+                state.search_focus = SearchFocus::Query;
+            }
+            KeyCode::Char(' ') if state.search_focus == SearchFocus::Results => {
                 apply_search_hit(SearchHit::ActionPlay, state, pool, tx, client).await;
             }
             KeyCode::Char('p') if state.search_query.is_empty() => {
                 apply_search_hit(SearchHit::ActionPlay, state, pool, tx, client).await;
             }
             KeyCode::Backspace => {
+                state.search_focus = SearchFocus::Query;
                 state.search_query.pop();
                 trigger_search_update(state, pool, tx, client, false).await;
             }
             KeyCode::Char(c) => {
+                state.search_focus = SearchFocus::Query;
                 state.search_query.push(c);
                 trigger_search_update(state, pool, tx, client, false).await;
             }

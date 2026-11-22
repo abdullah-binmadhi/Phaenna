@@ -103,6 +103,15 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS thumb_blobs (
+            video_id TEXT PRIMARY KEY,
+            blob BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

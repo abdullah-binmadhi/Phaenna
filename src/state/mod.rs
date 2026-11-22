@@ -1,7 +1,7 @@
 //! Central Application State — single source of truth for screens, overlays, cache & playback.
 
 use crate::api::dislike::DislikeInfo;
-use crate::api::innertube::{VideoComment, VideoVote};
+use crate::api::innertube::{SearchChannelCard, VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
@@ -24,11 +24,144 @@ use crate::services::remote::RemoteServerHandle;
 use crate::services::substyler::SubtitlePreset;
 use crate::services::updater::UpdateInfo;
 use crate::ui::theme::{self, extract_ambilight_palette, ThemePalette};
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum ThumbPriority {
+    Focused = 0,
+    #[default]
+    Visible = 1,
+    Prefetch = 2,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThumbRequest {
+    pub video_id: String,
+    pub url: String,
+    pub priority: ThumbPriority,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedThumbEntry {
+    pub attempts: u8,
+    pub next_retry_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchViewMode {
+    #[default]
+    Grid,
+    Split,
+}
+
+impl SearchViewMode {
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::Grid => Self::Split,
+            Self::Split => Self::Grid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchFocus {
+    #[default]
+    Query,
+    Results,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedSearchQuery {
+    pub api_query: String,
+    pub tokens: Vec<String>,
+    pub exact_phrases: Vec<String>,
+    pub excluded_terms: Vec<String>,
+    pub channel_filter: Option<String>,
+    pub force_type: Option<SearchTypeFilter>,
+    pub only_4k: bool,
+    pub only_hd: bool,
+    pub only_live: bool,
+    pub only_unwatched: bool,
+}
+
+pub fn parse_search_query(raw: &str) -> ParsedSearchQuery {
+    let mut parsed = ParsedSearchQuery::default();
+    let mut api_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    let bytes = raw.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let phrase = raw[start..i].trim().to_lowercase();
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+            }
+            if !phrase.is_empty() {
+                api_parts.push(format!("\"{phrase}\""));
+                for w in phrase.split_whitespace() {
+                    parsed.tokens.push(w.to_string());
+                }
+                parsed.exact_phrases.push(phrase);
+            }
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let tok = &raw[start..i];
+        let low = tok.to_ascii_lowercase();
+        if let Some(ex) = low.strip_prefix('-').filter(|s| !s.is_empty()) {
+            parsed.excluded_terms.push(ex.to_string());
+            api_parts.push(format!("-{ex}"));
+        } else if matches!(low.as_str(), "is:short" | "is:shorts") {
+            parsed.force_type = Some(SearchTypeFilter::Shorts);
+        } else if matches!(low.as_str(), "is:video" | "is:videos") {
+            parsed.force_type = Some(SearchTypeFilter::Videos);
+        } else if low == "is:live" {
+            parsed.only_live = true;
+            parsed.force_type = Some(SearchTypeFilter::Live);
+        } else if low == "is:4k" {
+            parsed.only_4k = true;
+        } else if low == "is:hd" {
+            parsed.only_hd = true;
+        } else if low == "is:unwatched" {
+            parsed.only_unwatched = true;
+        } else if let Some(ch) = low.strip_prefix("ch:").or_else(|| low.strip_prefix("channel:")) {
+            let clean = ch.trim_start_matches('@').trim();
+            if !clean.is_empty() {
+                parsed.channel_filter = Some(clean.to_string());
+                api_parts.push(clean.to_string());
+            }
+        } else if let Some(handle) = low.strip_prefix('@') {
+            let clean = handle.trim();
+            if !clean.is_empty() {
+                parsed.channel_filter = Some(clean.to_string());
+                api_parts.push(clean.to_string());
+            }
+        } else if !low.is_empty() {
+            parsed.tokens.push(low.clone());
+            api_parts.push(tok.to_string());
+        }
+    }
+    parsed.api_query = api_parts.join(" ");
+    parsed
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisHit {
@@ -284,9 +417,15 @@ pub struct AppState {
     pub is_loading_channel: bool,
     pub channel_return_screen: Screen,
 
-    // Search Studio + 120ms/350ms debounce + smart filters
+    // Search Studio + 120ms/350ms debounce + smart filters + hybrid RRF engine
     pub search_query: String,
     pub search_results: Vec<VideoItem>,
+    pub search_shorts: Vec<VideoItem>,
+    pub search_channels: Vec<SearchChannelCard>,
+    pub search_did_you_mean: Option<String>,
+    pub search_estimated_results: Option<u64>,
+    pub search_latency_ms: Option<u64>,
+    pub search_last_executed_query: String,
     pub search_local_results: Vec<VideoItem>,
     pub search_suggestions: Vec<String>,
     pub search_history: Vec<String>,
@@ -297,6 +436,11 @@ pub struct AppState {
     pub search_duration_filter: SearchDurationFilter,
     pub search_sort_order: SearchSortOrder,
     pub search_hide_watched: bool,
+    pub search_hd_4k_only: bool,
+    pub search_view_mode: SearchViewMode,
+    pub search_focus: SearchFocus,
+    pub search_grid_cols: usize,
+    pub return_to_search: bool,
     pub search_hitboxes: Vec<(Rect, SearchHit)>,
     pub search_results_rect: Rect,
     pub search_last_click: Option<(usize, Instant)>,
@@ -380,11 +524,14 @@ pub struct AppState {
     // Thumbnail & Ambilight Cache (keyed by (video_id, cell_w, cell_h) for 100% edge-to-edge cover)
     pub picker: Option<Picker>,
     pub image_cache: HashMap<(String, u16, u16), Box<dyn StatefulProtocol>>,
+    pub image_cache_order: VecDeque<(String, u16, u16)>,
     pub raw_thumbs: HashMap<String, image::DynamicImage>,
+    pub raw_thumbs_order: VecDeque<String>,
     pub ambilight_cache: HashMap<String, ThemePalette>,
     pub loading_thumbs: HashSet<String>,
-    pub failed_thumbs: HashMap<String, u8>,
-    pub pending_thumb_requests: Vec<(String, String)>,
+    pub failed_thumbs: HashMap<String, FailedThumbEntry>,
+    pub pending_thumb_requests: Vec<ThumbRequest>,
+    pub kitty_flush_needed: bool,
 }
 
 impl AppState {
@@ -479,6 +626,12 @@ impl AppState {
 
             search_query: String::new(),
             search_results: Vec::new(),
+            search_shorts: Vec::new(),
+            search_channels: Vec::new(),
+            search_did_you_mean: None,
+            search_estimated_results: None,
+            search_latency_ms: None,
+            search_last_executed_query: String::new(),
             search_local_results: Vec::new(),
             search_suggestions: Vec::new(),
             search_history: Vec::new(),
@@ -489,6 +642,11 @@ impl AppState {
             search_duration_filter: SearchDurationFilter::Any,
             search_sort_order: SearchSortOrder::Relevance,
             search_hide_watched: false,
+            search_hd_4k_only: false,
+            search_view_mode: SearchViewMode::Grid,
+            search_focus: SearchFocus::Query,
+            search_grid_cols: 3,
+            return_to_search: false,
             search_hitboxes: Vec::new(),
             search_results_rect: Rect::default(),
             search_last_click: None,
@@ -565,11 +723,14 @@ impl AppState {
 
             picker: None,
             image_cache: HashMap::new(),
+            image_cache_order: VecDeque::new(),
             raw_thumbs: HashMap::new(),
+            raw_thumbs_order: VecDeque::new(),
             ambilight_cache: HashMap::new(),
             loading_thumbs: HashSet::new(),
             failed_thumbs: HashMap::new(),
             pending_thumb_requests: Vec::new(),
+            kitty_flush_needed: false,
         }
     }
 
@@ -1127,13 +1288,14 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let q_trimmed = self.search_query.trim().to_lowercase();
-        let q_clean = q_trimmed
-            .strip_prefix("ch:")
-            .unwrap_or(&q_trimmed)
-            .trim_start_matches('@')
-            .to_string();
-        let tokens: Vec<&str> = q_clean.split_whitespace().collect();
+        let parsed = parse_search_query(&self.search_query);
+        let eff_type = parsed.force_type.unwrap_or(self.search_type_filter);
+        let query_wants_shorts = eff_type == SearchTypeFilter::Shorts
+            || parsed
+                .tokens
+                .iter()
+                .any(|t| t == "short" || t == "shorts");
+        let q_joined = parsed.tokens.join(" ");
 
         let sub_items: Vec<&VideoItem> = self
             .categories
@@ -1160,6 +1322,14 @@ impl AppState {
                 for v in &self.search_results {
                     push_dedupe(v);
                 }
+                if eff_type == SearchTypeFilter::Shorts
+                    || query_wants_shorts
+                    || self.search_results.len() < 8
+                {
+                    for v in &self.search_shorts {
+                        push_dedupe(v);
+                    }
+                }
                 for v in &self.search_local_results {
                     push_dedupe(v);
                 }
@@ -1168,28 +1338,36 @@ impl AppState {
                 for v in &self.search_results {
                     push_dedupe(v);
                 }
+                if eff_type == SearchTypeFilter::Shorts || query_wants_shorts {
+                    for v in &self.search_shorts {
+                        push_dedupe(v);
+                    }
+                }
             }
             SearchScope::Subscribed => {
                 for v in sub_items.into_iter().chain(self.shorts_subscribed.iter()) {
-                    if q_clean.is_empty() || video_matches_tokens(v, &tokens) {
+                    if parsed.tokens.is_empty() || video_matches_parsed(v, &parsed) {
                         push_dedupe(v);
                     }
                 }
             }
             SearchScope::Cached => {
                 for v in &self.search_local_results {
-                    push_dedupe(v);
+                    if parsed.tokens.is_empty() || video_matches_parsed(v, &parsed) {
+                        push_dedupe(v);
+                    }
                 }
             }
         }
 
-        // Apply Search filters
+        // Apply Search filters + inline operator constraints
         let min_ts = self.search_date_filter.min_timestamp(now);
+        let hide_watched = self.search_hide_watched || parsed.only_unwatched;
         pool.retain(|v| {
-            if self.search_hide_watched && self.is_video_watched(&v.id) {
+            if hide_watched && self.is_video_watched(&v.id) {
                 return false;
             }
-            match self.search_type_filter {
+            match eff_type {
                 SearchTypeFilter::All => {}
                 SearchTypeFilter::Videos => {
                     if v.is_shorts() {
@@ -1200,6 +1378,37 @@ impl AppState {
                     if !v.is_shorts() {
                         return false;
                     }
+                }
+                SearchTypeFilter::Live => {
+                    if !v.is_live_stream() {
+                        return false;
+                    }
+                }
+            }
+            if parsed.only_live && !v.is_live_stream() {
+                return false;
+            }
+            if !parsed.exact_phrases.is_empty() {
+                let hay = format!(
+                    "{} {} {}",
+                    v.title,
+                    v.display_uploader(),
+                    v.search_snippet.as_deref().unwrap_or("")
+                )
+                .to_lowercase();
+                if !parsed.exact_phrases.iter().all(|p| hay.contains(p)) {
+                    return false;
+                }
+            }
+            if !parsed.excluded_terms.is_empty() {
+                let hay = format!("{} {}", v.title, v.display_uploader()).to_lowercase();
+                if parsed.excluded_terms.iter().any(|ex| hay.contains(ex)) {
+                    return false;
+                }
+            }
+            if let Some(ref ch_req) = parsed.channel_filter {
+                if !v.display_uploader().to_lowercase().contains(ch_req) {
+                    return false;
                 }
             }
             if !self.search_duration_filter.matches(v.duration) {
@@ -1215,18 +1424,34 @@ impl AppState {
             true
         });
 
-        // Score & sort
+        // Score with Hybrid Reciprocal Rank Fusion (YouTube rank + text/fuzzy/quality priors)
+        let matcher = SkimMatcherV2::default();
         let mut scored: Vec<(i64, VideoItem)> = pool
             .into_iter()
             .map(|v| {
-                let s = search_relevance_score(&v, &q_clean, &tokens, &sub_uploaders, now);
+                let s = search_relevance_score(
+                    &v,
+                    &q_joined,
+                    &parsed,
+                    &sub_uploaders,
+                    &self.progress_map,
+                    query_wants_shorts,
+                    &matcher,
+                    now,
+                );
                 (s, v)
             })
             .collect();
 
         match self.search_sort_order {
             SearchSortOrder::Relevance => {
-                scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+                scored.sort_by(|a, b| {
+                    b.0.cmp(&a.0).then_with(|| {
+                        a.1.yt_rank
+                            .unwrap_or(usize::MAX)
+                            .cmp(&b.1.yt_rank.unwrap_or(usize::MAX))
+                    })
+                });
             }
             SearchSortOrder::Newest => {
                 scored.sort_by(|a, b| {
@@ -1268,6 +1493,8 @@ impl AppState {
     }
 
     pub fn search_params_token(&self) -> Option<String> {
+        let parsed = parse_search_query(&self.search_query);
+        let eff_type = parsed.force_type.unwrap_or(self.search_type_filter);
         let sort_code = match self.search_sort_order {
             SearchSortOrder::Relevance => 0,
             SearchSortOrder::Newest => 2,
@@ -1276,6 +1503,7 @@ impl AppState {
         };
         let date_code = match self.search_date_filter {
             SearchDateFilter::Any => 0,
+            SearchDateFilter::Hour => 1,
             SearchDateFilter::Today => 2,
             SearchDateFilter::Week => 3,
             SearchDateFilter::Month => 4,
@@ -1287,8 +1515,19 @@ impl AppState {
             SearchDurationFilter::Medium => 3,
             SearchDurationFilter::Long => 2,
         };
-        let videos_only = self.search_type_filter == SearchTypeFilter::Videos;
-        crate::api::innertube::encode_search_params(sort_code, date_code, dur_code, videos_only)
+        let videos_only = eff_type == SearchTypeFilter::Videos;
+        let is_live = eff_type == SearchTypeFilter::Live || parsed.only_live;
+        let is_4k = self.search_hd_4k_only || parsed.only_4k;
+        let is_hd = parsed.only_hd;
+        crate::api::innertube::encode_search_params_ex(
+            sort_code,
+            date_code,
+            dur_code,
+            videos_only,
+            is_hd,
+            is_4k,
+            is_live,
+        )
     }
 
     pub fn all_known_videos(&self) -> Vec<VideoItem> {
@@ -1319,25 +1558,72 @@ impl AppState {
 
         let ambi = extract_ambilight_palette(&img, self.base_theme());
         self.ambilight_cache.insert(video_id.clone(), ambi);
+        if self.raw_thumbs.contains_key(&video_id) {
+            if let Some(pos) = self.raw_thumbs_order.iter().position(|x| x == &video_id) {
+                self.raw_thumbs_order.remove(pos);
+            }
+        } else if self.raw_thumbs.len() >= 240 {
+            for _ in 0..40 {
+                if let Some(evicted) = self.raw_thumbs_order.pop_front() {
+                    self.raw_thumbs.remove(&evicted);
+                    self.image_cache.retain(|(id, _, _), _| id != &evicted);
+                    self.image_cache_order.retain(|(id, _, _)| id != &evicted);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.raw_thumbs_order.push_back(video_id.clone());
         self.raw_thumbs.insert(video_id.clone(), img);
         self.image_cache.retain(|(id, _, _), _| id != &video_id);
+        self.image_cache_order.retain(|(id, _, _)| id != &video_id);
     }
 
     pub fn queue_thumb_if_needed(&mut self, id: &str, url: &str) {
-        if self.raw_thumbs.contains_key(id)
-            || self.loading_thumbs.contains(id)
-            || self.failed_thumbs.get(id).copied().unwrap_or(0) >= 2
-        {
+        self.queue_thumb_with_priority(id, url, ThumbPriority::Visible);
+    }
+
+    pub fn queue_thumb_with_priority(&mut self, id: &str, url: &str, priority: ThumbPriority) {
+        if id.is_empty() || self.raw_thumbs.contains_key(id) || self.loading_thumbs.contains(id) {
             return;
         }
-        if !self
-            .pending_thumb_requests
-            .iter()
-            .any(|(eid, _)| eid == id)
-        {
-            self.pending_thumb_requests
-                .push((id.to_string(), url.to_string()));
+        if let Some(fail) = self.failed_thumbs.get(id) {
+            if fail.attempts >= 3 || Instant::now() < fail.next_retry_at {
+                return;
+            }
         }
+        if let Some(existing) = self
+            .pending_thumb_requests
+            .iter_mut()
+            .find(|req| req.video_id == id)
+        {
+            if priority < existing.priority {
+                existing.priority = priority;
+            }
+            if existing.url.is_empty() && !url.is_empty() {
+                existing.url = url.to_string();
+            }
+            return;
+        }
+        self.pending_thumb_requests.push(ThumbRequest {
+            video_id: id.to_string(),
+            url: url.to_string(),
+            priority,
+        });
+    }
+
+    pub fn is_thumb_failed(&self, id: &str) -> bool {
+        !self.raw_thumbs.contains_key(id)
+            && !self.loading_thumbs.contains(id)
+            && self
+                .failed_thumbs
+                .get(id)
+                .map(|f| f.attempts >= 3)
+                .unwrap_or(false)
+    }
+
+    pub fn retry_failed_thumbs(&mut self) {
+        self.failed_thumbs.clear();
     }
 
     pub async fn sync_calendar_tz(&mut self, pool: &sqlx::SqlitePool) {
@@ -1353,53 +1639,106 @@ impl AppState {
     }
 }
 
-fn video_matches_tokens(v: &VideoItem, tokens: &[&str]) -> bool {
-    if tokens.is_empty() {
-        return true;
-    }
+fn video_matches_parsed(v: &VideoItem, parsed: &ParsedSearchQuery) -> bool {
     let title_l = v.title.to_lowercase();
     let up_l = v.display_uploader().to_lowercase();
-    tokens
-        .iter()
-        .all(|t| title_l.contains(t) || up_l.contains(t))
-}
-
-fn search_relevance_score(
-    v: &VideoItem,
-    q_clean: &str,
-    tokens: &[&str],
-    sub_uploaders: &HashSet<String>,
-    now_unix: i64,
-) -> i64 {
-    if q_clean.is_empty() {
-        let rec = v.timestamp.unwrap_or(0) / 86_400;
-        let views = v.view_count.unwrap_or(0).min(10_000_000) as i64 / 50_000;
-        return rec + views;
-    }
-    let title_l = v.title.to_lowercase();
-    let up_l = v.display_uploader().to_lowercase();
-    let mut score = 0i64;
-    if title_l.contains(q_clean) {
-        score += 60;
-        if title_l.starts_with(q_clean) {
-            score += 15;
+    if let Some(ref ch) = parsed.channel_filter {
+        if !up_l.contains(ch) {
+            return false;
         }
     }
-    if up_l == q_clean {
-        score += 55;
-    } else if up_l.contains(q_clean) {
-        score += 35;
-    }
-    let matched_tokens = tokens
+    if parsed
+        .excluded_terms
         .iter()
-        .filter(|t| title_l.contains(**t) || up_l.contains(**t))
+        .any(|ex| title_l.contains(ex) || up_l.contains(ex))
+    {
+        return false;
+    }
+    if parsed.tokens.is_empty() {
+        return true;
+    }
+    parsed
+        .tokens
+        .iter()
+        .all(|t| title_l.contains(t.as_str()) || up_l.contains(t.as_str()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_relevance_score(
+    v: &VideoItem,
+    q_joined: &str,
+    parsed: &ParsedSearchQuery,
+    sub_uploaders: &HashSet<String>,
+    progress_map: &HashMap<String, (f64, f64)>,
+    query_wants_shorts: bool,
+    matcher: &SkimMatcherV2,
+    now_unix: i64,
+) -> i64 {
+    // 1. Preserve YouTube's ML Search ranking order via smooth Reciprocal Rank prior
+    let yt_rank_prior = v
+        .yt_rank
+        .map(|r| (180.0 / (1.0 + 0.14 * r as f64)).round() as i64)
+        .unwrap_or(0);
+
+    if q_joined.is_empty() && parsed.channel_filter.is_none() && parsed.exact_phrases.is_empty() {
+        let rec = v.timestamp.unwrap_or(0) / 86_400;
+        let views = v.view_count.unwrap_or(0).min(10_000_000) as i64 / 50_000;
+        return yt_rank_prior + rec + views;
+    }
+
+    let title_l = v.title.to_lowercase();
+    let up_l = v.display_uploader().to_lowercase();
+    let mut score = yt_rank_prior;
+
+    if !q_joined.is_empty() {
+        if title_l.contains(q_joined) {
+            score += 65;
+            if title_l.starts_with(q_joined) {
+                score += 18;
+            }
+        }
+        if up_l == q_joined {
+            score += 55;
+        } else if up_l.contains(q_joined) {
+            score += 32;
+        }
+        if let Some(fuzzy) = matcher.fuzzy_match(&title_l, q_joined) {
+            score += (fuzzy / 4).clamp(0, 42);
+        }
+    }
+
+    for phrase in &parsed.exact_phrases {
+        if title_l.contains(phrase.as_str()) {
+            score += 80;
+        }
+    }
+
+    let matched_tokens = parsed
+        .tokens
+        .iter()
+        .filter(|t| title_l.contains(t.as_str()) || up_l.contains(t.as_str()))
         .count();
     score += (matched_tokens as i64) * 14;
-    if !tokens.is_empty() && matched_tokens == tokens.len() {
-        score += 22;
+    if !parsed.tokens.is_empty() && matched_tokens == parsed.tokens.len() {
+        score += 30;
     }
+
+    if let Some(ref ch) = parsed.channel_filter {
+        if up_l == *ch {
+            score += 70;
+        } else if up_l.contains(ch.as_str()) {
+            score += 45;
+        }
+    }
+
     if sub_uploaders.contains(&up_l) {
-        score += 12;
+        score += 15;
+    }
+    if v.channel_verified {
+        score += 8;
+    }
+    if progress_map.get(v.clean_id()).map(|(p, _)| *p > 5.0).unwrap_or(false) {
+        score += 6;
     }
     if let Some(ts) = v.timestamp {
         if now_unix.saturating_sub(ts) <= 7 * 86_400 {
@@ -1408,12 +1747,18 @@ fn search_relevance_score(
     }
     if let Some(vw) = v.view_count {
         if vw > 0 {
-            score += ((vw as f64).log10() * 2.0) as i64;
+            score += ((vw as f64).log10() * 1.4).round() as i64;
         }
     }
-    if v.is_shorts() {
-        score -= 4;
+
+    // Penalize metadata-less items & unintended Shorts hijackers
+    if v.display_uploader() == "Unknown" {
+        score -= 25;
     }
+    if v.is_shorts() && !query_wants_shorts {
+        score -= 45;
+    }
+
     score
 }
 
@@ -1450,15 +1795,17 @@ pub enum SearchTypeFilter {
     All,
     Videos,
     Shorts,
+    Live,
 }
 
 impl SearchTypeFilter {
-    pub const ALL: [Self; 3] = [Self::All, Self::Videos, Self::Shorts];
+    pub const ALL: [Self; 4] = [Self::All, Self::Videos, Self::Shorts, Self::Live];
     pub const fn next(self) -> Self {
         match self {
             Self::All => Self::Videos,
             Self::Videos => Self::Shorts,
-            Self::Shorts => Self::All,
+            Self::Shorts => Self::Live,
+            Self::Live => Self::All,
         }
     }
     pub const fn label(self) -> &'static str {
@@ -1466,6 +1813,7 @@ impl SearchTypeFilter {
             Self::All => "All",
             Self::Videos => "Videos",
             Self::Shorts => "Shorts",
+            Self::Live => "Live",
         }
     }
 }
@@ -1473,6 +1821,7 @@ impl SearchTypeFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchDateFilter {
     Any,
+    Hour,
     Today,
     Week,
     Month,
@@ -1480,10 +1829,18 @@ pub enum SearchDateFilter {
 }
 
 impl SearchDateFilter {
-    pub const ALL: [Self; 5] = [Self::Any, Self::Today, Self::Week, Self::Month, Self::Year];
+    pub const ALL: [Self; 6] = [
+        Self::Any,
+        Self::Hour,
+        Self::Today,
+        Self::Week,
+        Self::Month,
+        Self::Year,
+    ];
     pub const fn next(self) -> Self {
         match self {
-            Self::Any => Self::Today,
+            Self::Any => Self::Hour,
+            Self::Hour => Self::Today,
             Self::Today => Self::Week,
             Self::Week => Self::Month,
             Self::Month => Self::Year,
@@ -1493,15 +1850,17 @@ impl SearchDateFilter {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Any => "Any",
+            Self::Hour => "Hour",
             Self::Today => "Today",
             Self::Week => "Week",
-            Self::Month => "Month",
-            Self::Year => "Year",
+            Self::Month => "Mo",
+            Self::Year => "Yr",
         }
     }
     pub fn min_timestamp(self, now: i64) -> Option<i64> {
         match self {
             Self::Any => None,
+            Self::Hour => Some(now - 3_600),
             Self::Today => Some(now - 86_400),
             Self::Week => Some(now - 7 * 86_400),
             Self::Month => Some(now - 30 * 86_400),
@@ -1652,12 +2011,23 @@ pub enum SearchHit {
     SetDuration(SearchDurationFilter),
     SetSort(SearchSortOrder),
     ToggleHideWatched,
+    ToggleHd4k,
+    ToggleViewMode,
+    SetViewMode(SearchViewMode),
     SelectRow(usize),
     ActionPlay,
     ActionDetail,
     ActionPinCw,
     ActionWatchLater,
     ActionChannel,
+    OpenSpotlightChannel(usize),
+    FilterByChannel(String),
+    RetryThumbs,
+    ExecuteQueryNow,
+    FocusQuery,
+    DirectJumpDetail(String),
+    DirectJumpPlay(String),
+    CloseSearch,
     LoadMore,
 }
 
@@ -2348,7 +2718,7 @@ pub fn play_options_modal_rect(frame_area: Rect) -> Rect {
 pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rect> {
     let (px, py) = match overlay {
         ActiveOverlay::None => return None,
-        ActiveOverlay::Search => (90, 86),
+        ActiveOverlay::Search => return Some(frame_area),
         ActiveOverlay::Login => (84, 78),
         ActiveOverlay::Filter => (64, 66),
         ActiveOverlay::PlayOptions => return Some(play_options_modal_rect(frame_area)),
@@ -2735,5 +3105,61 @@ mod tests {
         assert_eq!(updated.len(), 5);
         assert_eq!(updated[3].comment.id, "local_sub_1");
         assert_eq!(updated[3].depth, 3);
+    }
+
+    #[test]
+    fn test_search_query_parser_hybrid_rrf_ranking_and_thumb_backoff() {
+        let parsed = parse_search_query("distributed \"event driven\" @gaurav -shorts is:4k is:unwatched");
+        assert_eq!(parsed.tokens, vec!["distributed", "event", "driven"]);
+        assert_eq!(parsed.exact_phrases, vec!["event driven"]);
+        assert_eq!(parsed.channel_filter.as_deref(), Some("gaurav"));
+        assert_eq!(parsed.excluded_terms, vec!["shorts"]);
+        assert!(parsed.only_4k);
+        assert!(parsed.only_unwatched);
+        assert_eq!(parsed.api_query, "distributed \"event driven\" gaurav -shorts");
+
+        let mut st = AppState::new(Config::default());
+        st.search_query = "system architecture".into();
+        st.search_results = vec![
+            VideoItem {
+                id: "highview_sht".into(),
+                title: "Architecture in 50s".into(),
+                duration: Some(45),
+                duration_string: Some("SHORT".into()),
+                view_count: Some(5_000_000),
+                yt_rank: Some(4),
+                ..Default::default()
+            },
+            VideoItem {
+                id: "top_ml_video".into(),
+                title: "Designing Scalable Production Backends".into(),
+                uploader: Some("ByteByteGo".into()),
+                duration: Some(1400),
+                view_count: Some(400_000),
+                channel_verified: true,
+                yt_rank: Some(0),
+                ..Default::default()
+            },
+        ];
+
+        let ranked = st.combined_search_items();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].id, "top_ml_video");
+
+        // Thumbnail backoff & manual reset
+        st.queue_thumb_with_priority("vid12345678", "", ThumbPriority::Visible);
+        st.queue_thumb_with_priority("vid12345678", "https://i.ytimg.com/vi/vid12345678/hq720.jpg", ThumbPriority::Focused);
+        assert_eq!(st.pending_thumb_requests.len(), 1);
+        assert_eq!(st.pending_thumb_requests[0].priority, ThumbPriority::Focused);
+        st.failed_thumbs.insert(
+            "bad12345678".into(),
+            FailedThumbEntry {
+                attempts: 3,
+                next_retry_at: Instant::now() + Duration::from_secs(30),
+            },
+        );
+        assert!(st.is_thumb_failed("bad12345678"));
+        st.retry_failed_thumbs();
+        assert!(!st.is_thumb_failed("bad12345678"));
     }
 }

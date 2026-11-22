@@ -1,7 +1,7 @@
 //! Central asynchronous message bus for background workers and TUI event loop.
 
 use crate::api::dislike::DislikeInfo;
-use crate::api::innertube::{VideoComment, VideoVote};
+use crate::api::innertube::{SearchChannelCard, VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
@@ -42,11 +42,17 @@ pub enum AppMessage {
         generation: u64,
         query: String,
         items: Vec<VideoItem>,
+        shorts: Vec<VideoItem>,
+        channels: Vec<SearchChannelCard>,
+        did_you_mean: Option<String>,
+        estimated_results: Option<u64>,
+        latency_ms: u64,
         continuation: Option<String>,
     },
     MoreSearchResults {
         generation: u64,
         items: Vec<VideoItem>,
+        shorts: Vec<VideoItem>,
         continuation: Option<String>,
     },
     SearchSuggestionsReady {

@@ -166,6 +166,29 @@ pub fn build_stateful_protocol(
     picker.new_resize_protocol(img)
 }
 
+/// Detect YouTube's tiny 120x90 flat-grey 404 placeholder so the loader tries fallback CDNs instead of caching it.
+pub fn is_yt_grey_placeholder(img: &DynamicImage) -> bool {
+    if img.width() != 120 || img.height() != 90 {
+        return false;
+    }
+    let rgb = img.to_rgb8();
+    let mut min_luma = u8::MAX;
+    let mut max_luma = 0u8;
+    let mut max_chroma = 0u8;
+    for y in (20..70).step_by(5) {
+        for x in (24..96).step_by(6) {
+            let p = rgb.get_pixel(x, y);
+            let hi = p[0].max(p[1]).max(p[2]);
+            let lo = p[0].min(p[1]).min(p[2]);
+            max_chroma = max_chroma.max(hi - lo);
+            let luma = ((p[0] as u16 + p[1] as u16 + p[2] as u16) / 3) as u8;
+            min_luma = min_luma.min(luma);
+            max_luma = max_luma.max(luma);
+        }
+    }
+    max_chroma <= 12 && max_luma.saturating_sub(min_luma) <= 18
+}
+
 /// Render 100% of the full thumbnail at accurate aspect scale, centered inside `area`.
 pub fn render_thumbnail_cover(
     frame: &mut Frame,
@@ -187,20 +210,31 @@ pub fn render_thumbnail_cover(
     };
 
     let key = (video_id.to_string(), fit_rect.width, fit_rect.height);
-    if !state.image_cache.contains_key(&key) {
-        if let (Some(ref mut picker), Some(raw_img)) =
-            (&mut state.picker, state.raw_thumbs.get(video_id))
-        {
-            if state.image_cache.len() >= 180 {
-                state.image_cache.clear();
-            }
-            let (fw, fh) = font_size;
-            let px_w = (fit_rect.width as u32 * fw.max(6) as u32).max(32);
-            let px_h = (fit_rect.height as u32 * fh.max(12) as u32).max(32);
-            let scaled = raw_img.resize(px_w, px_h, FilterType::Lanczos3);
-            let proto = build_stateful_protocol(picker, scaled);
-            state.image_cache.insert(key.clone(), proto);
+    if state.image_cache.contains_key(&key) {
+        // Refresh LRU position on cache hit
+        if let Some(pos) = state.image_cache_order.iter().position(|k| k == &key) {
+            state.image_cache_order.remove(pos);
         }
+        state.image_cache_order.push_back(key.clone());
+    } else if let (Some(ref mut picker), Some(raw_img)) =
+        (&mut state.picker, state.raw_thumbs.get(video_id))
+    {
+        if state.image_cache.len() >= 220 {
+            for _ in 0..40 {
+                if let Some(old_k) = state.image_cache_order.pop_front() {
+                    state.image_cache.remove(&old_k);
+                } else {
+                    break;
+                }
+            }
+        }
+        let (fw, fh) = font_size;
+        let px_w = (fit_rect.width as u32 * fw.max(6) as u32).max(32);
+        let px_h = (fit_rect.height as u32 * fh.max(12) as u32).max(32);
+        let scaled = raw_img.resize(px_w, px_h, FilterType::Lanczos3);
+        let proto = build_stateful_protocol(picker, scaled);
+        state.image_cache.insert(key.clone(), proto);
+        state.image_cache_order.push_back(key.clone());
     }
 
     if let Some(proto) = state.image_cache.get_mut(&key) {
@@ -211,6 +245,26 @@ pub fn render_thumbnail_cover(
         );
     } else if let Some(img) = state.raw_thumbs.get(video_id) {
         frame.render_widget(HalfblockCover { image: img }, area);
+    } else if state.is_thumb_failed(video_id) {
+        let accent = color_from_id(video_id);
+        let label = if area.height >= 4 && area.width >= 16 {
+            "\nNO COVER\n[R] Retry"
+        } else if area.width >= 8 {
+            "[R]"
+        } else {
+            "—"
+        };
+        frame.render_widget(
+            Paragraph::new(label)
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(accent)
+                        .bg(Color::Rgb(20, 24, 34))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            area,
+        );
     } else if !fallback_label.is_empty() {
         frame.render_widget(
             Paragraph::new(fallback_label)
@@ -247,7 +301,11 @@ pub fn render_video_preview_inspector(
         return;
     }
 
-    state.queue_thumb_if_needed(&video.id, &video.best_thumbnail_url());
+    state.queue_thumb_with_priority(
+        &video.id,
+        &video.best_thumbnail_url(),
+        crate::state::ThumbPriority::Focused,
+    );
     let pal = state.active_palette_for(Some(&video.id));
 
     let blk = Block::default()
@@ -283,9 +341,14 @@ pub fn render_video_preview_inspector(
     let inner_w = sections[1].width.max(8) as usize;
     let title_str = marquee_window(&video.title, inner_w, state.ticker_step);
 
+    let uploader_lbl = if video.channel_verified {
+        format!("{} ✓", video.display_uploader())
+    } else {
+        video.display_uploader().to_string()
+    };
     let mut ch_spans = vec![
         Span::styled(
-            video.display_uploader().to_string(),
+            uploader_lbl,
             Style::default().fg(pal.secondary).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ·  ", Style::default().fg(pal.text_dim)),
@@ -333,6 +396,7 @@ pub fn render_video_preview_inspector(
     let desc = video
         .description
         .as_deref()
+        .or(video.search_snippet.as_deref())
         .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
@@ -479,5 +543,20 @@ mod tests {
         let fit_9_16 = fit_centered_rect(area, 405, 720, (10, 22));
         assert_eq!(fit_9_16.height, 7);
         assert_eq!(fit_9_16.width, 9);
+    }
+
+    #[test]
+    fn test_is_yt_grey_placeholder() {
+        let mut grey = image::RgbImage::new(120, 90);
+        for p in grey.pixels_mut() {
+            *p = image::Rgb([196, 196, 196]);
+        }
+        assert!(is_yt_grey_placeholder(&DynamicImage::ImageRgb8(grey)));
+
+        let mut real_cover = image::RgbImage::new(120, 90);
+        for (x, y, p) in real_cover.enumerate_pixels_mut() {
+            *p = image::Rgb([(x * 2) as u8, (y * 2) as u8, 220]);
+        }
+        assert!(!is_yt_grey_placeholder(&DynamicImage::ImageRgb8(real_cover)));
     }
 }
