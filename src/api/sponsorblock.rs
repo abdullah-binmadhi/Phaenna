@@ -2,7 +2,7 @@
 //! Queries https://sponsor.ajay.app/api/skipSegments for intro, outro, sponsor,
 //! self-promotion, interaction reminders, and filler segments.
 
-use crate::config::SponsorBlockMode;
+use crate::config::{SponsorBlockMode, SponsorCategoryPolicy};
 use crate::db::user::SponsorSegmentRow;
 use crate::error::{AppError, Result};
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,31 @@ pub fn filter_segments_for_mode_with_outro(
         .iter()
         .filter(|seg| {
             seg.action_type == "skip" && mode.auto_skips_category_with_outro(&seg.category, skip_outro)
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn filter_segments_for_config(
+    segments: &[SponsorSegment],
+    cfg: &crate::config::Config,
+    channel_name: Option<&str>,
+) -> Vec<SponsorSegment> {
+    if cfg.sponsorblock_mode == SponsorBlockMode::Off {
+        return Vec::new();
+    }
+    if let Some(ch) = channel_name {
+        if cfg.is_channel_whitelisted(ch) {
+            return Vec::new();
+        }
+    }
+    let min_len = cfg.sponsorblock_min_secs as f64;
+    segments
+        .iter()
+        .filter(|seg| {
+            seg.action_type == "skip"
+                && (seg.end_time - seg.start_time) >= min_len
+                && cfg.effective_sponsor_policy(&seg.category) == SponsorCategoryPolicy::AutoSkip
         })
         .cloned()
         .collect()

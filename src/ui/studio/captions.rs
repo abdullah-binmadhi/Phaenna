@@ -1,10 +1,10 @@
-//! Page 5 — `[5] Captions & Skip`: Subtitles, Language Quick-Picker, Live Typography Fine-Tuner,
-//! SponsorBlock 7-Category Guard Matrix, Chapter-Marked Timeline, and Dual Segments/Chapters Jump List.
+//! Page 5 — `[5] AdBlock & Subs`: Subtitles & Live Typography Studio (43%),
+//! and Interactive Ad-Block & SponsorBlock Shield Command Center (57%).
 
 use crate::api::sponsorblock::category_label;
-use crate::config::SponsorBlockMode;
+use crate::config::{SponsorBlockMode, SponsorCategoryPolicy};
 use crate::services::substyler::{SubtitlePreset, SubtitleStyleConfig};
-use crate::state::{AppState, PlayOptionsHit};
+use crate::state::{AppState, CaptionsTab, PlayOptionsHit};
 use crate::ui::studio::widgets::{
     format_hms, push_line_hit, push_pane_hit, render_inline_pills, section_block, sponsor_color,
     sponsor_timeline_with_chapters_spans, truncate_words,
@@ -18,16 +18,16 @@ use ratatui::{
 };
 
 pub fn render_captions_page(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    if area.width < 32 || area.height < 12 {
+    if area.width < 34 || area.height < 14 {
         return;
     }
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
         .split(area);
 
     render_subtitles_preview_pane(frame, cols[0], state);
-    render_sponsorblock_timeline_pane(frame, cols[1], state);
+    render_adblock_shield_pane(frame, cols[1], state);
 }
 
 fn parse_hex_color(hex: &str, fallback: Color) -> Color {
@@ -58,10 +58,10 @@ fn pill_style(active: bool, bg: Color, idle_fg: Color) -> Style {
 fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = *state.base_theme();
     let focused = state.studio.pane_focus == 0;
-    let blk = section_block(" Subtitles, Language & Typography Studio ", focused, &theme);
+    let blk = section_block(" Subtitles & Typography Studio ", focused, &theme);
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
-    if inner.width < 24 || inner.height < 11 {
+    if inner.width < 22 || inner.height < 11 {
         return;
     }
 
@@ -80,27 +80,34 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     let sub_tracks = state.live_playback.sub_tracks.clone();
     let active_sid = state.live_playback.active_sid;
 
-    let show_tuner = inner.height >= 15;
-    let track_h: u16 = if inner.height >= 19 { 3 } else { 2 };
-    let preview_h: u16 = if inner.height >= 20 { 6 } else { 4 };
+    let show_tuner = inner.height >= 16;
+    let show_div = inner.height >= 19;
+    let preview_h: u16 = if inner.height >= 19 { 5 } else { 4 };
 
     let mut constraints = vec![
-        Constraint::Length(1),         // 0: Subtitles ON/OFF + Collision
-        Constraint::Length(1),         // 1: Sub Offset pills
-        Constraint::Length(1),         // 2: Default Lang pills
-        Constraint::Length(1),         // 3: Tracks header
-        Constraint::Length(track_h),   // 4: Sub tracks list
-        Constraint::Length(1),         // 5: Typography header
-        Constraint::Length(1),         // 6: Preset pills
+        Constraint::Length(1), // 0: Subtitles + Collision
+        Constraint::Length(1), // 1: Sub Offset pills
+        Constraint::Length(1), // 2: Default Lang pills
+        Constraint::Length(1), // 3: Tracks header + [Reload]
+        Constraint::Min(2),    // 4: Scrollable sub tracks (absorbs extra vertical space!)
     ];
+    if show_div {
+        constraints.push(Constraint::Length(1)); // Divider
+    }
+    constraints.extend([
+        Constraint::Length(1), // Typography Preset header
+        Constraint::Length(1), // Preset pills
+    ]);
     if show_tuner {
         constraints.extend([
-            Constraint::Length(1), // Fine-tuner row 1: Font Size + Border
-            Constraint::Length(1), // Fine-tuner row 2: MarginY + Backdrop
-            Constraint::Length(1), // Fine-tuner row 3: Text Ink
+            Constraint::Length(1), // Font Family pills
+            Constraint::Length(1), // Font Size + Border
+            Constraint::Length(1), // MarginY + Shadow
+            Constraint::Length(1), // Backdrop BG pills
+            Constraint::Length(1), // Ink pills
         ]);
     }
-    constraints.push(Constraint::Min(preview_h)); // Framed live preview box
+    constraints.push(Constraint::Length(preview_h)); // Fixed 4-5 row Preview Frame (NEVER a blank hole!)
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -147,7 +154,7 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     hits.push((r0_cols[1], PlayOptionsHit::ToggleSubCollision));
     ri += 1;
 
-    // 1: Sub Offset controls via render_inline_pills (fixes `][` bug!)
+    // 1: Sub Offset controls
     let offset_prefix = format!(" Offset {:+}ms:", sub_delay_ms);
     let sub_steps = vec![
         ("[-500]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubDelayDelta(-500)),
@@ -187,13 +194,17 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     render_inline_pills(
         frame,
         rows[ri],
-        Some((" Default Lang:", Style::default().fg(theme.text_dim))),
+        Some((" Lang :", Style::default().fg(theme.text_dim))),
         &lang_pills,
         hits,
     );
     ri += 1;
 
-    // 3 & 4: Live Sub Tracks
+    // 3 & 4: Tracks header + [Reload] + list
+    let hdr_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(18), Constraint::Length(14)])
+        .split(rows[ri]);
     frame.render_widget(
         Paragraph::new(Span::styled(
             if total_subs > 0 {
@@ -205,7 +216,18 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
                 .fg(theme.primary)
                 .add_modifier(Modifier::BOLD),
         )),
-        rows[ri],
+        hdr_cols[0],
+    );
+    render_inline_pills(
+        frame,
+        hdr_cols[1],
+        None,
+        &[(
+            "[Reload Subs]".to_string(),
+            Style::default().fg(theme.secondary),
+            PlayOptionsHit::ReloadSubtitles,
+        )],
+        hits,
     );
     ri += 1;
 
@@ -214,11 +236,11 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     let mut tr_lines = Vec::new();
     if total_subs == 0 {
         tr_lines.push(Line::from(Span::styled(
-            format!("   Default Language: {} (libass + \\an8 ready)", def_lang),
+            format!("   Default: {} (libass + \\an8 ready)", def_lang),
             Style::default().fg(theme.text_dim),
         )));
     } else {
-        let cap = track_h as usize;
+        let cap = tr_area.height as usize;
         let scroll = sub_scroll.min(total_subs.saturating_sub(cap));
         for tr in sub_tracks.iter().skip(scroll).take(cap) {
             let active = active_sid == Some(tr.id) || tr.selected;
@@ -241,13 +263,21 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     }
     frame.render_widget(Paragraph::new(tr_lines), tr_area);
 
-    // 5 & 6: Style Preset Selector
+    if show_div {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {}", "─".repeat(inner.width.saturating_sub(2) as usize)),
+                Style::default().fg(theme.divider),
+            )),
+            rows[ri],
+        );
+        ri += 1;
+    }
+
+    // Typography Preset header & pills
     frame.render_widget(
         Paragraph::new(Span::styled(
-            format!(
-                " Typography Preset [y] (libass · {}):",
-                st_cfg.font_family
-            ),
+            format!(" Typography Preset [y] (libass · {}):", st_cfg.font_family),
             Style::default()
                 .fg(theme.secondary)
                 .add_modifier(Modifier::BOLD),
@@ -257,9 +287,9 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     ri += 1;
 
     let mut preset_pills: Vec<(String, Style, PlayOptionsHit)> = [
-        (SubtitlePreset::StudioMinimal, "Studio Min"),
+        (SubtitlePreset::StudioMinimal, "Studio"),
         (SubtitlePreset::NetflixClean, "Netflix"),
-        (SubtitlePreset::CinemaGold, "Cinema Gold"),
+        (SubtitlePreset::CinemaGold, "Gold"),
         (SubtitlePreset::OledPlate, "OLED"),
     ]
     .into_iter()
@@ -281,14 +311,39 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     render_inline_pills(frame, rows[ri], Some((" ", Style::default())), &preset_pills, hits);
     ri += 1;
 
-    // Live Typography Fine-Tuner Rows
     if show_tuner {
-        // Row A: Font Size + Border Size
+        // Font Family quick-picker
+        let cur_font = st_cfg.font_family.as_str();
+        let font_pills = [
+            ("Trebuchet", "Trebuchet MS"),
+            ("Helvetica", "Helvetica Neue"),
+            ("Inter", "Inter"),
+            ("Mono", "Menlo"),
+        ]
+        .into_iter()
+        .map(|(short, fam)| {
+            (
+                format!("[{short}]"),
+                pill_style(cur_font.eq_ignore_ascii_case(fam), theme.primary, theme.text_dim),
+                PlayOptionsHit::SetSubFont(fam),
+            )
+        })
+        .collect::<Vec<_>>();
+        render_inline_pills(
+            frame,
+            rows[ri],
+            Some((" Font :", Style::default().fg(theme.text_dim))),
+            &font_pills,
+            hits,
+        );
+        ri += 1;
+
+        // Font Size + Border Size
         let fine_a = vec![
             ("[-]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubFontSizeDelta(-2)),
             (format!("{}px", st_cfg.font_size), Style::default().fg(theme.text).add_modifier(Modifier::BOLD), PlayOptionsHit::SubFontSizeDelta(0)),
             ("[+]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubFontSizeDelta(2)),
-            ("Border:".to_string(), Style::default().fg(theme.text_dim), PlayOptionsHit::SubBorderDelta(0.0)),
+            ("Bdr:".to_string(), Style::default().fg(theme.text_dim), PlayOptionsHit::SubBorderDelta(0.0)),
             ("[-]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubBorderDelta(-0.4)),
             (format!("{:.1}", st_cfg.border_size), Style::default().fg(theme.text).add_modifier(Modifier::BOLD), PlayOptionsHit::SubBorderDelta(0.0)),
             ("[+]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubBorderDelta(0.4)),
@@ -296,19 +351,34 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
         render_inline_pills(
             frame,
             rows[ri],
-            Some((" Font:", Style::default().fg(theme.text_dim))),
+            Some((" Size :", Style::default().fg(theme.text_dim))),
             &fine_a,
             hits,
         );
         ri += 1;
 
-        // Row B: MarginY + Backdrop
-        let op = st_cfg.backdrop_opacity;
+        // MarginY + Shadow Depth
         let fine_b = vec![
             ("[-]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubMarginYDelta(-4)),
             (format!("{}px", st_cfg.margin_y), Style::default().fg(theme.text).add_modifier(Modifier::BOLD), PlayOptionsHit::SubMarginYDelta(0)),
             ("[+]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubMarginYDelta(4)),
-            ("BG:".to_string(), Style::default().fg(theme.text_dim), PlayOptionsHit::SubMarginYDelta(0)),
+            ("Shd:".to_string(), Style::default().fg(theme.text_dim), PlayOptionsHit::SubShadowDelta(0.0)),
+            ("[-]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubShadowDelta(-0.3)),
+            (format!("{:.1}", st_cfg.shadow_offset), Style::default().fg(theme.text).add_modifier(Modifier::BOLD), PlayOptionsHit::SubShadowDelta(0.0)),
+            ("[+]".to_string(), Style::default().fg(theme.secondary), PlayOptionsHit::SubShadowDelta(0.3)),
+        ];
+        render_inline_pills(
+            frame,
+            rows[ri],
+            Some((" MgnY :", Style::default().fg(theme.text_dim))),
+            &fine_b,
+            hits,
+        );
+        ri += 1;
+
+        // Backdrop opacity
+        let op = st_cfg.backdrop_opacity;
+        let bg_pills = vec![
             ("[Off]".to_string(), pill_style(op <= 0.05, theme.primary, theme.text_dim), PlayOptionsHit::SetSubBackdrop(0.0)),
             ("[35%]".to_string(), pill_style((op - 0.35).abs() < 0.08, theme.primary, theme.text_dim), PlayOptionsHit::SetSubBackdrop(0.35)),
             ("[65%]".to_string(), pill_style((op - 0.65).abs() < 0.08, theme.primary, theme.text_dim), PlayOptionsHit::SetSubBackdrop(0.65)),
@@ -317,13 +387,13 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
         render_inline_pills(
             frame,
             rows[ri],
-            Some((" Margin:", Style::default().fg(theme.text_dim))),
-            &fine_b,
+            Some((" BG   :", Style::default().fg(theme.text_dim))),
+            &bg_pills,
             hits,
         );
         ri += 1;
 
-        // Row C: Text Ink
+        // Text Ink
         let cur_ink = st_cfg.primary_color.to_uppercase();
         let ink_pills = [
             ("White", "#FFFFFF", Color::White),
@@ -351,14 +421,14 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
         render_inline_pills(
             frame,
             rows[ri],
-            Some((" Ink   :", Style::default().fg(theme.text_dim))),
+            Some((" Ink  :", Style::default().fg(theme.text_dim))),
             &ink_pills,
             hits,
         );
         ri += 1;
     }
 
-    // Bottom: Crisp Right-Sized Live Typography Preview Frame
+    // Bounded 4-5 Row Live Preview Frame
     let prev_rect = rows[ri];
     let prev_blk = Block::default()
         .title(Span::styled(
@@ -379,12 +449,11 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
             text_style = text_style.bg(Color::Rgb(16, 18, 24));
         }
         let mut preview_lines = Vec::new();
-        if prev_inner.height >= 4 {
-            preview_lines.push(Line::from(if sub_on {
-                ""
-            } else {
-                "(Subtitles currently hidden — press [c] to enable)"
-            }));
+        if !sub_on && prev_inner.height >= 3 {
+            preview_lines.push(Line::from(Span::styled(
+                "(Hidden — press [c] to enable)",
+                Style::default().fg(theme.text_dim),
+            )));
         }
         preview_lines.push(Line::from(Span::styled(
             truncate_words("\"Shooting with an old MFT camera\"", prev_inner.width as usize),
@@ -403,13 +472,13 @@ fn render_subtitles_preview_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     push_pane_hit(hits, area, 0);
 }
 
-fn render_sponsorblock_timeline_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
+fn render_adblock_shield_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = *state.base_theme();
     let focused = state.studio.pane_focus == 1;
-    let blk = section_block(" SponsorBlock Guard & Timeline Map ", focused, &theme);
+    let blk = section_block(" Ad-Block & SponsorBlock Shield Engine ", focused, &theme);
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
-    if inner.width < 24 || inner.height < 11 {
+    if inner.width < 28 || inner.height < 12 {
         return;
     }
 
@@ -425,6 +494,18 @@ fn render_sponsorblock_timeline_pane(frame: &mut Frame, area: Rect, state: &mut 
     let sb_mode = state.config.sponsorblock_mode;
     let skip_outro = state.config.skip_outro;
     let saved_total_secs = state.analytics.sponsorblock_saved_secs;
+    let min_secs = state.config.sponsorblock_min_secs;
+    let osd_toast = state.config.sponsorblock_osd_toast;
+    let has_ipc = state.has_live_ipc();
+    let whitelist = state.config.sponsorblock_whitelist.clone();
+    let active_channel = state
+        .active_selected_video()
+        .map(|v| v.display_uploader().to_string())
+        .filter(|s| !s.is_empty());
+    let ch_whitelisted = active_channel
+        .as_deref()
+        .map(|c| state.config.is_channel_whitelisted(c))
+        .unwrap_or(false);
     let chapters = state
         .active_selected_video()
         .map(|v| v.effective_chapters())
@@ -433,26 +514,37 @@ fn render_sponsorblock_timeline_pane(frame: &mut Frame, area: Rect, state: &mut 
 
     let total_segs = state.detail_sponsor_segments.len();
     let total_chaps = chapters.len();
-    let show_chapters = match state.studio.captions_use_chapters {
-        Some(v) => v,
-        None => total_segs == 0 && total_chaps > 0,
-    };
+    let active_tab = state.studio.captions_tab.unwrap_or(if total_segs > 0 {
+        CaptionsTab::Segments
+    } else if total_chaps > 0 {
+        CaptionsTab::Chapters
+    } else {
+        CaptionsTab::Shield
+    });
 
-    let show_matrix = inner.height >= 17;
+    let show_div = inner.height >= 19;
     let mut constraints = vec![
-        Constraint::Length(1), // 0: Mode row 1
-        Constraint::Length(1), // 1: Mode row 2
-        Constraint::Length(1), // 2: Skip Outros + Saved summary
+        Constraint::Length(1), // 0: Shield mode pills
+        Constraint::Length(1), // 1: Instant Ad-Block actions
     ];
-    if show_matrix {
-        constraints.push(Constraint::Length(4)); // Category Guard Matrix (4 rows x 2 cols)
+    if show_div {
+        constraints.push(Constraint::Length(1));
     }
     constraints.extend([
+        Constraint::Length(1), // Category Matrix header
+        Constraint::Length(4), // Interactive 8-Category Policy Matrix
+    ]);
+    if show_div {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.extend([
+        Constraint::Length(1), // Min len + OSD alert toggle
+        Constraint::Length(1), // Stream Ad-Block status + Saved stats
         Constraint::Length(1), // Timeline header
-        Constraint::Length(1), // Visual Timeline Bar
-        Constraint::Length(1), // Legend
-        Constraint::Length(1), // Jump List Tab switcher ([Segments] [Chapters])
-        Constraint::Min(3),    // Scrollable Segments or Chapters List
+        Constraint::Length(1), // Timeline bar
+        Constraint::Length(1), // Timeline legend
+        Constraint::Length(1), // 3-Tab Inspector pills
+        Constraint::Min(3),    // Inspector content (Segments / Chapters / Shield & WL)
     ]);
 
     let rows = Layout::default()
@@ -463,51 +555,205 @@ fn render_sponsorblock_timeline_pane(frame: &mut Frame, area: Rect, state: &mut 
     let hits = &mut state.live_playback.play_hitboxes;
     let mut ri = 0usize;
 
-    // Rows 0 & 1: 2x2 SponsorBlockMode selector
-    let modes_r0 = [SponsorBlockMode::AutoSkipAll, SponsorBlockMode::SponsorOnly];
-    let modes_r1 = [SponsorBlockMode::ShowChaptersOnly, SponsorBlockMode::Off];
-    for pair in [modes_r0, modes_r1] {
-        let m_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[ri]);
-        for (c_idx, mode) in pair.into_iter().enumerate() {
-            let active = sb_mode == mode;
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    format!(" {} {}", if active { "(*)" } else { "( )" }, mode.label()),
-                    if active {
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.text)
-                    },
-                )),
-                m_cols[c_idx],
-            );
-            hits.push((m_cols[c_idx], PlayOptionsHit::SelectSponsorBlock(mode)));
-        }
+    // 0: Shield master mode pills
+    let mode_pills = vec![
+        ("Aggressive", SponsorBlockMode::AutoSkipAll, Color::Rgb(52, 211, 153)),
+        ("Sponsors", SponsorBlockMode::SponsorOnly, theme.primary),
+        ("Notify", SponsorBlockMode::ShowChaptersOnly, Color::Rgb(56, 189, 248)),
+        ("Custom", SponsorBlockMode::Custom, theme.accent),
+        ("OFF", SponsorBlockMode::Off, Color::Rgb(248, 113, 113)),
+    ]
+    .into_iter()
+    .map(|(lbl, m, col)| {
+        (
+            format!("[{lbl}]"),
+            pill_style(sb_mode == m, col, theme.text_dim),
+            PlayOptionsHit::SelectSponsorBlock(m),
+        )
+    })
+    .collect::<Vec<_>>();
+    render_inline_pills(
+        frame,
+        rows[ri],
+        Some((" Shield:", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
+        &mode_pills,
+        hits,
+    );
+    ri += 1;
+
+    // 1: Instant Ad-Block Action Bar
+    let action_pills = vec![
+        (
+            "[R Re-Scan]".to_string(),
+            Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+            PlayOptionsHit::ReScanSponsorBlock,
+        ),
+        (
+            "[U Undo Skip]".to_string(),
+            Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD),
+            PlayOptionsHit::UndoLastSponsorSkip,
+        ),
+        (
+            "[Skip Now]".to_string(),
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            PlayOptionsHit::SkipActiveSponsorNow,
+        ),
+        (
+            if ch_whitelisted {
+                "[W WL: ON ✓]"
+            } else {
+                "[W Whitelist Ch]"
+            }
+            .to_string(),
+            pill_style(ch_whitelisted, Color::Rgb(52, 211, 153), theme.text_dim),
+            PlayOptionsHit::ToggleWhitelistChannel,
+        ),
+    ];
+    render_inline_pills(
+        frame,
+        rows[ri],
+        Some((" Act   :", Style::default().fg(theme.text_dim))),
+        &action_pills,
+        hits,
+    );
+    ri += 1;
+
+    if show_div {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {}", "─".repeat(inner.width.saturating_sub(2) as usize)),
+                Style::default().fg(theme.divider),
+            )),
+            rows[ri],
+        );
         ri += 1;
     }
 
-    // Row 2: Skip Outros + Session Skips + Lifetime Saved
+    // Category header
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            if ch_whitelisted {
+                " Category Policy (CHANNEL WHITELISTED — Auto-Skip Paused):"
+            } else {
+                " Category Policy (Click any category to toggle SKIP / NOTF / IGNR):"
+            },
+            Style::default()
+                .fg(if ch_whitelisted {
+                    Color::Rgb(52, 211, 153)
+                } else {
+                    theme.primary
+                })
+                .add_modifier(Modifier::BOLD),
+        )),
+        rows[ri],
+    );
+    ri += 1;
+
+    // 8 Interactive Category Cells (4 rows x 2 columns)
+    let mat_area = rows[ri];
+    ri += 1;
+    let cats = [
+        ("sponsor", "Sponsor (Paid Ad)"),
+        ("selfpromo", "Self-Promo / Merch"),
+        ("intro", "Intro / Intermis."),
+        ("outro", "Outro / Endcards"),
+        ("interaction", "Like / Sub Prompt"),
+        ("preview", "Preview / Recap"),
+        ("filler", "Filler / Tangents"),
+        ("music_offtopic", "Non-Music Section"),
+    ];
+    let row_splits = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1); 4])
+        .split(mat_area);
+
+    for (row_idx, row_rect) in row_splits.iter().enumerate() {
+        let cell_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(*row_rect);
+        for (col_idx, cell_rect) in cell_cols.iter().enumerate() {
+            let idx = row_idx * 2 + col_idx;
+            if let Some(&(key, name)) = cats.get(idx) {
+                let eff_pol = state.config.effective_sponsor_policy(key);
+                let (badge, bcol) = if ch_whitelisted {
+                    ("[WL  ]", Color::Rgb(52, 211, 153))
+                } else {
+                    match eff_pol {
+                        SponsorCategoryPolicy::AutoSkip => ("[SKIP]", Color::Rgb(251, 191, 36)),
+                        SponsorCategoryPolicy::NotifyOnly => ("[NOTF]", Color::Rgb(56, 189, 248)),
+                        SponsorCategoryPolicy::Ignore => ("[IGNR]", theme.text_dim),
+                    }
+                };
+                let lbl_w = (cell_rect.width as usize).saturating_sub(11).max(8);
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(" █ ", Style::default().fg(sponsor_color(key))),
+                        Span::styled(
+                            format!("{:<lbl_w$} ", truncate_words(name, lbl_w)),
+                            Style::default().fg(theme.text),
+                        ),
+                        Span::styled(
+                            badge,
+                            Style::default().fg(bcol).add_modifier(Modifier::BOLD),
+                        ),
+                    ])),
+                    *cell_rect,
+                );
+                hits.push((*cell_rect, PlayOptionsHit::CycleSponsorCategory(key)));
+            }
+        }
+    }
+
+    if show_div {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {}", "─".repeat(inner.width.saturating_sub(2) as usize)),
+                Style::default().fg(theme.divider),
+            )),
+            rows[ri],
+        );
+        ri += 1;
+    }
+
+    // Min Skip Threshold + OSD Alert toggle + Outro toggle
+    let filter_pills = vec![
+        ("[>=1s]".to_string(), pill_style(min_secs <= 1, theme.primary, theme.text_dim), PlayOptionsHit::SetSponsorMinSecs(1)),
+        ("[>=3s]".to_string(), pill_style(min_secs == 3, theme.primary, theme.text_dim), PlayOptionsHit::SetSponsorMinSecs(3)),
+        ("[>=5s]".to_string(), pill_style(min_secs >= 5, theme.primary, theme.text_dim), PlayOptionsHit::SetSponsorMinSecs(5)),
+        (
+            if osd_toast { "[OSD: ON]" } else { "[OSD: OFF]" }.to_string(),
+            pill_style(osd_toast, Color::Rgb(52, 211, 153), theme.text_dim),
+            PlayOptionsHit::ToggleSponsorOsdToast,
+        ),
+        (
+            if skip_outro { "[Out: SKIP]" } else { "[Out: PROT]" }.to_string(),
+            pill_style(skip_outro, Color::Rgb(251, 191, 36), Color::Rgb(52, 211, 153)),
+            PlayOptionsHit::ToggleSkipOutro,
+        ),
+    ];
+    render_inline_pills(
+        frame,
+        rows[ri],
+        Some((" Min   :", Style::default().fg(theme.text_dim))),
+        &filter_pills,
+        hits,
+    );
+    ri += 1;
+
+    // Stream Ad-Block status & savings telemetry
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" Outros [o]: ", Style::default().fg(theme.text_dim)),
+            Span::styled(" Stream Ads: ", Style::default().fg(theme.text_dim)),
             Span::styled(
-                if skip_outro { "SKIP" } else { "PROTECTED" },
+                "[BLOCKED ✓ Clean Feed]",
                 Style::default()
-                    .fg(if skip_outro {
-                        Color::Rgb(251, 191, 36)
-                    } else {
-                        Color::Rgb(52, 211, 153)
-                    })
+                    .fg(Color::Rgb(52, 211, 153))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(
-                    " | Session: {} | Saved: {}",
+                    " | Session: {} Skips | Saved: {}",
                     state.sponsor_skips_session,
                     format_hms(saved_total_secs)
                 ),
@@ -516,63 +762,9 @@ fn render_sponsorblock_timeline_pane(frame: &mut Frame, area: Rect, state: &mut 
         ])),
         rows[ri],
     );
-    hits.push((rows[ri], PlayOptionsHit::ToggleSkipOutro));
     ri += 1;
 
-    // 7-Category SponsorBlock Guard Matrix (4 rows x 2 cols)
-    if show_matrix {
-        let cats = [
-            ("sponsor", "Sponsor"),
-            ("selfpromo", "Self-Promo"),
-            ("intro", "Intro"),
-            ("outro", "Outro"),
-            ("interaction", "Interact"),
-            ("preview", "Preview"),
-            ("filler", "Filler"),
-        ];
-        let mut matrix_lines = Vec::with_capacity(4);
-        let pair_w = (rows[ri].width as usize / 2).max(16);
-        for row_idx in 0..4 {
-            let mut spans = Vec::new();
-            for col_idx in 0..2 {
-                let idx = row_idx * 2 + col_idx;
-                if let Some(&(key, name)) = cats.get(idx) {
-                    let (badge, bcol) = if key == "outro" && !skip_outro {
-                        ("[PROT]", Color::Rgb(52, 211, 153))
-                    } else if sb_mode == SponsorBlockMode::Off {
-                        ("[OFF ]", theme.text_dim)
-                    } else if sb_mode.auto_skips_category_with_outro(key, skip_outro) {
-                        ("[SKIP]", Color::Rgb(251, 191, 36))
-                    } else {
-                        ("[BADG]", Color::Rgb(56, 189, 248))
-                    };
-                    let lbl_w = pair_w.saturating_sub(10).max(8);
-                    spans.push(Span::styled(" █ ", Style::default().fg(sponsor_color(key))));
-                    spans.push(Span::styled(
-                        format!("{name:<lbl_w$}"),
-                        Style::default().fg(theme.text),
-                    ));
-                    spans.push(Span::styled(
-                        format!("{badge} "),
-                        Style::default().fg(bcol).add_modifier(Modifier::BOLD),
-                    ));
-                } else {
-                    let lbl_w = pair_w.saturating_sub(10).max(8);
-                    let saved_lbl = format!("Saved {}", format_hms(saved_total_secs));
-                    spans.push(Span::styled(" ⏱ ", Style::default().fg(theme.secondary)));
-                    spans.push(Span::styled(
-                        truncate_words(&saved_lbl, lbl_w + 6),
-                        Style::default().fg(theme.secondary),
-                    ));
-                }
-            }
-            matrix_lines.push(Line::from(spans));
-        }
-        frame.render_widget(Paragraph::new(matrix_lines), rows[ri]);
-        ri += 1;
-    }
-
-    // Timeline Distribution Header
+    // Timeline header
     frame.render_widget(
         Paragraph::new(Span::styled(
             format!(
@@ -587,7 +779,7 @@ fn render_sponsorblock_timeline_pane(frame: &mut Frame, area: Rect, state: &mut 
     );
     ri += 1;
 
-    // Timeline bar with Sponsor segments AND Chapter boundary ticks
+    // Timeline bar
     let bar_w = rows[ri].width.saturating_sub(4).max(8) as usize;
     let mut t_spans = vec![Span::styled(" ├", Style::default().fg(theme.text_dim))];
     t_spans.extend(sponsor_timeline_with_chapters_spans(
@@ -614,167 +806,240 @@ fn render_sponsorblock_timeline_pane(frame: &mut Frame, area: Rect, state: &mut 
             Span::styled("SelfPromo  ", Style::default().fg(theme.text_dim)),
             Span::styled("█ ", Style::default().fg(sponsor_color("intro"))),
             Span::styled("Intro  ", Style::default().fg(theme.text_dim)),
-            Span::styled("█ ", Style::default().fg(sponsor_color("outro"))),
-            Span::styled("Outro  ", Style::default().fg(theme.text_dim)),
+            Span::styled("█ ", Style::default().fg(sponsor_color("music_offtopic"))),
+            Span::styled("NonMusic  ", Style::default().fg(theme.text_dim)),
             Span::styled("┆ Chap", Style::default().fg(theme.secondary)),
         ])),
         rows[ri],
     );
     ri += 1;
 
-    // Jump List Mode Tabs via render_inline_pills
+    // 3-Tab Switcher
     let tab_pills = vec![
         (
-            format!("[SB Segments ({total_segs})]"),
-            pill_style(!show_chapters, theme.primary, theme.text_dim),
-            PlayOptionsHit::SetCaptionsListTab(false),
+            format!("[Segments ({total_segs})]"),
+            pill_style(active_tab == CaptionsTab::Segments, theme.primary, theme.text_dim),
+            PlayOptionsHit::SetCaptionsTab(CaptionsTab::Segments),
         ),
         (
             format!("[Chapters ({total_chaps})]"),
-            pill_style(show_chapters, theme.secondary, theme.text_dim),
-            PlayOptionsHit::SetCaptionsListTab(true),
+            pill_style(active_tab == CaptionsTab::Chapters, theme.secondary, theme.text_dim),
+            PlayOptionsHit::SetCaptionsTab(CaptionsTab::Chapters),
+        ),
+        (
+            format!("[Shield & WL ({})]", whitelist.len()),
+            pill_style(active_tab == CaptionsTab::Shield, Color::Rgb(52, 211, 153), theme.text_dim),
+            PlayOptionsHit::SetCaptionsTab(CaptionsTab::Shield),
         ),
     ];
     render_inline_pills(
         frame,
         rows[ri],
-        Some((" Jump List [u]:", Style::default().fg(theme.text).add_modifier(Modifier::BOLD))),
+        Some((" View [u]:", Style::default().fg(theme.text).add_modifier(Modifier::BOLD))),
         &tab_pills,
         hits,
     );
     ri += 1;
 
-    // Dual-Mode Clickable Segments or Chapters List
+    // 3-Tab Bottom Inspector
     let list_area = rows[ri];
     let cap = list_area.height as usize;
     let mut list_lines = Vec::new();
-    if show_chapters {
-        if chapters.is_empty() {
-            list_lines.push(Line::from(Span::styled(
-                " No video chapters available in description or metadata.",
-                Style::default().fg(theme.text_dim),
-            )));
-        } else {
-            let cursor = state.studio.chapter_cursor.min(chapters.len() - 1);
-            let scroll = state
-                .studio
-                .chapter_scroll
-                .min(chapters.len().saturating_sub(cap));
-            for (rel_idx, ch) in chapters.iter().skip(scroll).take(cap).enumerate() {
-                let abs_idx = scroll + rel_idx;
-                let row = list_lines.len() as u16;
-                let next_start = chapters
-                    .get(abs_idx + 1)
-                    .map(|c| c.start_time)
-                    .unwrap_or(dur.max(ch.start_time + 1.0));
-                let is_playing = pos >= ch.start_time && pos < next_start;
-                let selected = focused && abs_idx == cursor;
-                let title_w = list_area.width.saturating_sub(21).max(10) as usize;
-                let status = if is_playing { "[ACT]" } else { "Jump " };
-                let txt = format!(
-                    " {} {:>5}  {:<title_w$}  {}",
-                    if selected { ">" } else { " " },
-                    format_hms(ch.start_time),
-                    truncate_words(&ch.title, title_w),
-                    status
-                );
+    match active_tab {
+        CaptionsTab::Segments => {
+            if total_segs == 0 {
                 list_lines.push(Line::from(Span::styled(
-                    txt,
-                    if selected {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(theme.primary)
-                            .add_modifier(Modifier::BOLD)
-                    } else if is_playing {
-                        Style::default()
-                            .fg(Color::Rgb(52, 211, 153))
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.text)
-                    },
+                    " No SponsorBlock segments returned for this video yet.",
+                    Style::default().fg(theme.text_dim),
                 )));
-                push_line_hit(
-                    hits,
-                    list_area,
-                    row,
-                    PlayOptionsHit::JumpSponsorSegment(ch.start_time),
-                );
+                list_lines.push(Line::from(Span::styled(
+                    " Press [R] to Re-Scan API live, or switch to [Shield & WL] via [u].",
+                    Style::default().fg(theme.secondary),
+                )));
+            } else {
+                let cursor = state.studio.sponsor_cursor.min(total_segs - 1);
+                let scroll = state
+                    .studio
+                    .sponsor_scroll
+                    .min(total_segs.saturating_sub(cap));
+                for (rel_idx, seg) in state
+                    .detail_sponsor_segments
+                    .iter()
+                    .skip(scroll)
+                    .take(cap)
+                    .enumerate()
+                {
+                    let abs_idx = scroll + rel_idx;
+                    let row = list_lines.len() as u16;
+                    let selected = focused && abs_idx == cursor;
+                    let len_s = (seg.end_time - seg.start_time).max(0.0);
+                    let pol = state.config.effective_sponsor_policy(&seg.category);
+                    let status = if ch_whitelisted {
+                        "[WL Allow ]"
+                    } else if pol != SponsorCategoryPolicy::AutoSkip {
+                        pol.badge()
+                    } else if pos >= seg.end_time {
+                        "[Skipped ✓]"
+                    } else if pos >= seg.start_time && pos < seg.end_time {
+                        "[Active]   "
+                    } else {
+                        "[Queued]   "
+                    };
+                    let cat_lbl = category_label(&seg.category);
+                    let cat_w = list_area.width.saturating_sub(36).max(8) as usize;
+                    let txt = format!(
+                        " {} {}–{} ({:>3.0}s) {:<cat_w$} {}",
+                        if selected { ">" } else { " " },
+                        format_hms(seg.start_time),
+                        format_hms(seg.end_time),
+                        len_s,
+                        truncate_words(cat_lbl, cat_w),
+                        status
+                    );
+                    list_lines.push(Line::from(Span::styled(
+                        txt,
+                        if selected {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(theme.primary)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(sponsor_color(&seg.category))
+                        },
+                    )));
+                    push_line_hit(
+                        hits,
+                        list_area,
+                        row,
+                        PlayOptionsHit::JumpSponsorSegment(seg.start_time),
+                    );
+                }
             }
         }
-    } else if total_segs == 0 {
-        list_lines.push(Line::from(Span::styled(
-            " No SponsorBlock segments detected for this video.",
-            Style::default().fg(theme.text_dim),
-        )));
-        if total_chaps > 0 {
-            list_lines.push(Line::from(Span::styled(
-                format!(" Tip: Click [Chapters ({total_chaps})] or press [u] to browse chapter jumps."),
-                Style::default().fg(theme.secondary),
-            )));
-        } else {
-            list_lines.push(Line::from(Span::styled(
-                " Categories guarded: Sponsor, Self-Promo, Intro, Outro, Interaction.",
-                Style::default().fg(theme.secondary),
-            )));
-        }
-    } else {
-        let cursor = state.studio.sponsor_cursor.min(total_segs - 1);
-        let scroll = state
-            .studio
-            .sponsor_scroll
-            .min(total_segs.saturating_sub(cap));
-        for (rel_idx, seg) in state
-            .detail_sponsor_segments
-            .iter()
-            .skip(scroll)
-            .take(cap)
-            .enumerate()
-        {
-            let abs_idx = scroll + rel_idx;
-            let row = list_lines.len() as u16;
-            let selected = focused && abs_idx == cursor;
-            let len_s = (seg.end_time - seg.start_time).max(0.0);
-            let status = if seg.category == "outro" && !skip_outro {
-                "[Protected]"
-            } else if !sb_mode.auto_skips_category_with_outro(&seg.category, skip_outro) {
-                "[BadgeOnly]"
-            } else if pos >= seg.end_time {
-                "[Skipped ✓]"
-            } else if pos >= seg.start_time && pos < seg.end_time {
-                "[Active]   "
+        CaptionsTab::Chapters => {
+            if chapters.is_empty() {
+                list_lines.push(Line::from(Span::styled(
+                    " No video chapters available in description or metadata.",
+                    Style::default().fg(theme.text_dim),
+                )));
             } else {
-                "[Queued]   "
-            };
-            let cat_lbl = category_label(&seg.category);
-            let cat_w = list_area.width.saturating_sub(36).max(8) as usize;
-            let txt = format!(
-                " {} {}–{} ({:>3.0}s) {:<cat_w$} {}",
-                if selected { ">" } else { " " },
-                format_hms(seg.start_time),
-                format_hms(seg.end_time),
-                len_s,
-                truncate_words(cat_lbl, cat_w),
-                status
-            );
+                let cursor = state.studio.chapter_cursor.min(chapters.len() - 1);
+                let scroll = state
+                    .studio
+                    .chapter_scroll
+                    .min(chapters.len().saturating_sub(cap));
+                for (rel_idx, ch) in chapters.iter().skip(scroll).take(cap).enumerate() {
+                    let abs_idx = scroll + rel_idx;
+                    let row = list_lines.len() as u16;
+                    let next_start = chapters
+                        .get(abs_idx + 1)
+                        .map(|c| c.start_time)
+                        .unwrap_or(dur.max(ch.start_time + 1.0));
+                    let is_playing = pos >= ch.start_time && pos < next_start;
+                    let selected = focused && abs_idx == cursor;
+                    let title_w = list_area.width.saturating_sub(21).max(10) as usize;
+                    let status = if is_playing { "[ACT]" } else { "Jump " };
+                    let txt = format!(
+                        " {} {:>5}  {:<title_w$}  {}",
+                        if selected { ">" } else { " " },
+                        format_hms(ch.start_time),
+                        truncate_words(&ch.title, title_w),
+                        status
+                    );
+                    list_lines.push(Line::from(Span::styled(
+                        txt,
+                        if selected {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(theme.primary)
+                                .add_modifier(Modifier::BOLD)
+                        } else if is_playing {
+                            Style::default()
+                                .fg(Color::Rgb(52, 211, 153))
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text)
+                        },
+                    )));
+                    push_line_hit(
+                        hits,
+                        list_area,
+                        row,
+                        PlayOptionsHit::JumpSponsorSegment(ch.start_time),
+                    );
+                }
+            }
+        }
+        CaptionsTab::Shield => {
+            let ch_lbl = active_channel.as_deref().unwrap_or("Selected Channel");
+            list_lines.push(Line::from(vec![
+                Span::styled(" Active Creator : ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    truncate_words(ch_lbl, list_area.width.saturating_sub(36).max(10) as usize),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if ch_whitelisted {
+                        " [WHITELISTED]"
+                    } else {
+                        " [Shielded]"
+                    },
+                    Style::default().fg(if ch_whitelisted {
+                        Color::Rgb(52, 211, 153)
+                    } else {
+                        theme.secondary
+                    }),
+                ),
+            ]));
             list_lines.push(Line::from(Span::styled(
-                txt,
-                if selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(theme.primary)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(sponsor_color(&seg.category))
-                },
+                format!(
+                    " {}",
+                    truncate_words(
+                        "YouTube Pre/Mid-Roll Ad-Block: Native stream URL extraction bypasses video ads.",
+                        list_area.width.saturating_sub(1) as usize
+                    )
+                ),
+                Style::default().fg(Color::Rgb(52, 211, 153)),
             )));
-            push_line_hit(
-                hits,
-                list_area,
-                row,
-                PlayOptionsHit::JumpSponsorSegment(seg.start_time),
-            );
+            list_lines.push(Line::from(Span::styled(
+                format!(
+                    " {}",
+                    truncate_words(
+                        &format!(
+                            "Live IPC Sync: {} | Min Skip: >={}s | OSD Toast: {}",
+                            if has_ipc { "Active (Hot-updates instantly)" } else { "Ready for launch" },
+                            min_secs,
+                            if osd_toast { "ON" } else { "OFF" }
+                        ),
+                        list_area.width.saturating_sub(1) as usize
+                    )
+                ),
+                Style::default().fg(theme.text_dim),
+            )));
+
+            if whitelist.is_empty() {
+                list_lines.push(Line::from(Span::styled(
+                    " Whitelisted Channels: None (Press [W] to allow a creator without skipping).",
+                    Style::default().fg(theme.text_dim),
+                )));
+            } else {
+                for ch in whitelist.into_iter().take(cap.saturating_sub(3)) {
+                    let row = list_lines.len() as u16;
+                    let w_lbl = list_area.width.saturating_sub(18).max(10) as usize;
+                    list_lines.push(Line::from(vec![
+                        Span::styled(" WL: ", Style::default().fg(Color::Rgb(52, 211, 153))),
+                        Span::styled(
+                            format!("{:<w_lbl$} ", truncate_words(&ch, w_lbl)),
+                            Style::default().fg(theme.text),
+                        ),
+                        Span::styled("[Remove]", Style::default().fg(Color::Rgb(248, 113, 113))),
+                    ]));
+                    push_line_hit(hits, list_area, row, PlayOptionsHit::RemoveWhitelistChannel(ch));
+                }
+            }
         }
     }
+
     frame.render_widget(Paragraph::new(list_lines), list_area);
     push_pane_hit(hits, area, 1);
 }

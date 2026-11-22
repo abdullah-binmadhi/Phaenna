@@ -25,15 +25,16 @@ use crate::api::translate::{
     next_preset_lang, normalize_target_lang, prev_preset_lang, translate_text,
 };
 use crate::api::sponsorblock::{
-    fetch_sponsor_segments, filter_segments_for_mode_with_outro, from_db_rows, to_db_rows,
+    fetch_sponsor_segments, filter_segments_for_config, from_db_rows, to_db_rows,
 };
 use crate::api::ytdlp::{
     fetch_channel_videos, fetch_feed_range, fetch_feed_range_stream,
     fetch_video_details_with_ladder, resolve_stream_ladder, search_youtube,
 };
 use crate::config::{
-    next_dub_lang, Config, ManualMasteringConfig, MotionMode, PerformanceMode, PictureGrade,
-    PicturePreset, Player, Quality, VideoShaderMode,
+    next_dub_lang, AudioEqPreset, Config, ManualMasteringConfig, MotionMode, PerformanceMode,
+    PictureGrade, PicturePreset, Player, Quality, SponsorBlockMode, SponsorCategoryPolicy,
+    VideoShaderMode, EQ_BAND_LABELS,
 };
 use crate::db::{delete_account, set_active_account, upsert_account};
 use crate::db::cache::{
@@ -74,8 +75,8 @@ use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
 };
 use crate::state::{
-    ActiveOverlay, AnalysisHit, AppState, Category, CommentTranslation, ContentFilter,
-    ContentProfile, DetailHit, DetailViewMode, DownloadJobState, HelpHit,
+    ActiveOverlay, AnalysisHit, AppState, CaptionsTab, Category, CommentTranslation,
+    ContentFilter, ContentProfile, DetailHit, DetailViewMode, DownloadJobState, HelpHit,
     ManualToggle, NowPlayingHit, PlayOptionsHit, ReplyTarget, Screen, SearchHit, SearchScope,
     SearchSortOrder, SearchTypeFilter, ShortsSource, SleepTimerMode, SortOrder, StudioPage,
 };
@@ -1578,13 +1579,22 @@ async fn handle_app_message(
         AppMessage::SponsorSegmentsLoaded { video_id, segments } => {
             let rows = to_db_rows(&video_id, &segments);
             let _ = save_sponsorblock_segments(pool, &video_id, &rows, now_unix()).await;
-            if state
+            let count = segments.len();
+            let matches_detail = state
                 .detail_video
                 .as_ref()
                 .map(|v| v.id == video_id)
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            let matches_live =
+                state.active_playback_video_id.as_deref() == Some(video_id.as_str());
+            if matches_detail || matches_live {
                 state.detail_sponsor_segments = segments;
+            }
+            if matches_live {
+                sync_live_sponsorblock_segments(state);
+            }
+            if matches_detail || matches_live {
+                state.log_studio_event("SPONSOR", format!("SponsorBlock loaded {count} segments"));
             }
         }
         AppMessage::DislikesLoaded { video_id, info } => {
@@ -1825,6 +1835,7 @@ async fn handle_app_message(
             state.active_playback_pos = 0.0;
             state.active_playback_dur = 0.0;
             state.sponsor_skips_session = 0;
+            state.live_playback.audio_eq_bypass = false;
             state.log_studio_event(
                 "LAUNCH",
                 format!(
@@ -2656,7 +2667,9 @@ async fn start_nonblocking_playback_with_live_opts(
         audio_multistreams: state.config.audio_multistreams,
         audio_loudnorm: state.config.audio_loudnorm,
         audio_filter_chain: build_mpv_audio_filter_chain(
-            state.config.audio_eq_preset,
+            state.config.active_audio_eq_bands(),
+            state.config.audio_eq_preamp_db,
+            false,
             state.config.audio_channel_mode,
             state.config.audio_voice_highpass,
             state.config.audio_loudnorm,
@@ -2753,23 +2766,27 @@ async fn start_nonblocking_playback_with_live_opts(
             state.show_toast(toast_msg);
 
             if state.config.player == Player::Mpv {
-                let sb_segs = if !is_live
+                let has_detail_sb = !is_live
                     && !state.detail_sponsor_segments.is_empty()
                     && state
                         .detail_video
                         .as_ref()
                         .map(|v| v.id == video.id)
-                        .unwrap_or(false)
-                {
-                    filter_segments_for_mode_with_outro(
+                        .unwrap_or(false);
+                let sb_segs = if has_detail_sb {
+                    filter_segments_for_config(
                         &state.detail_sponsor_segments,
-                        state.config.sponsorblock_mode,
-                        state.config.skip_outro,
+                        &state.config,
+                        Some(video.display_uploader()),
                     )
                 } else {
                     Vec::new()
                 };
-                let sponsorblock_fetch = if sb_segs.is_empty() && !is_live {
+                let sponsorblock_fetch = if !has_detail_sb
+                    && !is_live
+                    && state.config.sponsorblock_mode != SponsorBlockMode::Off
+                    && !state.config.is_channel_whitelisted(video.display_uploader())
+                {
                     Some((
                         client.clone(),
                         state.config.sponsorblock_mode,
@@ -2803,6 +2820,7 @@ async fn start_nonblocking_playback_with_live_opts(
                     tx: tx.clone(),
                     skip_segments: sb_segs,
                     sponsorblock_fetch,
+                    sponsor_osd_toast: state.config.sponsorblock_osd_toast,
                 });
             } else {
                 let p_ext = pool.clone();
@@ -4029,7 +4047,9 @@ fn apply_motion_mode(state: &mut AppState, mode: MotionMode) {
 
 fn apply_audio_filter_chain(state: &mut AppState) {
     let chain = build_mpv_audio_filter_chain(
-        state.config.audio_eq_preset,
+        state.config.active_audio_eq_bands(),
+        state.config.audio_eq_preamp_db,
+        state.live_playback.audio_eq_bypass,
         state.config.audio_channel_mode,
         state.config.audio_voice_highpass,
         state.config.audio_loudnorm,
@@ -4037,6 +4057,21 @@ fn apply_audio_filter_chain(state: &mut AppState) {
     if state.has_live_ipc() {
         state.send_player_cmd(PlayerCommand::SetAudioFilterChain(chain.unwrap_or_default()));
     }
+}
+
+fn sync_live_sponsorblock_segments(state: &AppState) {
+    if !state.has_live_ipc() {
+        return;
+    }
+    let channel_name = state
+        .active_selected_video()
+        .map(|v| v.display_uploader().to_string());
+    let filtered = filter_segments_for_config(
+        &state.detail_sponsor_segments,
+        &state.config,
+        channel_name.as_deref(),
+    );
+    state.send_player_cmd(PlayerCommand::UpdateSkipSegments(filtered));
 }
 
 fn apply_live_subtitle_style(state: &AppState) {
@@ -4256,6 +4291,7 @@ async fn apply_play_options_hit(
         }
         PlayOptionsHit::SelectAudioEq(eq) => {
             state.config.audio_eq_preset = eq;
+            state.live_playback.audio_eq_bypass = false;
             let _ = state.config.save();
             apply_audio_filter_chain(state);
             state.log_studio_event("MODE", format!("Audio EQ -> {}", eq.short_label()));
@@ -4264,16 +4300,100 @@ async fn apply_play_options_hit(
         PlayOptionsHit::CycleAudioEq => {
             let next = state.config.audio_eq_preset.next();
             state.config.audio_eq_preset = next;
+            state.live_playback.audio_eq_bypass = false;
             let _ = state.config.save();
             apply_audio_filter_chain(state);
+            state.log_studio_event("MODE", format!("Audio EQ -> {}", next.short_label()));
             state.show_toast(format!("Audio EQ: {}", next.label()));
         }
-        PlayOptionsHit::ToggleAudioChannelMode => {
-            state.config.audio_channel_mode = state.config.audio_channel_mode.toggle();
+        PlayOptionsHit::AudioEqBandDelta(idx, delta) => {
+            if idx < 10 {
+                if state.config.audio_eq_preset != AudioEqPreset::Custom {
+                    state.config.audio_eq_custom_bands = state.config.active_audio_eq_bands();
+                    state.config.audio_eq_preset = AudioEqPreset::Custom;
+                }
+                let next_db = (state.config.audio_eq_custom_bands[idx] + delta).clamp(-12, 12);
+                state.config.audio_eq_custom_bands[idx] = next_db;
+                state.live_playback.audio_eq_bypass = false;
+                state.studio.audio_eq_band_cursor = idx;
+                let _ = state.config.save();
+                apply_audio_filter_chain(state);
+                state.show_toast(format!("EQ {} -> {:+}dB", EQ_BAND_LABELS[idx], next_db));
+            }
+        }
+        PlayOptionsHit::SetAudioEqBand(idx, val_db) => {
+            if idx < 10 {
+                if state.config.audio_eq_preset != AudioEqPreset::Custom {
+                    state.config.audio_eq_custom_bands = state.config.active_audio_eq_bands();
+                    state.config.audio_eq_preset = AudioEqPreset::Custom;
+                }
+                let next_db = val_db.clamp(-12, 12);
+                state.config.audio_eq_custom_bands[idx] = next_db;
+                state.live_playback.audio_eq_bypass = false;
+                state.studio.audio_eq_band_cursor = idx;
+                let _ = state.config.save();
+                apply_audio_filter_chain(state);
+            }
+        }
+        PlayOptionsHit::AudioEqPreampDelta(delta) => {
+            state.config.audio_eq_preamp_db = if delta == 0 {
+                0
+            } else {
+                (state.config.audio_eq_preamp_db + delta).clamp(-12, 6)
+            };
             let _ = state.config.save();
             apply_audio_filter_chain(state);
             state.show_toast(format!(
-                "Audio Route: {}",
+                "EQ Preamp: {:+}dB",
+                state.config.audio_eq_preamp_db
+            ));
+        }
+        PlayOptionsHit::ToggleAudioEqBypass => {
+            state.live_playback.audio_eq_bypass = !state.live_playback.audio_eq_bypass;
+            apply_audio_filter_chain(state);
+            if state.live_playback.audio_eq_bypass {
+                state.log_studio_event("MODE", "10-Band EQ Bypassed (Flat 0dB)");
+                state.show_toast("10-Band EQ Bypassed (Flat 0dB)");
+            } else {
+                state.log_studio_event("MODE", "10-Band EQ Active");
+                state.show_toast(format!(
+                    "10-Band EQ Active ({})",
+                    state.config.audio_eq_preset.short_label()
+                ));
+            }
+        }
+        PlayOptionsHit::SaveCustomAudioEq => {
+            state.config.audio_eq_custom_bands = state.config.active_audio_eq_bands();
+            state.config.audio_eq_preset = AudioEqPreset::Custom;
+            state.live_playback.audio_eq_bypass = false;
+            let _ = state.config.save();
+            apply_audio_filter_chain(state);
+            state.log_studio_event("MODE", "Saved Custom 10-Band EQ Curve");
+            state.show_toast("Saved current curve as Custom EQ");
+        }
+        PlayOptionsHit::ResetAudioEq => {
+            state.config.audio_eq_preset = AudioEqPreset::Flat;
+            state.config.audio_eq_custom_bands = [0; 10];
+            state.config.audio_eq_preamp_db = 0;
+            state.live_playback.audio_eq_bypass = false;
+            let _ = state.config.save();
+            apply_audio_filter_chain(state);
+            state.log_studio_event("MODE", "Reset 10-Band EQ to Flat (0dB)");
+            state.show_toast("Reset 10-Band EQ to Flat (0dB)");
+        }
+        PlayOptionsHit::SelectAudioSpatial(mode) => {
+            state.config.audio_channel_mode = mode;
+            let _ = state.config.save();
+            apply_audio_filter_chain(state);
+            state.log_studio_event("MODE", format!("Spatial -> {}", mode.label()));
+            state.show_toast(format!("Spatial DSP: {}", mode.label()));
+        }
+        PlayOptionsHit::ToggleAudioChannelMode => {
+            state.config.audio_channel_mode = state.config.audio_channel_mode.next();
+            let _ = state.config.save();
+            apply_audio_filter_chain(state);
+            state.show_toast(format!(
+                "Spatial DSP: {}",
                 state.config.audio_channel_mode.label()
             ));
         }
@@ -4376,6 +4496,13 @@ async fn apply_play_options_hit(
             }
             state.show_toast(format!("Default Sub Lang: {lang}"));
         }
+        PlayOptionsHit::SetSubFont(font) => {
+            state.config.subtitle_style.font_family = font.to_string();
+            state.config.subtitle_style.preset = crate::services::substyler::SubtitlePreset::Custom;
+            let _ = state.config.save();
+            apply_live_subtitle_style(state);
+            state.show_toast(format!("Subtitle Font: {font}"));
+        }
         PlayOptionsHit::SubFontSizeDelta(delta) => {
             if delta != 0 {
                 let cur = state.config.subtitle_style.font_size as i32;
@@ -4403,6 +4530,15 @@ async fn apply_play_options_hit(
                 apply_live_subtitle_style(state);
             }
         }
+        PlayOptionsHit::SubShadowDelta(delta) => {
+            if delta.abs() > 0.01 {
+                let next = (state.config.subtitle_style.shadow_offset + delta).clamp(0.0, 4.0);
+                state.config.subtitle_style.shadow_offset = (next * 10.0).round() / 10.0;
+                state.config.subtitle_style.preset = crate::services::substyler::SubtitlePreset::Custom;
+                let _ = state.config.save();
+                apply_live_subtitle_style(state);
+            }
+        }
         PlayOptionsHit::SetSubBackdrop(op) => {
             state.config.subtitle_style.backdrop_opacity = op.clamp(0.0, 1.0);
             state.config.subtitle_style.preset = crate::services::substyler::SubtitlePreset::Custom;
@@ -4415,8 +4551,17 @@ async fn apply_play_options_hit(
             let _ = state.config.save();
             apply_live_subtitle_style(state);
         }
-        PlayOptionsHit::SetCaptionsListTab(use_chapters) => {
-            state.studio.captions_use_chapters = Some(use_chapters);
+        PlayOptionsHit::ReloadSubtitles => {
+            if state.has_live_ipc() {
+                state.send_player_cmd(PlayerCommand::ReloadSubtitles);
+                state.log_studio_event("SUBS", "Re-applied & reloaded subtitle tracks");
+                state.show_toast("Reloading subtitle tracks...");
+            } else {
+                state.show_toast("Launch playback first to reload live subtitle tracks");
+            }
+        }
+        PlayOptionsHit::SetCaptionsTab(tab) => {
+            state.studio.captions_tab = Some(tab);
         }
         PlayOptionsHit::SubDelayDelta(delta_ms) => {
             state.live_playback.sub_delay_ms =
@@ -4449,10 +4594,183 @@ async fn apply_play_options_hit(
         PlayOptionsHit::SelectSponsorBlock(mode) => {
             state.config.sponsorblock_mode = mode;
             let _ = state.config.save();
+            sync_live_sponsorblock_segments(state);
+            state.log_studio_event("SHIELD", format!("AdBlock Shield -> {}", mode.label()));
+            state.show_toast(format!("Shield Mode: {}", mode.label()));
         }
         PlayOptionsHit::ToggleSkipOutro => {
             state.config.skip_outro = !state.config.skip_outro;
             let _ = state.config.save();
+            sync_live_sponsorblock_segments(state);
+        }
+        PlayOptionsHit::ReScanSponsorBlock => {
+            let target_vid = state
+                .active_playback_video_id
+                .clone()
+                .or_else(|| state.active_selected_video().map(|v| v.id));
+            if let Some(vid) = target_vid {
+                let c = client.clone();
+                let tx_s = tx.clone();
+                state.show_toast("Scanning SponsorBlock database...");
+                state.log_studio_event("SHIELD", format!("Re-scanning SponsorBlock for {vid}"));
+                tokio::spawn(async move {
+                    match fetch_sponsor_segments(&c, &vid).await {
+                        Ok(segments) => {
+                            let _ = tx_s
+                                .send(AppMessage::SponsorSegmentsLoaded {
+                                    video_id: vid,
+                                    segments,
+                                })
+                                .await;
+                        }
+                        Err(err) => {
+                            let _ = tx_s
+                                .send(AppMessage::ShowToast(format!(
+                                    "SponsorBlock scan failed: {err}"
+                                )))
+                                .await;
+                        }
+                    }
+                });
+            } else {
+                state.show_toast("Select or play a video to scan SponsorBlock");
+            }
+        }
+        PlayOptionsHit::UndoLastSponsorSkip => {
+            if state.has_live_ipc() {
+                state.send_player_cmd(PlayerCommand::UndoLastSkip);
+                state.log_studio_event("SHIELD", "Requested undo of last SponsorBlock skip");
+            } else {
+                state.show_toast("Launch playback first to undo last skip");
+            }
+        }
+        PlayOptionsHit::SkipActiveSponsorNow => {
+            let pos = state.active_playback_pos;
+            let target = state
+                .detail_sponsor_segments
+                .iter()
+                .find(|s| pos >= s.start_time && pos < s.end_time)
+                .or_else(|| {
+                    state
+                        .detail_sponsor_segments
+                        .iter()
+                        .find(|s| s.start_time > pos)
+                });
+            if let Some(seg) = target.cloned() {
+                if state.has_live_ipc() {
+                    let saved = (seg.end_time - pos.max(seg.start_time)).max(0.0);
+                    let cat_lbl = crate::api::sponsorblock::category_label(&seg.category);
+                    state.active_playback_pos = seg.end_time;
+                    state.send_player_cmd(PlayerCommand::SeekAbsolute(seg.end_time));
+                    state.sponsor_skips_session += 1;
+                    state.log_studio_event(
+                        "SKIP",
+                        format!("Manual skip {} (+{:.0}s)", cat_lbl, saved),
+                    );
+                    state.show_toast(format!("Skipped {} (+{:.0}s)", cat_lbl, saved));
+                } else {
+                    state.show_toast("Launch playback first to skip segment");
+                }
+            } else {
+                state.show_toast("No active or upcoming segment to skip");
+            }
+        }
+        PlayOptionsHit::ToggleWhitelistChannel => {
+            if let Some(ch) = state
+                .active_selected_video()
+                .map(|v| v.display_uploader().trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(pos) = state
+                    .config
+                    .sponsorblock_whitelist
+                    .iter()
+                    .position(|existing| existing.eq_ignore_ascii_case(&ch))
+                {
+                    state.config.sponsorblock_whitelist.remove(pos);
+                    state.show_toast(format!("Removed '{ch}' from AdBlock whitelist"));
+                    state.log_studio_event("SHIELD", format!("Un-whitelisted channel {ch}"));
+                } else {
+                    state.config.sponsorblock_whitelist.push(ch.clone());
+                    state.show_toast(format!(
+                        "Whitelisted channel '{ch}' (SponsorBlock paused)"
+                    ));
+                    state.log_studio_event("SHIELD", format!("Whitelisted channel {ch}"));
+                }
+                let _ = state.config.save();
+                sync_live_sponsorblock_segments(state);
+            } else {
+                state.show_toast("No channel metadata for current selection");
+            }
+        }
+        PlayOptionsHit::RemoveWhitelistChannel(ch) => {
+            state
+                .config
+                .sponsorblock_whitelist
+                .retain(|existing| !existing.eq_ignore_ascii_case(&ch));
+            let _ = state.config.save();
+            sync_live_sponsorblock_segments(state);
+            state.show_toast(format!("Removed '{ch}' from whitelist"));
+        }
+        PlayOptionsHit::CycleSponsorCategory(cat) => {
+            if state.config.sponsorblock_mode != SponsorBlockMode::Custom {
+                let cur_mode = state.config.sponsorblock_mode;
+                let cur_outro = state.config.skip_outro;
+                for k in [
+                    "sponsor",
+                    "selfpromo",
+                    "interaction",
+                    "intro",
+                    "outro",
+                    "preview",
+                    "filler",
+                    "music_offtopic",
+                ] {
+                    let pol = state
+                        .config
+                        .sponsor_rules
+                        .effective_policy(cur_mode, cur_outro, k);
+                    state.config.sponsor_rules.set_policy(k, pol);
+                }
+                state.config.sponsorblock_mode = SponsorBlockMode::Custom;
+            }
+            let next_pol = state.config.sponsor_rules.cycle_category(cat);
+            if cat == "outro" {
+                state.config.skip_outro = next_pol == SponsorCategoryPolicy::AutoSkip;
+            }
+            let _ = state.config.save();
+            sync_live_sponsorblock_segments(state);
+            state.show_toast(format!(
+                "{} -> {}",
+                crate::api::sponsorblock::category_label(cat),
+                next_pol.badge()
+            ));
+        }
+        PlayOptionsHit::SetSponsorMinSecs(secs) => {
+            state.config.sponsorblock_min_secs = secs.min(10);
+            let _ = state.config.save();
+            sync_live_sponsorblock_segments(state);
+            state.show_toast(format!(
+                "Min SponsorBlock duration: {}s",
+                state.config.sponsorblock_min_secs
+            ));
+        }
+        PlayOptionsHit::ToggleSponsorOsdToast => {
+            state.config.sponsorblock_osd_toast = !state.config.sponsorblock_osd_toast;
+            let _ = state.config.save();
+            if state.has_live_ipc() {
+                state.send_player_cmd(PlayerCommand::SetSponsorOsdToast(
+                    state.config.sponsorblock_osd_toast,
+                ));
+            }
+            state.show_toast(format!(
+                "Skip OSD Toast: {}",
+                if state.config.sponsorblock_osd_toast {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            ));
         }
         PlayOptionsHit::JumpSponsorSegment(start_secs) => {
             if state.has_live_ipc() {
@@ -4468,10 +4786,10 @@ async fn apply_play_options_hit(
                 .active_selected_video()
                 .map(|v| v.effective_chapters().len())
                 .unwrap_or(0);
-            let use_chapters = match state.studio.captions_use_chapters {
-                Some(v) => v,
-                None => state.detail_sponsor_segments.is_empty() && chaps_len > 0,
-            };
+            let use_chapters = state.studio.captions_tab == Some(CaptionsTab::Chapters)
+                || (state.studio.captions_tab.is_none()
+                    && state.detail_sponsor_segments.is_empty()
+                    && chaps_len > 0);
             if use_chapters && chaps_len > 0 {
                 state.studio.chapter_cursor = if delta > 0 {
                     (state.studio.chapter_cursor + delta as usize).min(chaps_len - 1)
@@ -6650,18 +6968,12 @@ async fn handle_overlay_key(
                         )
                         .await;
                     }
-                    (StudioPage::AudioSync, 1) => {
-                        let delta = if right { 50 } else { -50 };
-                        apply_play_options_hit(
-                            PlayOptionsHit::AudioDelayDelta(delta),
-                            0,
-                            ratatui::layout::Rect::default(),
-                            state,
-                            pool,
-                            tx,
-                            client,
-                        )
-                        .await;
+                    (StudioPage::AudioSync, 0) => {
+                        state.studio.audio_eq_band_cursor = if right {
+                            (state.studio.audio_eq_band_cursor + 1) % 10
+                        } else {
+                            (state.studio.audio_eq_band_cursor + 9) % 10
+                        };
                     }
                     (StudioPage::CaptionsSkip, 0) => {
                         let delta = if right { 100 } else { -100 };
@@ -6733,7 +7045,10 @@ async fn handle_overlay_key(
                     }
                     (StudioPage::AudioSync, 0) => {
                         apply_play_options_hit(
-                            PlayOptionsHit::ScrollAudioTracks(step),
+                            PlayOptionsHit::AudioEqBandDelta(
+                                state.studio.audio_eq_band_cursor,
+                                if down { -1 } else { 1 },
+                            ),
                             0,
                             ratatui::layout::Rect::default(),
                             state,
@@ -6898,8 +7213,13 @@ async fn handle_overlay_key(
                 state.send_player_cmd(PlayerCommand::ToggleMute);
             }
             KeyCode::Char('0') => {
+                let hit = if state.studio.page == StudioPage::AudioSync {
+                    PlayOptionsHit::ResetAudioEq
+                } else {
+                    PlayOptionsHit::ResetPicture
+                };
                 apply_play_options_hit(
-                    PlayOptionsHit::ResetPicture,
+                    hit,
                     0,
                     ratatui::layout::Rect::default(),
                     state,
@@ -6923,8 +7243,13 @@ async fn handle_overlay_key(
                 .await;
             }
             KeyCode::Char('b') => {
+                let hit = if state.studio.page == StudioPage::AudioSync {
+                    PlayOptionsHit::ToggleAudioEqBypass
+                } else {
+                    PlayOptionsHit::TogglePictureBypass
+                };
                 apply_play_options_hit(
-                    PlayOptionsHit::TogglePictureBypass,
+                    hit,
                     0,
                     ratatui::layout::Rect::default(),
                     state,
@@ -7029,7 +7354,13 @@ async fn handle_overlay_key(
                 let hit = match code {
                     KeyCode::Char('v') => PlayOptionsHit::CycleLiveMode,
                     KeyCode::Char('E') => PlayOptionsHit::JumpToLiveEdge,
-                    KeyCode::Char('R') => PlayOptionsHit::LaunchAudioRadio,
+                    KeyCode::Char('R') => {
+                        if state.studio.page == StudioPage::CaptionsSkip {
+                            PlayOptionsHit::ReScanSponsorBlock
+                        } else {
+                            PlayOptionsHit::LaunchAudioRadio
+                        }
+                    }
                     _ => PlayOptionsHit::PlayLiveFromStart,
                 };
                 apply_play_options_hit(
@@ -7049,15 +7380,47 @@ async fn handle_overlay_key(
                     KeyCode::Char('r') => PlayOptionsHit::RefreshStreamLadder,
                     KeyCode::Char('e') => PlayOptionsHit::CycleAudioEq,
                     KeyCode::Char('u') => {
-                        let cur = state.studio.captions_use_chapters.unwrap_or(
-                            state.detail_sponsor_segments.is_empty(),
+                        let has_chaps = state
+                            .active_selected_video()
+                            .map(|v| !v.effective_chapters().is_empty())
+                            .unwrap_or(false);
+                        let cur = state.studio.captions_tab.unwrap_or(
+                            if state.detail_sponsor_segments.is_empty() && has_chaps {
+                                CaptionsTab::Chapters
+                            } else {
+                                CaptionsTab::Segments
+                            },
                         );
-                        PlayOptionsHit::SetCaptionsListTab(!cur)
+                        PlayOptionsHit::SetCaptionsTab(cur.next())
                     }
                     _ => PlayOptionsHit::SetEventLogFilter(state.studio.event_log_filter.next()),
                 };
                 apply_play_options_hit(
                     hit,
+                    0,
+                    ratatui::layout::Rect::default(),
+                    state,
+                    pool,
+                    tx,
+                    client,
+                )
+                .await;
+            }
+            KeyCode::Char('U') => {
+                apply_play_options_hit(
+                    PlayOptionsHit::UndoLastSponsorSkip,
+                    0,
+                    ratatui::layout::Rect::default(),
+                    state,
+                    pool,
+                    tx,
+                    client,
+                )
+                .await;
+            }
+            KeyCode::Char('W') => {
+                apply_play_options_hit(
+                    PlayOptionsHit::ToggleWhitelistChannel,
                     0,
                     ratatui::layout::Rect::default(),
                     state,

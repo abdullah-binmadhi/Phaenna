@@ -593,6 +593,7 @@ pub enum SponsorBlockMode {
     AutoSkipAll,
     SponsorOnly,
     ShowChaptersOnly,
+    Custom,
     Off,
 }
 
@@ -602,7 +603,8 @@ impl SponsorBlockMode {
         match self {
             Self::AutoSkipAll => Self::SponsorOnly,
             Self::SponsorOnly => Self::ShowChaptersOnly,
-            Self::ShowChaptersOnly => Self::Off,
+            Self::ShowChaptersOnly => Self::Custom,
+            Self::Custom => Self::Off,
             Self::Off => Self::AutoSkipAll,
         }
     }
@@ -612,13 +614,14 @@ impl SponsorBlockMode {
             Self::AutoSkipAll => "Auto-Skip All",
             Self::SponsorOnly => "Sponsors Only",
             Self::ShowChaptersOnly => "Show Badges Only",
+            Self::Custom => "Custom Rules",
             Self::Off => "Disabled",
         }
     }
 
     pub fn categories(self) -> &'static [&'static str] {
         match self {
-            Self::AutoSkipAll | Self::ShowChaptersOnly => &[
+            Self::AutoSkipAll | Self::ShowChaptersOnly | Self::Custom => &[
                 "sponsor",
                 "selfpromo",
                 "interaction",
@@ -626,6 +629,7 @@ impl SponsorBlockMode {
                 "outro",
                 "preview",
                 "music_offtopic",
+                "filler",
             ],
             Self::SponsorOnly => &["sponsor"],
             Self::Off => &[],
@@ -643,7 +647,150 @@ impl SponsorBlockMode {
         match self {
             Self::AutoSkipAll => true,
             Self::SponsorOnly => category == "sponsor",
-            Self::ShowChaptersOnly | Self::Off => false,
+            Self::ShowChaptersOnly | Self::Off | Self::Custom => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SponsorCategoryPolicy {
+    #[default]
+    AutoSkip,
+    NotifyOnly,
+    Ignore,
+}
+
+#[allow(dead_code)]
+impl SponsorCategoryPolicy {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::AutoSkip => Self::NotifyOnly,
+            Self::NotifyOnly => Self::Ignore,
+            Self::Ignore => Self::AutoSkip,
+        }
+    }
+
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::AutoSkip => "[SKIP]",
+            Self::NotifyOnly => "[NOTF]",
+            Self::Ignore => "[IGNR]",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SponsorCategoryRules {
+    #[serde(default = "default_policy_skip")]
+    pub sponsor: SponsorCategoryPolicy,
+    #[serde(default = "default_policy_skip")]
+    pub selfpromo: SponsorCategoryPolicy,
+    #[serde(default = "default_policy_skip")]
+    pub interaction: SponsorCategoryPolicy,
+    #[serde(default = "default_policy_skip")]
+    pub intro: SponsorCategoryPolicy,
+    #[serde(default = "default_policy_ignore")]
+    pub outro: SponsorCategoryPolicy,
+    #[serde(default = "default_policy_skip")]
+    pub preview: SponsorCategoryPolicy,
+    #[serde(default = "default_policy_notify")]
+    pub filler: SponsorCategoryPolicy,
+    #[serde(default = "default_policy_skip")]
+    pub music_offtopic: SponsorCategoryPolicy,
+}
+
+fn default_policy_skip() -> SponsorCategoryPolicy {
+    SponsorCategoryPolicy::AutoSkip
+}
+fn default_policy_notify() -> SponsorCategoryPolicy {
+    SponsorCategoryPolicy::NotifyOnly
+}
+fn default_policy_ignore() -> SponsorCategoryPolicy {
+    SponsorCategoryPolicy::Ignore
+}
+
+impl Default for SponsorCategoryRules {
+    fn default() -> Self {
+        Self {
+            sponsor: SponsorCategoryPolicy::AutoSkip,
+            selfpromo: SponsorCategoryPolicy::AutoSkip,
+            interaction: SponsorCategoryPolicy::AutoSkip,
+            intro: SponsorCategoryPolicy::AutoSkip,
+            outro: SponsorCategoryPolicy::Ignore,
+            preview: SponsorCategoryPolicy::AutoSkip,
+            filler: SponsorCategoryPolicy::NotifyOnly,
+            music_offtopic: SponsorCategoryPolicy::AutoSkip,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SponsorCategoryRules {
+    pub fn policy_for(&self, cat: &str) -> SponsorCategoryPolicy {
+        match cat {
+            "sponsor" => self.sponsor,
+            "selfpromo" => self.selfpromo,
+            "interaction" => self.interaction,
+            "intro" => self.intro,
+            "outro" => self.outro,
+            "preview" => self.preview,
+            "filler" => self.filler,
+            "music_offtopic" => self.music_offtopic,
+            _ => SponsorCategoryPolicy::Ignore,
+        }
+    }
+
+    pub fn set_policy(&mut self, cat: &str, p: SponsorCategoryPolicy) {
+        match cat {
+            "sponsor" => self.sponsor = p,
+            "selfpromo" => self.selfpromo = p,
+            "interaction" => self.interaction = p,
+            "intro" => self.intro = p,
+            "outro" => self.outro = p,
+            "preview" => self.preview = p,
+            "filler" => self.filler = p,
+            "music_offtopic" => self.music_offtopic = p,
+            _ => {}
+        }
+    }
+
+    pub fn cycle_category(&mut self, cat: &str) -> SponsorCategoryPolicy {
+        let next = self.policy_for(cat).next();
+        self.set_policy(cat, next);
+        next
+    }
+
+    pub fn effective_policy(
+        &self,
+        mode: SponsorBlockMode,
+        skip_outro: bool,
+        cat: &str,
+    ) -> SponsorCategoryPolicy {
+        match mode {
+            SponsorBlockMode::Off => SponsorCategoryPolicy::Ignore,
+            SponsorBlockMode::ShowChaptersOnly => SponsorCategoryPolicy::NotifyOnly,
+            SponsorBlockMode::SponsorOnly => {
+                if cat == "sponsor" {
+                    SponsorCategoryPolicy::AutoSkip
+                } else {
+                    SponsorCategoryPolicy::Ignore
+                }
+            }
+            SponsorBlockMode::AutoSkipAll => {
+                if cat == "outro" && !skip_outro {
+                    SponsorCategoryPolicy::Ignore
+                } else {
+                    SponsorCategoryPolicy::AutoSkip
+                }
+            }
+            SponsorBlockMode::Custom => {
+                if cat == "outro" && !skip_outro && self.outro == SponsorCategoryPolicy::AutoSkip {
+                    SponsorCategoryPolicy::NotifyOnly
+                } else {
+                    self.policy_for(cat)
+                }
+            }
         }
     }
 }
@@ -1562,6 +1709,11 @@ impl PictureConfig {
     }
 }
 
+pub const EQ_BAND_FREQS_HZ: [u32; 10] = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+pub const EQ_BAND_LABELS: [&str; 10] = [
+    "31Hz", "62Hz", "125Hz", "250Hz", "500Hz", "1kHz", "2kHz", "4kHz", "8kHz", "16kHz",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioEqPreset {
@@ -1570,29 +1722,65 @@ pub enum AudioEqPreset {
     VoiceClarity,
     Podcast,
     BassBoost,
+    DeepSub,
     TrebleCrisp,
+    Rock,
+    Electronic,
+    Acoustic,
+    Jazz,
+    Cinema,
     LateNight,
+    Custom,
 }
 
 #[allow(dead_code)]
 impl AudioEqPreset {
-    pub const ALL: [Self; 6] = [
+    pub const PRESETS_12: [Self; 12] = [
         Self::Flat,
         Self::VoiceClarity,
         Self::Podcast,
         Self::BassBoost,
+        Self::DeepSub,
         Self::TrebleCrisp,
+        Self::Rock,
+        Self::Electronic,
+        Self::Acoustic,
+        Self::Jazz,
+        Self::Cinema,
         Self::LateNight,
+    ];
+
+    pub const ALL: [Self; 13] = [
+        Self::Flat,
+        Self::VoiceClarity,
+        Self::Podcast,
+        Self::BassBoost,
+        Self::DeepSub,
+        Self::TrebleCrisp,
+        Self::Rock,
+        Self::Electronic,
+        Self::Acoustic,
+        Self::Jazz,
+        Self::Cinema,
+        Self::LateNight,
+        Self::Custom,
     ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Flat => "Flat (Reference 0dB)",
-            Self::VoiceClarity => "Voice Clarity (Presence +5dB)",
+            Self::VoiceClarity => "Voice Clarity (Dialogue +5dB)",
             Self::Podcast => "Podcast Studio (Warm Vocal)",
-            Self::BassBoost => "Bass Boost (+6dB Low End)",
+            Self::BassBoost => "Bass Boost (+6dB Punch)",
+            Self::DeepSub => "Deep Sub (+8dB Theater LFE)",
             Self::TrebleCrisp => "Treble Crisp (+6dB Air)",
+            Self::Rock => "Rock (Punchy V-Shape)",
+            Self::Electronic => "EDM / Electronic (Sub + Air)",
+            Self::Acoustic => "Acoustic (Warm Natural)",
+            Self::Jazz => "Jazz (Upright Bass & Brass)",
+            Self::Cinema => "Cinema (Wide + Dialogue)",
             Self::LateNight => "Late Night (Soft Bass / Peaks)",
+            Self::Custom => "Custom User Curve",
         }
     }
 
@@ -1602,8 +1790,15 @@ impl AudioEqPreset {
             Self::VoiceClarity => "Voice",
             Self::Podcast => "Podcast",
             Self::BassBoost => "Bass+",
+            Self::DeepSub => "Deep Sub",
             Self::TrebleCrisp => "Treble+",
+            Self::Rock => "Rock",
+            Self::Electronic => "EDM",
+            Self::Acoustic => "Acoustic",
+            Self::Jazz => "Jazz",
+            Self::Cinema => "Cinema",
             Self::LateNight => "Night",
+            Self::Custom => "Custom",
         }
     }
 
@@ -1612,21 +1807,33 @@ impl AudioEqPreset {
             Self::Flat => Self::VoiceClarity,
             Self::VoiceClarity => Self::Podcast,
             Self::Podcast => Self::BassBoost,
-            Self::BassBoost => Self::TrebleCrisp,
-            Self::TrebleCrisp => Self::LateNight,
-            Self::LateNight => Self::Flat,
+            Self::BassBoost => Self::DeepSub,
+            Self::DeepSub => Self::TrebleCrisp,
+            Self::TrebleCrisp => Self::Rock,
+            Self::Rock => Self::Electronic,
+            Self::Electronic => Self::Acoustic,
+            Self::Acoustic => Self::Jazz,
+            Self::Jazz => Self::Cinema,
+            Self::Cinema => Self::LateNight,
+            Self::LateNight | Self::Custom => Self::Flat,
         }
     }
 
-    /// 5-band parametric EQ gains (dB) centered at `[60Hz, 250Hz, 1kHz, 4kHz, 12kHz]`.
-    pub const fn band_gains_db(self) -> [i8; 5] {
+    /// 10-band graphic EQ gains (dB) at `[31Hz, 62Hz, 125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz, 16kHz]`.
+    pub const fn band_gains_db(self) -> [i8; 10] {
         match self {
-            Self::Flat => [0, 0, 0, 0, 0],
-            Self::VoiceClarity => [-4, -2, 3, 5, 2],
-            Self::Podcast => [-3, 1, 4, 3, 1],
-            Self::BassBoost => [6, 4, 0, -1, 1],
-            Self::TrebleCrisp => [-1, 0, 1, 4, 6],
-            Self::LateNight => [-5, -2, 2, 1, -3],
+            Self::Flat | Self::Custom => [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            Self::VoiceClarity => [-5, -4, -2, 0, 2, 4, 5, 4, 2, 0],
+            Self::Podcast => [-4, -2, 0, 2, 3, 4, 3, 2, 1, 0],
+            Self::BassBoost => [6, 5, 4, 2, 0, 0, 0, -1, 0, 1],
+            Self::DeepSub => [8, 6, 3, 1, -1, -1, 0, 1, 2, 2],
+            Self::TrebleCrisp => [-1, -1, 0, 0, 1, 2, 3, 5, 6, 6],
+            Self::Rock => [4, 3, 1, -1, -2, 0, 2, 4, 5, 4],
+            Self::Electronic => [6, 5, 2, 0, -2, 0, 1, 3, 5, 6],
+            Self::Acoustic => [2, 2, 1, 1, 2, 2, 3, 2, 2, 1],
+            Self::Jazz => [3, 2, 1, 2, -1, -1, 0, 1, 2, 3],
+            Self::Cinema => [5, 4, 1, 0, 1, 3, 4, 2, 1, 2],
+            Self::LateNight => [-6, -5, -3, -1, 1, 2, 2, 1, -2, -4],
         }
     }
 }
@@ -1637,30 +1844,44 @@ pub enum AudioChannelMode {
     #[default]
     Stereo,
     Mono,
+    Crossfeed,
+    WideStage,
 }
 
 #[allow(dead_code)]
 impl AudioChannelMode {
+    pub const ALL: [Self; 4] = [Self::Stereo, Self::Mono, Self::Crossfeed, Self::WideStage];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Stereo => "Stereo 2.0 (Native)",
             Self::Mono => "Mono Downmix (Centered)",
+            Self::Crossfeed => "Headphone Crossfeed (Natural Stage)",
+            Self::WideStage => "Wide Stereo Stage (+45% Width)",
         }
     }
 
     pub const fn short_label(self) -> &'static str {
         match self {
-            Self::Stereo => "Stereo 2.0",
-            Self::Mono => "Mono Mix",
+            Self::Stereo => "Stereo",
+            Self::Mono => "Mono",
+            Self::Crossfeed => "Crossfeed",
+            Self::WideStage => "Wide",
         }
     }
 
-    pub const fn toggle(self) -> Self {
+    pub const fn next(self) -> Self {
         match self {
             Self::Stereo => Self::Mono,
-            Self::Mono => Self::Stereo,
+            Self::Mono => Self::Crossfeed,
+            Self::Crossfeed => Self::WideStage,
+            Self::WideStage => Self::Stereo,
         }
     }
+}
+
+fn default_sb_min_secs() -> u8 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1708,9 +1929,21 @@ pub struct Config {
     #[serde(default)]
     pub audio_eq_preset: AudioEqPreset,
     #[serde(default)]
+    pub audio_eq_custom_bands: [i8; 10],
+    #[serde(default)]
+    pub audio_eq_preamp_db: i8,
+    #[serde(default)]
     pub audio_channel_mode: AudioChannelMode,
     #[serde(default)]
     pub audio_voice_highpass: bool,
+    #[serde(default)]
+    pub sponsor_rules: SponsorCategoryRules,
+    #[serde(default)]
+    pub sponsorblock_whitelist: Vec<String>,
+    #[serde(default = "default_sb_min_secs")]
+    pub sponsorblock_min_secs: u8,
+    #[serde(default = "default_true")]
+    pub sponsorblock_osd_toast: bool,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
     #[serde(default = "default_theme_index")]
@@ -1759,8 +1992,14 @@ impl Default for Config {
             auto_abr_downshift: true,
             max_fps_cap: None,
             audio_eq_preset: AudioEqPreset::default(),
+            audio_eq_custom_bands: [0; 10],
+            audio_eq_preamp_db: 0,
             audio_channel_mode: AudioChannelMode::default(),
             audio_voice_highpass: false,
+            sponsor_rules: SponsorCategoryRules::default(),
+            sponsorblock_whitelist: Vec::new(),
+            sponsorblock_min_secs: default_sb_min_secs(),
+            sponsorblock_osd_toast: true,
             ambilight_enabled: true,
             theme_index: default_theme_index(),
             google_oauth: GoogleOAuthConfig::default(),
@@ -1778,6 +2017,29 @@ impl Default for Config {
 
 #[allow(dead_code)]
 impl Config {
+    pub fn active_audio_eq_bands(&self) -> [i8; 10] {
+        let raw = if self.audio_eq_preset == AudioEqPreset::Custom {
+            self.audio_eq_custom_bands
+        } else {
+            self.audio_eq_preset.band_gains_db()
+        };
+        raw.map(|v| v.clamp(-12, 12))
+    }
+
+    pub fn is_channel_whitelisted(&self, channel_name: &str) -> bool {
+        let ch = channel_name.trim();
+        !ch.is_empty()
+            && self
+                .sponsorblock_whitelist
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case(ch))
+    }
+
+    pub fn effective_sponsor_policy(&self, category: &str) -> SponsorCategoryPolicy {
+        self.sponsor_rules
+            .effective_policy(self.sponsorblock_mode, self.skip_outro, category)
+    }
+
     pub fn effective_mastering(&self) -> ManualMasteringConfig {
         if self.performance_mode == PerformanceMode::Manual {
             self.manual_mastering
@@ -2107,27 +2369,44 @@ mod tests {
 
     #[test]
     fn test_audio_eq_channel_and_fps_config_roundtrip() {
-        assert_eq!(AudioEqPreset::ALL.len(), 6);
-        assert_eq!(AudioEqPreset::Flat.band_gains_db(), [0, 0, 0, 0, 0]);
-        assert_eq!(AudioEqPreset::VoiceClarity.band_gains_db(), [-4, -2, 3, 5, 2]);
+        assert_eq!(AudioEqPreset::PRESETS_12.len(), 12);
+        assert_eq!(AudioEqPreset::ALL.len(), 13);
+        assert_eq!(AudioEqPreset::Flat.band_gains_db(), [0; 10]);
+        assert_eq!(
+            AudioEqPreset::VoiceClarity.band_gains_db(),
+            [-5, -4, -2, 0, 2, 4, 5, 4, 2, 0]
+        );
         assert_eq!(AudioEqPreset::LateNight.next(), AudioEqPreset::Flat);
-        assert_eq!(AudioChannelMode::Stereo.toggle(), AudioChannelMode::Mono);
+        assert_eq!(AudioChannelMode::Stereo.next(), AudioChannelMode::Mono);
+        assert_eq!(AudioChannelMode::Mono.next(), AudioChannelMode::Crossfeed);
+        assert_eq!(AudioChannelMode::Crossfeed.next(), AudioChannelMode::WideStage);
 
         let dir = tempdir().unwrap();
         let cfg_path = dir.path().join("audio_fps_config.toml");
         let cfg = Config {
             max_fps_cap: Some(30),
-            audio_eq_preset: AudioEqPreset::Podcast,
-            audio_channel_mode: AudioChannelMode::Mono,
+            audio_eq_preset: AudioEqPreset::Custom,
+            audio_eq_custom_bands: [4, 2, 0, -2, 0, 3, 4, 2, 1, 0],
+            audio_eq_preamp_db: -2,
+            audio_channel_mode: AudioChannelMode::Crossfeed,
             audio_voice_highpass: true,
+            sponsorblock_mode: SponsorBlockMode::Custom,
+            sponsorblock_whitelist: vec!["Channel One".to_string()],
+            sponsorblock_min_secs: 3,
+            sponsorblock_osd_toast: false,
             ..Default::default()
         };
         cfg.save_to_path(&cfg_path).unwrap();
         let loaded = Config::load_from_path(&cfg_path).unwrap();
         assert_eq!(loaded.max_fps_cap, Some(30));
-        assert_eq!(loaded.audio_eq_preset, AudioEqPreset::Podcast);
-        assert_eq!(loaded.audio_channel_mode, AudioChannelMode::Mono);
+        assert_eq!(loaded.audio_eq_preset, AudioEqPreset::Custom);
+        assert_eq!(loaded.active_audio_eq_bands(), [4, 2, 0, -2, 0, 3, 4, 2, 1, 0]);
+        assert_eq!(loaded.audio_eq_preamp_db, -2);
+        assert_eq!(loaded.audio_channel_mode, AudioChannelMode::Crossfeed);
         assert!(loaded.audio_voice_highpass);
+        assert!(loaded.is_channel_whitelisted("channel one"));
+        assert_eq!(loaded.sponsorblock_min_secs, 3);
+        assert!(!loaded.sponsorblock_osd_toast);
 
         let fps_sel = Quality::P1080.ytdl_format_for_network_and_fps(
             DubPreference::OriginalOnly,

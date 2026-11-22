@@ -1735,8 +1735,8 @@ impl StudioPage {
             Self::Deck => "Deck",
             Self::StreamNet => "Stream & Net",
             Self::MasteringGpu => "Mastering & GPU",
-            Self::AudioSync => "Audio & Sync",
-            Self::CaptionsSkip => "Captions & Skip",
+            Self::AudioSync => "Audio & EQ",
+            Self::CaptionsSkip => "AdBlock & Subs",
             Self::LiveTelemetry => "Live & Telemetry",
         }
     }
@@ -1746,8 +1746,8 @@ impl StudioPage {
             Self::Deck => "Deck",
             Self::StreamNet => "Stream",
             Self::MasteringGpu => "Master",
-            Self::AudioSync => "Audio",
-            Self::CaptionsSkip => "Captions",
+            Self::AudioSync => "AudioEQ",
+            Self::CaptionsSkip => "AdBlock",
             Self::LiveTelemetry => "Live",
         }
     }
@@ -1842,15 +1842,35 @@ impl EventLogFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptionsTab {
+    #[default]
+    Segments,
+    Chapters,
+    Shield,
+}
+
+#[allow(dead_code)]
+impl CaptionsTab {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Segments => Self::Chapters,
+            Self::Chapters => Self::Shield,
+            Self::Shield => Self::Segments,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StudioNavState {
     pub page: StudioPage,
     pub pane_focus: usize,
     pub eq_cursor: usize,
+    pub audio_eq_band_cursor: usize,
     pub sub_track_scroll: usize,
     pub sponsor_cursor: usize,
     pub sponsor_scroll: usize,
-    pub captions_use_chapters: Option<bool>,
+    pub captions_tab: Option<CaptionsTab>,
     pub chapter_cursor: usize,
     pub chapter_scroll: usize,
     pub event_log_scroll: usize,
@@ -1998,6 +2018,13 @@ pub enum PlayOptionsHit {
     ToggleLoudnorm,
     SelectAudioEq(crate::config::AudioEqPreset),
     CycleAudioEq,
+    AudioEqBandDelta(usize, i8),
+    SetAudioEqBand(usize, i8),
+    AudioEqPreampDelta(i8),
+    ToggleAudioEqBypass,
+    SaveCustomAudioEq,
+    ResetAudioEq,
+    SelectAudioSpatial(crate::config::AudioChannelMode),
     ToggleAudioChannelMode,
     ToggleAudioHighpass,
     AudioDelayDelta(i32),
@@ -2009,12 +2036,23 @@ pub enum PlayOptionsHit {
     SelectSubPreset(SubtitlePreset),
     ToggleSubCollision,
     SetDefaultSubLang(&'static str),
+    SetSubFont(&'static str),
     SubFontSizeDelta(i32),
     SubBorderDelta(f32),
     SubMarginYDelta(i32),
+    SubShadowDelta(f32),
     SetSubBackdrop(f32),
     SetSubColor(&'static str),
-    SetCaptionsListTab(bool),
+    ReloadSubtitles,
+    SetCaptionsTab(CaptionsTab),
+    ReScanSponsorBlock,
+    UndoLastSponsorSkip,
+    SkipActiveSponsorNow,
+    ToggleWhitelistChannel,
+    RemoveWhitelistChannel(String),
+    CycleSponsorCategory(&'static str),
+    SetSponsorMinSecs(u8),
+    ToggleSponsorOsdToast,
     SubDelayDelta(i32),
     SetSubDelay(i32),
     SelectSubTrack(i64),
@@ -2124,6 +2162,7 @@ pub struct LivePlaybackControlState {
     pub hue: i64,
     pub sharpness: i64,
     pub picture_bypass: bool,
+    pub audio_eq_bypass: bool,
     pub video_zoom: f64,
     pub panscan: f64,
     pub aspect_override: String,
@@ -2194,6 +2233,7 @@ impl Default for LivePlaybackControlState {
             hue: 0,
             sharpness: 0,
             picture_bypass: false,
+            audio_eq_bypass: false,
             video_zoom: 0.0,
             panscan: 0.0,
             aspect_override: "-1".to_string(),

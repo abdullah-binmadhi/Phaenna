@@ -718,7 +718,7 @@ pub fn render_bipolar_slider_range(
 }
 
 /// Interactive centered bipolar slider (`-max_abs .. 0 .. +max_abs`) rendered inside `area`.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn render_bipolar_slider(
     frame: &mut Frame,
     area: Rect,

@@ -70,6 +70,7 @@ pub struct IpcMonitorConfig {
     pub tx: Sender<AppMessage>,
     pub skip_segments: Vec<SponsorSegment>,
     pub sponsorblock_fetch: Option<(reqwest::Client, SponsorBlockMode, bool)>,
+    pub sponsor_osd_toast: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +105,11 @@ impl LiveMediaTrack {
         } else {
             raw_title
         };
+        let is_url_junk = clean_title.contains("&ns=")
+            || clean_title.contains("&rqh=")
+            || clean_title.contains("mime=")
+            || clean_title.contains("://")
+            || clean_title.contains("videoplayback?");
         let role = if self.kind == TrackKind::Audio {
             if self.is_dubbed {
                 " [DUB]"
@@ -115,8 +121,29 @@ impl LiveMediaTrack {
         } else {
             ""
         };
-        let label = if clean_title.is_empty() {
-            lang.to_string()
+        let label = if clean_title.is_empty() || is_url_junk {
+            if is_url_junk {
+                let low = clean_title.to_lowercase();
+                if low.contains("webm") {
+                    if lang != "und" {
+                        format!("{lang} · WebM Opus")
+                    } else {
+                        "WebM Opus".to_string()
+                    }
+                } else if low.contains("mp4") || low.contains("m4a") {
+                    if lang != "und" {
+                        format!("{lang} · AAC Audio")
+                    } else {
+                        "AAC Audio".to_string()
+                    }
+                } else if lang != "und" {
+                    format!("{lang} · Stream")
+                } else {
+                    "Stream Audio".to_string()
+                }
+            } else {
+                lang.to_string()
+            }
         } else {
             clean_title.replace(" original", "").trim().to_string()
         };
@@ -196,6 +223,10 @@ pub enum PlayerCommand {
     SetAudioDelay(f64),
     SetAudioFilterChain(String),
     ApplySubtitleStyle(SubtitleStyleConfig),
+    ReloadSubtitles,
+    UpdateSkipSegments(Vec<SponsorSegment>),
+    UndoLastSkip,
+    SetSponsorOsdToast(bool),
     SetShaderMode(VideoShaderMode, VideoMasteringProfile, PerformanceMode),
     SetPerformanceMode(PerformanceMode, VideoShaderMode, VideoMasteringProfile),
     ApplyManualMastering(ManualMasteringConfig, VideoShaderMode, VideoMasteringProfile),
@@ -529,6 +560,12 @@ impl PlayerCommand {
                 cmds.push(json!({"command": ["loadfile", primary_url, "replace"]}).to_string());
                 cmds.push(json!({"command": ["show-text", osd_message, 3500]}).to_string());
                 cmds
+            }
+            Self::ReloadSubtitles => {
+                vec![json!({"command": ["rescan-external-files"]}).to_string()]
+            }
+            Self::UpdateSkipSegments(_) | Self::UndoLastSkip | Self::SetSponsorOsdToast(_) => {
+                Vec::new()
             }
             Self::Stop => vec![json!({"command": ["quit"]}).to_string()],
         }
@@ -946,6 +983,8 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
         let mut last_session_save = std::time::Instant::now();
         let mut last_ui_tick = std::time::Instant::now();
         let mut skipped_uuids: HashSet<String> = HashSet::new();
+        let mut last_skipped: Option<(String, f64, String)> = None;
+        let mut sponsor_osd_toast = config.sponsor_osd_toast;
         let mut marked_watched = false;
         let mut skip_segments = config.skip_segments.clone();
         let mut pending_reset_start = false;
@@ -990,6 +1029,24 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                 }
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
+                        Some(PlayerCommand::UpdateSkipSegments(new_segs)) => {
+                            skip_segments = new_segs;
+                        }
+                        Some(PlayerCommand::SetSponsorOsdToast(enabled)) => {
+                            sponsor_osd_toast = enabled;
+                        }
+                        Some(PlayerCommand::UndoLastSkip) => {
+                            if let Some((uuid, start_secs, cat_lbl)) = last_skipped.take() {
+                                skipped_uuids.insert(uuid);
+                                let seek_cmd = json!({"command": ["set_property", "time-pos", start_secs.max(0.0)]}).to_string();
+                                let _ = writer.write_all(format!("{seek_cmd}\n").as_bytes()).await;
+                                if sponsor_osd_toast {
+                                    let msg = format!("SponsorBlock: Restored skipped {cat_lbl}");
+                                    let osd = json!({"command": ["show-text", msg, 2200]}).to_string();
+                                    let _ = writer.write_all(format!("{osd}\n").as_bytes()).await;
+                                }
+                            }
+                        }
                         Some(cmd) => {
                             if matches!(cmd, PlayerCommand::HotSwitchStream { .. }) {
                                 pending_reset_start = true;
@@ -1053,6 +1110,13 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                     );
                                     if writer.write_all(seek_cmd.as_bytes()).await.is_ok() {
                                         let saved = (target_end - seg.start_time).max(0.0);
+                                        let cat_lbl = category_label(&seg.category).to_string();
+                                        last_skipped = Some((seg.uuid.clone(), seg.start_time, cat_lbl.clone()));
+                                        if sponsor_osd_toast {
+                                            let msg = format!("SponsorBlock: Skipped {cat_lbl} (+{saved:.0}s)");
+                                            let osd = json!({"command": ["show-text", msg, 2200]}).to_string();
+                                            let _ = writer.write_all(format!("{osd}\n").as_bytes()).await;
+                                        }
                                         tracker.sb_skipped_session += saved;
                                         *tracker.sb_cats.entry(seg.category.clone()).or_insert(0.0) +=
                                             saved;
@@ -1061,7 +1125,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                             .tx
                                             .send(AppMessage::SponsorSkipped {
                                                 video_id: config.video_id.clone(),
-                                                category: category_label(&seg.category).to_string(),
+                                                category: cat_lbl,
                                                 saved_secs: saved,
                                             })
                                             .await;
@@ -1405,5 +1469,18 @@ mod tests {
             .to_mpv_json_commands();
         assert!(sub_cmds.iter().any(|c| c.contains("\"sub-font-size\",44")));
         assert!(sub_cmds.iter().any(|c| c.contains("\"background-box\"")));
+
+        let leaky_track = LiveMediaTrack {
+            id: 1,
+            kind: TrackKind::Audio,
+            lang: Some("eng".into()),
+            title: Some("webm&ns=EhCPxqFzc0jGmBsdxM2Chdca&rqh=1&gir=yes".into()),
+            is_dubbed: false,
+            is_original: true,
+            selected: true,
+        };
+        let clean = leaky_track.display_label();
+        assert!(!clean.contains("ns=EhC"), "CDN URL params leaked: {clean}");
+        assert!(clean.contains("WebM Opus"));
     }
 }

@@ -364,8 +364,8 @@ mod tests {
             (StudioPage::Deck, "Picture Equalizer, Presets & Geometry"),
             (StudioPage::StreamNet, "Resolved Bitrate Ladder vs Throughput"),
             (StudioPage::MasteringGpu, "Active GPU Signal-Flow Pipeline"),
-            (StudioPage::AudioSync, "Live Audio Track Explorer"),
-            (StudioPage::CaptionsSkip, "SponsorBlock Guard & Timeline Map"),
+            (StudioPage::AudioSync, "10-Band Interactive Graphic Equalizer"),
+            (StudioPage::CaptionsSkip, "Ad-Block & SponsorBlock Shield Engine"),
             (StudioPage::LiveTelemetry, "60s Throughput vs Video Bitrate"),
         ];
 
@@ -513,11 +513,11 @@ mod tests {
             ),
             (
                 StudioPage::AudioSync,
-                vec!["EQ [e]:", "60Hz", "250Hz", "Route :", "Transfer:", "Quick Offset:", "Device Sync :"],
+                vec!["Presets [e]:", "31Hz", "16kHz", "[Cinema]", "[Rock]", "[EDM]", "Preamp:", "Spatial:"],
             ),
             (
                 StudioPage::CaptionsSkip,
-                vec!["Default Lang:", "Font:", "Margin:", "Ink :", "Sponsor", "Outros [o]:", "Jump List [u]:"],
+                vec!["Lang :", "Font :", "MgnY :", "Shd:", "[R Re-Scan]", "[U Undo Skip]", "Non-Music Section", "Stream Ads:", "View [u]:", "[Shield & WL"],
             ),
             (
                 StudioPage::LiveTelemetry,
@@ -629,11 +629,31 @@ mod tests {
                             "Missing pre-launch Standby target baseline on Page 6 at {w}x{h}"
                         );
                     }
+                    if *page == StudioPage::AudioSync {
+                        assert!(
+                            !full.contains("A/V Sync") && !full.contains("Live A/V Drift"),
+                            "Deprecated A/V Sync UI leaked back onto Page 4 at {w}x{h}"
+                        );
+                    }
                     if h >= 36 {
                         for needle in needles {
                             assert!(
                                 full.contains(needle) || normalized.contains(needle),
                                 "Missing '{needle}' on {page:?} live={is_live} at {w}x{h}\nRendered:\n{full}"
+                            );
+                        }
+                        if *page == StudioPage::CaptionsSkip {
+                            let start_idx = rows_text
+                                .iter()
+                                .position(|l| l.contains("Live Preview ("))
+                                .expect("Missing bounded Live Preview box on Page 5");
+                            let end_rel = rows_text[start_idx + 1..]
+                                .iter()
+                                .position(|l| l.contains('╰'))
+                                .expect("Missing closing border on Live Preview");
+                            assert!(
+                                end_rel <= 4,
+                                "Live Preview box grew too tall ({end_rel} inner rows) at {w}x{h}"
                             );
                         }
                     }

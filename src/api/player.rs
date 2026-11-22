@@ -2,8 +2,8 @@
 
 use crate::api::ytdlp::SelectedStreamPair;
 use crate::config::{
-    AudioChannelMode, AudioEqPreset, Config, DubPreference, LiveStreamMode, ManualMasteringConfig,
-    MotionMode, NetworkMode, PerformanceMode, PictureGrade, Player, VideoShaderMode,
+    AudioChannelMode, Config, DubPreference, LiveStreamMode, ManualMasteringConfig, MotionMode,
+    NetworkMode, PerformanceMode, PictureGrade, Player, VideoShaderMode, EQ_BAND_FREQS_HZ,
 };
 use crate::error::{AppError, Result};
 use crate::services::shaders::{
@@ -144,32 +144,40 @@ pub struct PlayOptions {
 
 pub const LOUDNORM_FILTER: &str = "lavfi=[dynaudnorm=f=150:g=15:p=0.9]";
 
-/// Compose one non-destructive FFmpeg/mpv `af` filter chain combining Highpass,
-/// 5-band parametric EQ, Night Loudnorm (`dynaudnorm`), and Mono downmix.
+/// Compose one non-destructive FFmpeg/mpv `af` filter chain combining Preamp, Highpass,
+/// 10-band parametric EQ, Night Loudnorm (`dynaudnorm`), and Spatial/Channel DSP.
 pub fn build_mpv_audio_filter_chain(
-    eq: AudioEqPreset,
+    bands_db: [i8; 10],
+    preamp_db: i8,
+    eq_bypass: bool,
     channel_mode: AudioChannelMode,
     voice_highpass: bool,
     loudnorm: bool,
 ) -> Option<String> {
     let mut nodes: Vec<String> = Vec::new();
+    let preamp = preamp_db.clamp(-6, 6);
+    if !eq_bypass && preamp != 0 {
+        nodes.push(format!("volume={preamp}dB"));
+    }
     if voice_highpass {
         nodes.push("highpass=f=80".to_string());
     }
-    if eq != AudioEqPreset::Flat {
-        const FREQS: [u32; 5] = [60, 250, 1000, 4000, 12000];
-        let gains = eq.band_gains_db();
-        for (freq, gain) in FREQS.into_iter().zip(gains) {
-            if gain != 0 {
-                nodes.push(format!("equalizer=f={freq}:t=q:w=1.2:g={gain}"));
+    if !eq_bypass {
+        for (freq, gain) in EQ_BAND_FREQS_HZ.into_iter().zip(bands_db) {
+            let g = gain.clamp(-12, 12);
+            if g != 0 {
+                nodes.push(format!("equalizer=f={freq}:t=q:w=1.4:g={g}"));
             }
         }
     }
     if loudnorm {
         nodes.push("dynaudnorm=f=150:g=15:p=0.9".to_string());
     }
-    if channel_mode == AudioChannelMode::Mono {
-        nodes.push("pan=mono|c0=0.5*c0+0.5*c1".to_string());
+    match channel_mode {
+        AudioChannelMode::Stereo => {}
+        AudioChannelMode::Mono => nodes.push("pan=mono|c0=0.5*c0+0.5*c1".to_string()),
+        AudioChannelMode::Crossfeed => nodes.push("crossfeed=strength=0.45:range=0.5".to_string()),
+        AudioChannelMode::WideStage => nodes.push("extrastereo=m=1.45".to_string()),
     }
     if nodes.is_empty() {
         None
@@ -1148,7 +1156,9 @@ mod tests {
     #[test]
     fn test_build_mpv_audio_filter_chain_composition() {
         assert!(build_mpv_audio_filter_chain(
-            AudioEqPreset::Flat,
+            [0; 10],
+            0,
+            false,
             AudioChannelMode::Stereo,
             false,
             false
@@ -1156,16 +1166,33 @@ mod tests {
         .is_none());
 
         let chain = build_mpv_audio_filter_chain(
-            AudioEqPreset::VoiceClarity,
-            AudioChannelMode::Mono,
+            crate::config::AudioEqPreset::VoiceClarity.band_gains_db(),
+            -2,
+            false,
+            AudioChannelMode::Crossfeed,
             true,
             true,
         )
         .unwrap();
         assert!(chain.starts_with("lavfi=["));
+        assert!(chain.contains("volume=-2dB"));
         assert!(chain.contains("highpass=f=80"));
-        assert!(chain.contains("equalizer=f=4000:t=q:w=1.2:g=5"));
+        assert!(chain.contains("equalizer=f=2000:t=q:w=1.4:g=5"));
         assert!(chain.contains("dynaudnorm=f=150:g=15:p=0.9"));
-        assert!(chain.contains("pan=mono|c0=0.5*c0+0.5*c1"));
+        assert!(chain.contains("crossfeed=strength=0.45:range=0.5"));
+
+        // Bypass skips preamp + EQ bands while keeping spatial + loudnorm
+        let bypassed = build_mpv_audio_filter_chain(
+            crate::config::AudioEqPreset::BassBoost.band_gains_db(),
+            -3,
+            true,
+            AudioChannelMode::WideStage,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!bypassed.contains("equalizer="));
+        assert!(!bypassed.contains("volume="));
+        assert!(bypassed.contains("extrastereo=m=1.45"));
     }
 }

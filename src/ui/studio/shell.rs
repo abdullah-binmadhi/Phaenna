@@ -517,8 +517,8 @@ fn render_footer_keybar(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         StudioPage::StreamNet => "[j/k] Tier | [C] Codec | [w] Net | [r] Probe | [A] ABR",
         StudioPage::MasteringGpu => "[m] Mode | [s] Shader | [t] 120Hz | [j/k+Space] Matrix",
-        StudioPage::AudioSync => "[d] Dub | [L] Lang | [n] Norm | [e] EQ | [h/l] Delay",
-        StudioPage::CaptionsSkip => "[c] Subs | [y] Style | [o] Outros | [u] Ch/SB | [h/l] Offset",
+        StudioPage::AudioSync => "[e] Preset | [h/l] Band | [j/k] ±1dB | [b] Bypass | [n] Norm | [d] Dub",
+        StudioPage::CaptionsSkip => "[c] Subs | [y] Style | [R] Re-Scan | [U] Undo | [W] Whitelist | [u] Tab",
         StudioPage::LiveTelemetry => "[v] Live | [E] Edge | [S] Start | [R] Radio | [F] Filter",
     };
 
