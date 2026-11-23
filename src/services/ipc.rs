@@ -1111,10 +1111,6 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                 }
                             }
                             "time-pos" => {
-                                // Ignore the transient 2s Y2K anime loading slide before stream starts
-                                if !config.is_live && last_dur > 0.0 && last_dur <= 4.5 {
-                                    continue;
-                                }
                                 if !tracker.is_paused && prev_pos > 0.0 {
                                     let dt = val - prev_pos;
                                     if dt > 0.0 && dt <= 6.0 {

@@ -140,7 +140,10 @@ pub struct PlayOptions {
     pub force_ipv4: bool,
     pub auto_fullscreen: bool,
     pub auto_pip: bool,
-    pub loading_image: Option<String>,
+    pub loading_art_dir: Option<String>,
+    pub loading_variant_idx: usize,
+    pub loading_channel: String,
+    pub loading_quality: String,
     pub picture: PictureGrade,
     pub direct_stream: Option<SelectedStreamPair>,
 }
@@ -303,8 +306,12 @@ hud_ov.res_x = 1280
 hud_ov.res_y = 720
 
 local title = mp.get_opt("phaenna_title") or "Preparing Stream"
+local channel = mp.get_opt("phaenna_channel") or ""
+local qual = mp.get_opt("phaenna_quality") or "HD"
 local meta = mp.get_opt("phaenna_meta") or "PHAENNA STUDIO"
-local has_card = (mp.get_opt("phaenna_has_card") or "0") == "1"
+local card_dir = mp.get_opt("phaenna_card_dir") or ""
+local card_count = math.max(1, tonumber(mp.get_opt("phaenna_card_count") or "11") or 11)
+local card_idx = (tonumber(mp.get_opt("phaenna_card_idx") or "0") or 0) % card_count
 local pip_active = (mp.get_opt("phaenna_auto_pip") or "0") == "1"
 
 local function esc_ass(s)
@@ -313,20 +320,60 @@ local function esc_ass(s)
 end
 
 title = esc_ass(title)
+channel = esc_ass(channel)
+qual = esc_ass(qual)
 meta = esc_ass(meta)
-if #title > 62 then title = string.sub(title, 1, 59) .. "..." end
+
+local function wrap_two_lines(str, max_col)
+    if #str <= max_col then return str, "" end
+    local cut = max_col
+    for i = max_col, math.max(12, max_col - 14), -1 do
+        if string.sub(str, i, i) == " " then
+            cut = i
+            break
+        end
+    end
+    local l1 = string.sub(str, 1, cut):gsub("%s+$", "")
+    local l2 = string.sub(str, cut + 1):gsub("^%s+", "")
+    if #l2 > max_col then l2 = string.sub(l2, 1, max_col - 3) .. "..." end
+    return l1, l2
+end
+
+local title_l1, title_l2 = wrap_two_lines(title, 38)
 
 -- =============================================================================
--- 1. Y2K Anime Loading Screen & Mid-Stream Buffering Overlay
+-- 1. Unique Y2K Anime Portrait Loader & Mid-Stream Buffering Overlay
+--    Uses mpv `overlay-add` (bitmap above ASS) for the crisp left 460x460 Y2K
+--    portrait and `ass-events` for the unified CRT frame, status & live bar.
+--    No rectangular fallback box — every stall rotates to a unique anime card!
 -- =============================================================================
+local y2k_themes = {
+    { tag = "CRT PHOSPHOR",  col = "&H87E76E&" },
+    { tag = "CYBER AUDIO",   col = "&HFAA560&" },
+    { tag = "INK SKETCH",    col = "&HEBE7E5&" },
+    { tag = "MIDNIGHT DECK", col = "&HFCB4A5&" },
+    { tag = "MINT STAR",     col = "&HACEF86&" },
+    { tag = "NEON CAT",      col = "&HF88C81&" },
+    { tag = "HALFTONE STAR", col = "&HE1D5CB&" },
+    { tag = "CYBER VIOLET",  col = "&HFC84C0&" },
+    { tag = "CYAN HALO",     col = "&HD4EA5E&" },
+    { tag = "ICE MATRIX",    col = "&HFDC593&" },
+    { tag = "TEAL SIGNAL",   col = "&HBFD42D&" },
+}
+
+local OVERLAY_ID = 61
 local phase = 0.0
 local cache_pct = nil
 local cache_speed = 0
 local cache_dur = 0
 local is_loading = true
+local is_initial_boot = true
 local timer = nil
-local boot_time = mp.get_time()
-local advanced_slide = false
+local overlay_shown = false
+local shown_card = -1
+local shown_x = -1
+local shown_y = -1
+local shown_sz = -1
 
 local function fmt_speed(bps)
     if not bps or bps <= 0 then return "" end
@@ -338,75 +385,188 @@ local function fmt_speed(bps)
     return string.format("%d B/s", math.floor(bps))
 end
 
-local function is_y2k_slide_active()
-    if not has_card then return false end
-    local cnt = mp.get_property_number("playlist-count", 1) or 1
-    local ppos = mp.get_property_number("playlist-pos", 0) or 0
-    return cnt > 1 and ppos == 0
+local function file_exists(p)
+    if not p or p == "" then return false end
+    local f = io.open(p, "rb")
+    if f then f:close(); return true end
+    return false
+end
+
+local function portrait_path_for(idx)
+    if card_dir == "" then return nil end
+    local p = string.format("%s/y2k_%d.bgra", card_dir, idx % card_count)
+    if file_exists(p) then return p end
+    return nil
+end
+
+local function advance_unique_card()
+    for step = 1, card_count do
+        local candidate = (card_idx + step) % card_count
+        if portrait_path_for(candidate) then
+            card_idx = candidate
+            return
+        end
+    end
+    card_idx = (card_idx + 1) % card_count
+end
+
+local function clear_bitmap_overlay()
+    if overlay_shown then
+        mp.command_native({ name = "overlay-remove", id = OVERLAY_ID })
+        overlay_shown = false
+        shown_card = -1
+        shown_x = -1
+        shown_y = -1
+        shown_sz = -1
+    end
 end
 
 local function render_loader()
-    if is_y2k_slide_active() then
-        local elapsed = mp.get_time() - boot_time
-        if elapsed >= 1.45 and not advanced_slide then
-            advanced_slide = true
-            mp.commandv("playlist-next")
-        end
-        -- Animate neon fill directly inside the generated 1280x720 Y2K card track (594..1174, 392..418)
-        local pct = math.min(0.95, elapsed / 1.45)
-        if cache_pct and cache_pct > 0 then
-            pct = math.max(pct, math.min(1.0, cache_pct / 100.0))
-        end
-        local fill_w = math.max(24, math.floor(568 * pct))
-        local spd = fmt_speed(cache_speed)
-        local tag = (spd ~= "") and string.format("%d%%  %s", math.floor(pct * 100), spd) or string.format("%d%%", math.floor(pct * 100))
-        ov.data = string.format(
-            "{\\an7\\pos(600,398)\\bord0\\shad0\\1c&H99D334&\\p1}m 0 0 l %d 0 l %d 14 l 0 14{\\p0}\n" ..
-            "{\\an9\\pos(1172,432)\\bord0\\shad0\\fs18\\b1\\1c&HF8BD38&}%s",
-            fill_w, fill_w, tag
-        )
-        ov:update()
-        return
-    end
-
     if not is_loading then
+        clear_bitmap_overlay()
         ov:remove()
         return
     end
 
-    phase = (phase + 0.05) % 1.0
-    local bar_x0 = 300
-    local bar_w = 680
-    local bar_y0 = 404
-    local bar_y1 = 418
+    local osd_w = mp.get_property_number("osd-width", 0) or 0
+    local osd_h = mp.get_property_number("osd-height", 0) or 0
+    if osd_w <= 0 or osd_h <= 0 then return end
 
+    ov.res_x = osd_w
+    ov.res_y = osd_h
+
+    local sc = math.min(osd_w / 1280.0, osd_h / 720.0)
+    local dw = math.floor(1280 * sc)
+    local dh = math.floor(720 * sc)
+    local ox = math.floor((osd_w - dw) / 2)
+    local oy = math.floor((osd_h - dh) / 2)
+    local function px(x) return math.floor(ox + x * sc) end
+    local function py(y) return math.floor(oy + y * sc) end
+    local function ps(v) return math.max(1, math.floor(v * sc)) end
+
+    local th = y2k_themes[(card_idx % #y2k_themes) + 1]
+
+    -- Show or reposition left 460x460 Y2K anime portrait via GPU overlay-add
+    local p_path = portrait_path_for(card_idx)
+    local art_x = px(84)
+    local art_y = py(130)
+    local art_sz = math.max(32, ps(460))
+    if p_path then
+        if (not overlay_shown) or shown_card ~= card_idx or shown_x ~= art_x or shown_y ~= art_y or shown_sz ~= art_sz then
+            mp.command_native({
+                name = "overlay-add",
+                id = OVERLAY_ID,
+                x = art_x,
+                y = art_y,
+                file = p_path,
+                offset = 0,
+                fmt = "bgra",
+                w = 460,
+                h = 460,
+                stride = 460 * 4,
+                dw = art_sz,
+                dh = art_sz,
+            })
+            overlay_shown = true
+            shown_card = card_idx
+            shown_x = art_x
+            shown_y = art_y
+            shown_sz = art_sz
+        end
+    else
+        clear_bitmap_overlay()
+    end
+
+    phase = (phase + 0.05) % 1.0
+
+    local bar_x = px(594)
+    local bar_y = py(392)
+    local bar_w = math.max(40, ps(580))
+    local bar_h = math.max(6, ps(22))
+    local pad = math.max(2, ps(3))
+    local track_w = bar_w - pad * 2
+    local track_h = bar_h - pad * 2
+
+    local fill_off = 0
+    local fill_w = math.max(12, math.floor(track_w * 0.28))
     local spd_txt = fmt_speed(cache_speed)
     local spd_sfx = (spd_txt ~= "") and ("  ·  " .. spd_txt) or ""
     local dur_txt = (cache_dur and cache_dur > 0.1) and string.format("  ·  %.1fs cached", cache_dur) or ""
-    local status = "Connecting & Buffering HD Stream" .. spd_sfx .. "..."
-    local fill_x0 = bar_x0
-    local fill_w = 180
+    local status_line = (is_initial_boot and "Connecting HD Stream" or "Re-buffering Stream") .. spd_sfx .. dur_txt .. "..."
+
     if cache_pct and cache_pct > 0 and cache_pct < 100 then
-        status = string.format("Buffering Stream (%d%%)%s%s...", math.floor(cache_pct), spd_sfx, dur_txt)
-        fill_w = math.max(24, math.floor(bar_w * (cache_pct / 100.0)))
+        fill_off = 0
+        fill_w = math.max(12, math.floor(track_w * (cache_pct / 100.0)))
+        status_line = string.format("Buffering %d%%%s%s", math.floor(cache_pct), spd_sfx, dur_txt)
     else
-        local sweep = math.floor(phase * (bar_w - 160))
-        fill_x0 = bar_x0 + sweep
-        fill_w = 160
+        local pulse_w = math.max(20, math.floor(track_w * 0.30))
+        fill_off = math.floor(phase * (track_w - pulse_w))
+        fill_w = pulse_w
     end
-    local fill_x1 = math.min(bar_x0 + bar_w, fill_x0 + fill_w)
+
+    local headline = is_initial_boot and "NOW LOADING..." or "BUFFERING STREAM..."
+    local sub_info = ((channel ~= "") and (channel .. "  ·  ") or "") .. qual .. "  ·  " .. meta
+    if #sub_info > 54 then sub_info = string.sub(sub_info, 1, 51) .. "..." end
+
+    local bx0, by0 = px(24), py(24)
+    local bx1, by1 = px(1256), py(696)
+    local cl = ps(26)
+    local ct = math.max(2, ps(3))
+    local hud_x = px(594)
+    local title_y2 = py(328)
+    local card_badge = string.format("CARD %02d/%02d", (card_idx % card_count) + 1, card_count)
 
     local ass = string.format(
-        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H14100D&\\1a&H18&\\p1}m 230 262 l 1050 262 l 1050 458 l 230 458{\\p0}\n" ..
-        "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&HFA8BA7&\\p1}m 230 262 l 1050 262 l 1050 458 l 230 458{\\p0}\n" ..
-        "{\\an5\\pos(640,302)\\bord0\\shad0\\fs19\\b1\\1c&H99D334&}✦  %s  ✦\n" ..
-        "{\\an5\\pos(640,342)\\bord0\\shad0\\fs25\\b1\\1c&HFAF4F0&}%s\n" ..
-        "{\\an5\\pos(640,376)\\bord0\\shad0\\fs17\\1c&HF8BD38&}%s\n" ..
-        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H2E2824&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
-        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H99D334&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}",
-        meta, title, status,
-        bar_x0, bar_y0, bar_x0 + bar_w, bar_y0, bar_x0 + bar_w, bar_y1, bar_x0, bar_y1,
-        fill_x0, bar_y0, fill_x1, bar_y0, fill_x1, bar_y1, fill_x0, bar_y1
+        -- Full-viewport CRT obsidian canvas
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H140E0B&\\1a&H0A&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}\n" ..
+        -- Thin CRT inner frame
+        "{\\an7\\pos(0,0)\\bord1\\shad0\\1a&HFF&\\3c&H3D3630&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
+        -- Four neon corner brackets
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\p1}m %d %d l %d %d l %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\p1}m %d %d l %d %d l %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\p1}m %d %d l %d %d l %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\p1}m %d %d l %d %d l %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
+        -- Top badge bar + card theme tag + sequence indicator
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}\n" ..
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\b1\\1c&H100E0C&}PHAENNA // STUDIO\n" ..
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\b1\\1c%s}%s   {\\1c&HA69A8E&}%s\n" ..
+        -- Main Status Headline
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\b1\\1c&HFAF4F0&}%s\n" ..
+        -- Channel + Quality + Playback Profile
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\b1\\1c%s}%s\n" ..
+        -- Wrapped Video Title
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\b1\\1c&HFAF4F0&}%s\n" ..
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\1c&HFAF4F0&}%s\n" ..
+        -- Progress bar track outline + animated neon fill
+        "{\\an7\\pos(%d,%d)\\bord1\\shad0\\1c&H1C1814&\\3c%s\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}\n" ..
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}\n" ..
+        -- Live Buffering Speed / Progress Text
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\b1\\1c&HC8B8A4&}%s\n" ..
+        -- Bottom divider + Phaenna Player Keybindings Legend
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\1c&H3D3630&\\p1}m 0 0 l %d 0 l %d %d l 0 %d{\\p0}\n" ..
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\b1\\1c%s}PHAENNA PLAYER KEYS:\n" ..
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\1c&HFAF4F0&}K / SPACE  Play-Pause     J / L  -10s / +10s     I  Info HUD\n" ..
+        "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs%d\\1c&HA69A8E&}P  PiP Float          Shift+P  Corner          F  Fullscreen",
+        osd_w, osd_w, osd_h, osd_h,
+        bx0, by0, bx1, by0, bx1, by1, bx0, by1,
+        th.col, bx0, by0, bx0 + cl, by0, bx0 + cl, by0 + ct, bx0 + ct, by0 + ct, bx0 + ct, by0 + cl, bx0, by0 + cl,
+        th.col, bx1 - cl, by0, bx1, by0, bx1, by0 + cl, bx1 - ct, by0 + cl, bx1 - ct, by0 + ct, bx1 - cl, by0 + ct,
+        th.col, bx0, by1 - cl, bx0 + ct, by1 - cl, bx0 + ct, by1 - ct, bx0 + cl, by1 - ct, bx0 + cl, by1, bx0, by1,
+        th.col, bx1 - ct, by1 - cl, bx1, by1 - cl, bx1, by1, bx1 - cl, by1, bx1 - cl, by1 - ct, bx1 - ct, by1 - ct,
+        hud_x, py(146), th.col, ps(270), ps(270), ps(34), ps(34),
+        hud_x + ps(14), py(152), math.max(11, ps(20)),
+        hud_x + ps(288), py(154), math.max(10, ps(17)), th.col, th.tag, card_badge,
+        hud_x, py(198), math.max(16, ps(36)), headline,
+        hud_x, py(252), math.max(10, ps(18)), th.col, sub_info,
+        hud_x, py(288), math.max(12, ps(24)), title_l1,
+        hud_x, title_y2, math.max(12, ps(24)), title_l2,
+        bar_x, bar_y, th.col, bar_w, bar_w, bar_h, bar_h,
+        bar_x + pad + fill_off, bar_y + pad, th.col, fill_w, fill_w, track_h, track_h,
+        hud_x, py(426), math.max(10, ps(18)), status_line,
+        hud_x, py(486), bar_w, bar_w, math.max(1, ps(2)), math.max(1, ps(2)),
+        hud_x, py(504), math.max(10, ps(16)), th.col,
+        hud_x, py(530), math.max(9, ps(16)),
+        hud_x, py(556), math.max(9, ps(16))
     )
     ov.data = ass
     ov:update()
@@ -420,26 +580,30 @@ local function start_anim()
 end
 
 local function stop_anim()
-    if is_y2k_slide_active() then return end
     is_loading = false
+    is_initial_boot = false
     if timer then
         timer:kill()
         timer = nil
     end
+    clear_bitmap_overlay()
     ov:remove()
 end
 
 mp.register_event("playback-restart", function()
-    if is_y2k_slide_active() then return end
     local pfc = mp.get_property_bool("paused-for-cache", false)
     if not pfc then stop_anim() end
 end)
 
 mp.observe_property("paused-for-cache", "bool", function(_, val)
-    if is_y2k_slide_active() then return end
     if val then
-        is_loading = true
-        start_anim()
+        if not is_loading then
+            is_initial_boot = false
+            advance_unique_card()
+            is_loading = true
+            phase = 0.0
+            start_anim()
+        end
     else
         local t = mp.get_property_number("time-pos", 0)
         if t and t > 0.02 then stop_anim() end
@@ -447,10 +611,13 @@ mp.observe_property("paused-for-cache", "bool", function(_, val)
 end)
 
 mp.observe_property("time-pos", "number", function(_, val)
-    if is_y2k_slide_active() then return end
     if val and val > 0.04 and not mp.get_property_bool("paused-for-cache", false) then
         stop_anim()
     end
+end)
+
+mp.observe_property("osd-dimensions", "native", function()
+    if is_loading then render_loader() end
 end)
 
 mp.observe_property("cache-buffering-state", "number", function(_, val) cache_pct = val end)
@@ -798,11 +965,29 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         }
         script_opt_parts.push(format!("phaenna_title={safe_title}"));
         script_opt_parts.push(format!("phaenna_meta={safe_meta}"));
-        let has_card = opts
-            .loading_image
+        let safe_ch = sanitize_script_opt(&opts.loading_channel);
+        if !safe_ch.is_empty() {
+            script_opt_parts.push(format!("phaenna_channel={safe_ch}"));
+        }
+        let safe_q = sanitize_script_opt(&opts.loading_quality);
+        if !safe_q.is_empty() {
+            script_opt_parts.push(format!("phaenna_quality={safe_q}"));
+        }
+        if let Some(dir) = opts
+            .loading_art_dir
             .as_deref()
-            .is_some_and(|p| !p.trim().is_empty());
-        script_opt_parts.push(format!("phaenna_has_card={}", if has_card { "1" } else { "0" }));
+            .filter(|d| !d.trim().is_empty())
+        {
+            script_opt_parts.push(format!("phaenna_card_dir={}", sanitize_script_opt(dir)));
+            script_opt_parts.push(format!(
+                "phaenna_card_count={}",
+                crate::services::loading_art::Y2K_ART_COUNT
+            ));
+            script_opt_parts.push(format!(
+                "phaenna_card_idx={}",
+                opts.loading_variant_idx % crate::services::loading_art::Y2K_ART_COUNT
+            ));
+        }
         script_opt_parts.push(format!("phaenna_auto_pip={}", if opts.auto_pip { "1" } else { "0" }));
     }
 
@@ -969,12 +1154,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         flags.push(format!("af={LOUDNORM_FILTER}"));
     }
 
-    let has_loading_slide = opts.player == Player::Mpv
-        && opts
-            .loading_image
-            .as_deref()
-            .is_some_and(|p| !p.trim().is_empty());
-    if !use_live_pipeline && !has_loading_slide {
+    if !use_live_pipeline {
         if let Some(start) = opts.start_pos {
             if start > 3.0 {
                 flags.push(format!("start={:.1}", start));
@@ -1067,25 +1247,7 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     for kv in shared_mpv_kv_flags(opts) {
         args.push(format!("--{kv}"));
     }
-    if let Some(img) = opts.loading_image.as_deref().filter(|p| !p.trim().is_empty()) {
-        args.push("--image-display-duration=2".to_string());
-        args.push("--prefetch-playlist=yes".to_string());
-        args.push("--loop-playlist=no".to_string());
-        args.push("--{".to_string());
-        args.push(img.to_string());
-        args.push("--}".to_string());
-        args.push("--{".to_string());
-        let use_live_pipeline = opts.is_live && opts.live_mode != LiveStreamMode::Off;
-        if !use_live_pipeline {
-            if let Some(start) = opts.start_pos.filter(|&s| s > 3.0) {
-                args.push(format!("--start={:.1}", start));
-            }
-        }
-        args.push(resolved_mpv_target(opts));
-        args.push("--}".to_string());
-    } else {
-        args.push(resolved_mpv_target(opts));
-    }
+    args.push(resolved_mpv_target(opts));
     args
 }
 
@@ -1275,7 +1437,10 @@ mod tests {
             force_ipv4: false,
             auto_fullscreen: false,
             auto_pip: false,
-            loading_image: None,
+            loading_art_dir: None,
+            loading_variant_idx: 0,
+            loading_channel: String::new(),
+            loading_quality: String::new(),
             picture: PictureGrade::default(),
             direct_stream: None,
         };
@@ -1356,7 +1521,10 @@ mod tests {
             force_ipv4: false,
             auto_fullscreen: false,
             auto_pip: false,
-            loading_image: None,
+            loading_art_dir: None,
+            loading_variant_idx: 0,
+            loading_channel: String::new(),
+            loading_quality: String::new(),
             picture: PictureGrade::default(),
             direct_stream: None,
         };
@@ -1404,7 +1572,10 @@ mod tests {
             force_ipv4: false,
             auto_fullscreen: false,
             auto_pip: false,
-            loading_image: None,
+            loading_art_dir: None,
+            loading_variant_idx: 0,
+            loading_channel: String::new(),
+            loading_quality: String::new(),
             picture: PictureGrade::default(),
             direct_stream: None,
         };
@@ -1457,7 +1628,10 @@ mod tests {
             direct_stream: None,
             auto_fullscreen: false,
             auto_pip: false,
-            loading_image: None,
+            loading_art_dir: None,
+            loading_variant_idx: 0,
+            loading_channel: String::new(),
+            loading_quality: String::new(),
         };
 
         let wifi_args = build_mpv_args(&opts);
@@ -1496,12 +1670,16 @@ mod tests {
 
         let mut auto_fs_opts = opts.clone();
         auto_fs_opts.auto_fullscreen = true;
-        auto_fs_opts.loading_image = Some("/tmp/y2k_card.jpg".to_string());
+        auto_fs_opts.loading_art_dir = Some("/tmp/phaenna-portraits".to_string());
+        auto_fs_opts.loading_variant_idx = 4;
+        auto_fs_opts.loading_channel = "ByteByteGo".to_string();
+        auto_fs_opts.loading_quality = "1080P".to_string();
         auto_fs_opts.start_pos = Some(65.0);
         let fs_args = build_mpv_args(&auto_fs_opts);
         assert!(fs_args.iter().any(|a| a == "--fullscreen=yes"));
-        assert!(fs_args.iter().any(|a| a == "--prefetch-playlist=yes"));
-        assert!(fs_args.iter().any(|a| a == "/tmp/y2k_card.jpg"));
+        assert!(!fs_args.iter().any(|a| a == "--image-display-duration=2"));
+        assert!(fs_args.iter().any(|a| a.contains("phaenna_card_dir=/tmp/phaenna-portraits")));
+        assert!(fs_args.iter().any(|a| a.contains("phaenna_card_idx=4")));
         assert!(fs_args.iter().any(|a| a == "--start=65.0"));
         assert!(build_vlc_args(&auto_fs_opts).iter().any(|a| a == "--fullscreen"));
 

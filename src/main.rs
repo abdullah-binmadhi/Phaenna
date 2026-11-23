@@ -2779,28 +2779,25 @@ async fn start_nonblocking_playback_with_live_opts(
         direct_stream,
         auto_fullscreen: state.config.auto_fullscreen,
         auto_pip: state.config.auto_pip,
-        loading_image: if state.config.player == Player::Mpv && eff_quality != Quality::AudioOnly {
-            let q_badge = match eff_quality {
-                Quality::Best => "BEST",
-                Quality::P2160 => "4K",
-                Quality::P1440 => "1440P",
-                Quality::P1080 => "1080P",
-                Quality::P720 => "720P",
-                Quality::P480 => "480P",
-                Quality::P360 => "360P",
-                Quality::AudioOnly => "AUDIO",
-            };
-            let variant_idx = crate::services::loading_art::next_loading_variant_index();
-            crate::services::loading_art::generate_y2k_loading_screen(
-                &video.title,
-                video.display_uploader(),
-                q_badge,
-                variant_idx,
-            )
-            .map(|p| p.to_string_lossy().into_owned())
+        loading_art_dir: if state.config.player == Player::Mpv && eff_quality != Quality::AudioOnly {
+            crate::services::loading_art::ensure_y2k_portrait_pack()
+                .map(|p| p.to_string_lossy().into_owned())
         } else {
             None
         },
+        loading_variant_idx: crate::services::loading_art::next_loading_variant_index(),
+        loading_channel: video.display_uploader().to_string(),
+        loading_quality: match eff_quality {
+            Quality::Best => "BEST",
+            Quality::P2160 => "4K",
+            Quality::P1440 => "1440P",
+            Quality::P1080 => "1080P",
+            Quality::P720 => "720P",
+            Quality::P480 => "480P",
+            Quality::P360 => "360P",
+            Quality::AudioOnly => "AUDIO",
+        }
+        .to_string(),
     };
 
     match spawn_player(&opts) {
