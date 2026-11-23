@@ -159,6 +159,10 @@ fn now_unix() -> i64 {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut cfg = Config::load().unwrap_or_default();
+    if !cfg.player.is_supported_on_host() {
+        cfg.player = crate::config::Player::AutoBest;
+        let _ = cfg.save();
+    }
 
     if let Some(ref cpath) = cli.cookies {
         cfg.custom_cookies_path = Some(cpath.clone());
@@ -174,7 +178,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("Phaenna v{} ({})", env!("CARGO_PKG_VERSION"), env!("PHAENNA_GIT_SHA"));
                 println!("  yt-dlp   : {}", if d.has_ytdlp { "READY" } else { "MISSING" });
                 println!("  mpv      : {}", if d.has_mpv { "READY" } else { "MISSING" });
+                #[cfg(windows)]
                 println!("  mpv.net  : {}", if d.has_mpvnet { "READY" } else { "MISSING" });
+                #[cfg(target_os = "linux")]
                 println!("  Celluloid: {}", if d.has_celluloid { "READY" } else { "MISSING" });
                 println!("  ffmpeg   : {}", if d.has_ffmpeg { "READY" } else { "MISSING" });
                 return Ok(());
@@ -3527,8 +3533,9 @@ async fn execute_hub_action(
             let _ = state.config.save();
         }
         HubActionId::PlayerBackend => {
-            state.config.player = state.config.player.next();
+            state.config.player = state.config.player.next_for_host();
             let _ = state.config.save();
+            state.show_toast(format!("Player Engine: {}", state.config.player.label()));
         }
         HubActionId::AutoFullscreen => {
             state.config.auto_fullscreen = !state.config.auto_fullscreen;

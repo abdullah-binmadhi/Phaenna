@@ -13,6 +13,7 @@ use crate::services::substyler::SubtitleStyleConfig;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use tokio::process::{Child, Command};
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +109,28 @@ pub fn detect_dependencies() -> DependencyStatus {
         has_mpvnet,
         has_celluloid,
         has_ffmpeg,
+    }
+}
+
+static DEPS_CACHE: OnceLock<DependencyStatus> = OnceLock::new();
+
+/// Process-wide cached dependency status (avoids repeated `stat` calls inside 60fps UI frames).
+pub fn cached_dependencies() -> &'static DependencyStatus {
+    DEPS_CACHE.get_or_init(detect_dependencies)
+}
+
+/// Returns whether a playback engine (or at least one host backend for `AutoBest`) is installed.
+pub fn is_player_installed(player: Player) -> bool {
+    let d = cached_dependencies();
+    match player {
+        Player::AutoBest => {
+            d.has_mpv
+                || (cfg!(windows) && d.has_mpvnet)
+                || (cfg!(target_os = "linux") && d.has_celluloid)
+        }
+        Player::Mpv => d.has_mpv,
+        Player::MpvNet => d.has_mpvnet,
+        Player::Celluloid => d.has_celluloid,
     }
 }
 
@@ -1566,7 +1589,8 @@ pub fn build_celluloid_args(opts: &PlayOptions) -> Vec<String> {
 
 /// Launch playback asynchronously in the background without blocking the TUI event loop.
 pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
-    let resolved_player = match opts.player {
+    let effective_player = opts.player.resolve_supported_for_host();
+    let resolved_player = match effective_player {
         Player::AutoBest => resolve_auto_player(),
         other => other,
     };

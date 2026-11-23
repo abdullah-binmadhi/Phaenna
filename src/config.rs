@@ -484,6 +484,46 @@ impl Player {
         [Player::AutoBest, Player::Mpv, Player::MpvNet, Player::Celluloid]
     }
 
+    pub const fn is_supported_on_host(self) -> bool {
+        match self {
+            Player::AutoBest | Player::Mpv => true,
+            Player::MpvNet => cfg!(windows),
+            Player::Celluloid => cfg!(target_os = "linux"),
+        }
+    }
+
+    pub const fn host_supported() -> &'static [Player] {
+        #[cfg(windows)]
+        {
+            &[Player::AutoBest, Player::Mpv, Player::MpvNet]
+        }
+        #[cfg(target_os = "linux")]
+        {
+            &[Player::AutoBest, Player::Mpv, Player::Celluloid]
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            &[Player::AutoBest, Player::Mpv]
+        }
+    }
+
+    pub fn next_for_host(self) -> Self {
+        let supported = Self::host_supported();
+        if let Some(idx) = supported.iter().position(|&p| p == self) {
+            supported[(idx + 1) % supported.len()]
+        } else {
+            Player::AutoBest
+        }
+    }
+
+    pub const fn resolve_supported_for_host(self) -> Self {
+        if self.is_supported_on_host() {
+            self
+        } else {
+            Player::AutoBest
+        }
+    }
+
     pub const fn next(self) -> Self {
         match self {
             Player::AutoBest => Player::Mpv,
@@ -2271,6 +2311,29 @@ mod tests {
         assert_eq!(legacy_vlc.player, Player::AutoBest);
         let legacy_br: Config = toml::from_str("player = \"browser\"\n").unwrap();
         assert_eq!(legacy_br.player, Player::AutoBest);
+    }
+
+    #[test]
+    fn test_player_host_filtering_and_cycling() {
+        let supported = Player::host_supported();
+        assert!(supported.contains(&Player::AutoBest));
+        assert!(supported.contains(&Player::Mpv));
+        assert!(supported.iter().all(|p| p.is_supported_on_host()));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(supported, &[Player::AutoBest, Player::Mpv]);
+            assert!(!Player::MpvNet.is_supported_on_host());
+            assert!(!Player::Celluloid.is_supported_on_host());
+            assert_eq!(Player::MpvNet.resolve_supported_for_host(), Player::AutoBest);
+            assert_eq!(Player::Celluloid.resolve_supported_for_host(), Player::AutoBest);
+            assert_eq!(Player::MpvNet.next_for_host(), Player::AutoBest);
+        }
+
+        assert_eq!(Player::AutoBest.next_for_host(), Player::Mpv);
+        let cycled = Player::Mpv.next_for_host();
+        assert!(cycled.is_supported_on_host());
+        assert_eq!(Player::Mpv.resolve_supported_for_host(), Player::Mpv);
     }
 
     #[test]

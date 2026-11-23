@@ -124,7 +124,8 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
         .unwrap_or(state.config.quality);
     let codec_prio = state.config.effective_mastering().codec_priority;
     let max_fps_cap = state.config.max_fps_cap;
-    let player_now = state.config.player;
+    let host_players = Player::host_supported();
+    let player_now = state.config.player.resolve_supported_for_host();
     let net_mode = state.config.network_mode;
     let show_dividers = inner.height >= 20;
 
@@ -144,9 +145,9 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
         constraints.push(Constraint::Length(1)); // divider
     }
     constraints.extend([
-        Constraint::Length(1), // Player Engine header
-        Constraint::Length(4), // 4 Players
-        Constraint::Min(1),    // Selected tier note + Refresh + selector footer
+        Constraint::Length(1),                              // Player Engine header
+        Constraint::Length((host_players.len() + 1) as u16), // Host-supported players + OS note
+        Constraint::Min(1),                                 // Selected tier note + Refresh + selector footer
     ]);
 
     let chunks = Layout::default()
@@ -362,36 +363,34 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
     );
     ci += 1;
 
-    // Player rows
+    // Player rows (host-OS filtered with live installation badges)
     let p_area = chunks[ci];
     ci += 1;
     let wide_caps = p_area.width >= 48;
-    let players = if wide_caps {
-        [
-            (Player::AutoBest, "Auto libmpv Best"),
-            (Player::Mpv, "100% Universal"),
-            (Player::MpvNet, "Win libmpv 99%"),
-            (Player::Celluloid, "Linux GTK 95%"),
-        ]
-    } else {
-        [
-            (Player::AutoBest, "Auto libmpv"),
-            (Player::Mpv, "Universal"),
-            (Player::MpvNet, "Win 99%"),
-            (Player::Celluloid, "GTK 95%"),
-        ]
-    };
     let mut p_lines = Vec::new();
-    for (pl, caps) in players {
+    for &pl in host_players {
         if (p_lines.len() as u16) >= p_area.height {
             break;
         }
         let active = pl == player_now;
+        let installed = crate::api::player::is_player_installed(pl);
+        let cap_lbl = match (pl, wide_caps) {
+            (Player::AutoBest, true) => "Auto libmpv",
+            (Player::AutoBest, false) => "Auto",
+            (Player::Mpv, true) => "Universal 100%",
+            (Player::Mpv, false) => "100%",
+            (Player::MpvNet, _) => "Win 99%",
+            (Player::Celluloid, _) => "GTK 95%",
+        };
+        let status_lbl = if installed { "READY" } else { "MISSING" };
+        let status_color = if installed {
+            Color::Rgb(52, 211, 153)
+        } else {
+            Color::Rgb(248, 113, 113)
+        };
         let row = p_lines.len() as u16;
-        let p_w = p_area
-            .width
-            .saturating_sub(caps.len() as u16 + 7)
-            .max(10) as usize;
+        let right_w = cap_lbl.len() as u16 + status_lbl.len() as u16 + 10;
+        let p_w = p_area.width.saturating_sub(right_w).max(10) as usize;
         let lbl = truncate_words(pl.label(), p_w);
         p_lines.push(Line::from(vec![
             Span::styled(
@@ -405,11 +404,30 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
                 },
             ),
             Span::styled(
-                format!("[{caps}]"),
+                format!("[{cap_lbl}] "),
                 Style::default().fg(if active { theme.accent } else { theme.text_dim }),
+            ),
+            Span::styled(
+                format!("[{status_lbl}]"),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         push_line_hit(hits, p_area, row, PlayOptionsHit::SelectPlayer(pl));
+    }
+    if (p_lines.len() as u16) < p_area.height {
+        let host_note = if cfg!(target_os = "macos") {
+            "   macOS native libmpv · mpv.net=Win, Celluloid=Linux"
+        } else if cfg!(windows) {
+            "   Windows native libmpv · Celluloid=Linux"
+        } else {
+            "   Linux native libmpv · mpv.net=Windows"
+        };
+        p_lines.push(Line::from(Span::styled(
+            truncate_words(host_note, p_area.width as usize),
+            Style::default().fg(theme.text_dim),
+        )));
     }
     frame.render_widget(Paragraph::new(p_lines), p_area);
 
