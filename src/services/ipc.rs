@@ -239,6 +239,9 @@ pub enum PlayerCommand {
     FrameBackStep,
     SetPitchCorrection(bool),
     SetFullscreen(bool),
+    SetPipMode(bool),
+    CyclePipCorner,
+    ToggleInfoHud,
     SetAbLoopPoint { is_b: bool, pos_secs: Option<f64> },
     ClearAbLoop,
     TakeScreenshot,
@@ -472,6 +475,33 @@ impl PlayerCommand {
             }
             Self::SetFullscreen(on) => {
                 vec![json!({"command": ["set_property", "fullscreen", on]}).to_string()]
+            }
+            Self::SetPipMode(on) => {
+                if *on {
+                    vec![
+                        json!({"command": ["set_property", "fullscreen", false]}).to_string(),
+                        json!({"command": ["set_property", "ontop", true]}).to_string(),
+                        json!({"command": ["set_property", "border", false]}).to_string(),
+                        json!({"command": ["set_property", "keepaspect-window", true]}).to_string(),
+                        json!({"command": ["set_property", "window-scale", 0.30]}).to_string(),
+                        json!({"command": ["set_property", "geometry", "30%x30%-24-24"]}).to_string(),
+                        json!({"command": ["show-text", "◈ Picture-in-Picture: ON ([p] toggle, [P] corner)", 2400]}).to_string(),
+                    ]
+                } else {
+                    vec![
+                        json!({"command": ["set_property", "ontop", false]}).to_string(),
+                        json!({"command": ["set_property", "border", true]}).to_string(),
+                        json!({"command": ["set_property", "window-scale", 1.0]}).to_string(),
+                        json!({"command": ["set_property", "geometry", "50%:50%"]}).to_string(),
+                        json!({"command": ["show-text", "◈ Picture-in-Picture: OFF (Standard Window)", 2000]}).to_string(),
+                    ]
+                }
+            }
+            Self::CyclePipCorner => {
+                vec![json!({"command": ["script-binding", "phaenna-cycle-pip-corner"]}).to_string()]
+            }
+            Self::ToggleInfoHud => {
+                vec![json!({"command": ["script-binding", "phaenna-toggle-hud"]}).to_string()]
             }
             Self::SetAbLoopPoint { is_b, pos_secs } => {
                 let prop = if *is_b { "ab-loop-b" } else { "ab-loop-a" };
@@ -1081,6 +1111,10 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                 }
                             }
                             "time-pos" => {
+                                // Ignore the transient 2s Y2K anime loading slide before stream starts
+                                if !config.is_live && last_dur > 0.0 && last_dur <= 4.5 {
+                                    continue;
+                                }
                                 if !tracker.is_paused && prev_pos > 0.0 {
                                     let dt = val - prev_pos;
                                     if dt > 0.0 && dt <= 6.0 {

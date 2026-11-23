@@ -851,16 +851,54 @@ fn render_transport_session_pane(frame: &mut Frame, area: Rect, state: &mut AppS
     ];
     render_inline_pills(frame, win_r, Some((" ", Style::default())), &win_pills, hits);
 
-    // 9. Audio Radio
+    // 9. Audio Radio + PiP + Auto-Fullscreen + HUD controls
     if h >= 12 {
         let rad_r = next_rect();
-        let rad_pills = vec![(
-            "[R Audio Radio]".to_string(),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-            PlayOptionsHit::LaunchAudioRadio,
-        )];
+        let rad_label = if w >= 58 { "[R Audio Radio]" } else { "[R Radio]" };
+        let rad_pills = vec![
+            (
+                rad_label.to_string(),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                PlayOptionsHit::LaunchAudioRadio,
+            ),
+            (
+                format!("[PiP:{}]", if state.live_playback.pip_mode { "ON" } else { "OFF" }),
+                Style::default().fg(if state.live_playback.pip_mode {
+                    theme.primary
+                } else {
+                    theme.text
+                }),
+                PlayOptionsHit::TogglePipMode,
+            ),
+            (
+                "[Corner]".to_string(),
+                Style::default().fg(if state.live_playback.pip_mode {
+                    theme.accent
+                } else {
+                    theme.text_dim
+                }),
+                PlayOptionsHit::CyclePipCorner,
+            ),
+            (
+                format!(
+                    "[AutoFS:{}]",
+                    if state.config.auto_fullscreen { "ON" } else { "OFF" }
+                ),
+                Style::default().fg(if state.config.auto_fullscreen {
+                    theme.primary
+                } else {
+                    theme.text
+                }),
+                PlayOptionsHit::ToggleAutoFullscreen,
+            ),
+            (
+                "[i HUD]".to_string(),
+                Style::default().fg(theme.accent),
+                PlayOptionsHit::ToggleInfoHud,
+            ),
+        ];
         render_inline_pills(frame, rad_r, Some((" ", Style::default())), &rad_pills, hits);
     }
 

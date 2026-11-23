@@ -778,6 +778,9 @@ impl AppState {
         let pic = self.config.picture.active_grade();
         self.live_playback = LivePlaybackControlState {
             sub_visible: self.config.subtitles_enabled,
+            pip_mode: self.config.auto_pip,
+            ontop: self.config.auto_pip,
+            fullscreen: self.config.auto_fullscreen && !self.config.auto_pip,
             brightness: pic.brightness,
             contrast: pic.contrast,
             saturation: pic.saturation,
@@ -838,7 +841,12 @@ impl AppState {
             LiveIpcEvent::AspectOverride(a) => self.live_playback.aspect_override = a,
             LiveIpcEvent::VideoRotate(deg) => self.live_playback.video_rotate = deg,
             LiveIpcEvent::MirrorX(m) => self.live_playback.mirror_x = m,
-            LiveIpcEvent::Fullscreen(f) => self.live_playback.fullscreen = f,
+            LiveIpcEvent::Fullscreen(f) => {
+                self.live_playback.fullscreen = f;
+                if f {
+                    self.live_playback.pip_mode = false;
+                }
+            }
             LiveIpcEvent::PitchCorrection(p) => self.live_playback.pitch_correction = p,
             LiveIpcEvent::AbLoopA(a) => self.live_playback.ab_loop_a = a,
             LiveIpcEvent::AbLoopB(b) => self.live_playback.ab_loop_b = b,
@@ -2469,6 +2477,10 @@ pub enum PlayOptionsHit {
     SetSleepTimer(SleepTimerMode),
     CycleSleepTimer,
     ToggleFullscreen,
+    TogglePipMode,
+    CyclePipCorner,
+    ToggleAutoFullscreen,
+    ToggleInfoHud,
     PictureDelta(&'static str, i64),
     SetPictureRatio(&'static str),
     SelectPicturePreset(PicturePreset),
@@ -2519,6 +2531,7 @@ pub struct LivePlaybackControlState {
     pub active_sid: Option<i64>,
     pub ontop: bool,
     pub fullscreen: bool,
+    pub pip_mode: bool,
     pub loop_video: bool,
     pub pitch_correction: bool,
     pub ab_loop_a: Option<f64>,
@@ -2590,6 +2603,7 @@ impl Default for LivePlaybackControlState {
             active_sid: None,
             ontop: false,
             fullscreen: false,
+            pip_mode: false,
             loop_video: false,
             pitch_correction: true,
             ab_loop_a: None,

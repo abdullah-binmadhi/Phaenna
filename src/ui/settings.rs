@@ -15,6 +15,8 @@ use ratatui::{
 pub enum HubActionId {
     QualityPreset,
     PlayerBackend,
+    AutoFullscreen,
+    PipMode,
     NetworkMode,
     ForceIpv4,
     AutoAbrDownshift,
@@ -64,6 +66,22 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             keywords: "player mpv iina vlc browser backend hwdec",
             badge: format!("[ {} ▾ ]", cfg.player.label()),
             description: "Choose non-blocking playback engine. mpv unlocks IPC resume & SponsorBlock.",
+        },
+        HubItem {
+            id: HubActionId::AutoFullscreen,
+            category: "▶ PLAYBACK & STREAMING",
+            label: "Auto-Fullscreen on Launch",
+            keywords: "fullscreen auto launch cinema theater max screen",
+            badge: if cfg.auto_fullscreen { "[ ON ]".to_string() } else { "[ OFF ]".to_string() },
+            description: "Automatically launch videos in fullscreen mode (and syncs active mpv immediately). Pressing [f] or [Esc] inside mpv exits anytime.",
+        },
+        HubItem {
+            id: HubActionId::PipMode,
+            category: "▶ PLAYBACK & STREAMING",
+            label: "Picture-in-Picture (PiP)",
+            keywords: "pip picture in picture float floating mini corner ontop work",
+            badge: if state.live_playback.pip_mode || cfg.auto_pip { "[ ON · Float ]".to_string() } else { "[ OFF ]".to_string() },
+            description: "Pin a borderless 16:9 floating mpv window in the corner above all apps so you can watch & work simultaneously ([p] toggle, [P] corner in mpv).",
         },
         HubItem {
             id: HubActionId::NetworkMode,

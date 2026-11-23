@@ -3,6 +3,7 @@ pub mod calendar;
 pub mod cast;
 pub mod downloader;
 pub mod ipc;
+pub mod loading_art;
 pub mod remote;
 pub mod shaders;
 pub mod substyler;

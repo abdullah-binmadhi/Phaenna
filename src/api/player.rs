@@ -138,6 +138,9 @@ pub struct PlayOptions {
     pub live_auto_catchup: bool,
     pub network_mode: NetworkMode,
     pub force_ipv4: bool,
+    pub auto_fullscreen: bool,
+    pub auto_pip: bool,
+    pub loading_image: Option<String>,
     pub picture: PictureGrade,
     pub direct_stream: Option<SelectedStreamPair>,
 }
@@ -218,6 +221,11 @@ c cycle sub-visibility
 HOME seek 0 absolute
 END seek 99 absolute-percent
 d cycle aid
+p script-binding phaenna-toggle-pip
+P script-binding phaenna-cycle-pip-corner
+i script-binding phaenna-toggle-hud
+I script-binding phaenna-pin-hud
+F1 script-binding stats/display-stats-toggle
 L script-binding phaenna-snap-live-edge
 "#;
 
@@ -282,52 +290,104 @@ mp.add_periodic_timer(1.5, function()
 end)
 "#;
 
-const PHAENNA_LOADER_LUA: &str = r#"-- Phaenna Animated ASS Loading Bar Overlay (replaces startup black screen until first frame)
+const PHAENNA_LOADER_LUA: &str = r##"-- Phaenna Unified Player Overlay Engine:
+--   1. Solus-Style Y2K Anime Loading Card & Buffering Overlay
+--   2. Floating Borderless Picture-in-Picture Controller ([p] toggle, [P] cycle corner/size)
+--   3. Multi-Color Curated Bento Info HUD ([i] 6s toggle, [I] 1Hz pin, [F1] raw stats)
 local ov = mp.create_osd_overlay("ass-events")
 ov.res_x = 1280
 ov.res_y = 720
 
+local hud_ov = mp.create_osd_overlay("ass-events")
+hud_ov.res_x = 1280
+hud_ov.res_y = 720
+
 local title = mp.get_opt("phaenna_title") or "Preparing Stream"
 local meta = mp.get_opt("phaenna_meta") or "PHAENNA STUDIO"
-if #title > 62 then title = string.sub(title, 1, 59) .. "..." end
-title = title:gsub("[{}]", "")
-meta = meta:gsub("[{}]", "")
+local has_card = (mp.get_opt("phaenna_has_card") or "0") == "1"
+local pip_active = (mp.get_opt("phaenna_auto_pip") or "0") == "1"
 
+local function esc_ass(s)
+    if not s then return "" end
+    return tostring(s):gsub("[{}]", ""):gsub("[\r\n]+", " ")
+end
+
+title = esc_ass(title)
+meta = esc_ass(meta)
+if #title > 62 then title = string.sub(title, 1, 59) .. "..." end
+
+-- =============================================================================
+-- 1. Y2K Anime Loading Screen & Mid-Stream Buffering Overlay
+-- =============================================================================
 local phase = 0.0
 local cache_pct = nil
 local cache_speed = 0
 local cache_dur = 0
 local is_loading = true
 local timer = nil
+local boot_time = mp.get_time()
+local advanced_slide = false
 
 local function fmt_speed(bps)
     if not bps or bps <= 0 then return "" end
     if bps >= 1048576 then
-        return string.format(" · %.1f MB/s", bps / 1048576.0)
+        return string.format("%.1f MB/s", bps / 1048576.0)
     elseif bps >= 1024 then
-        return string.format(" · %d KB/s", math.floor(bps / 1024.0))
+        return string.format("%d KB/s", math.floor(bps / 1024.0))
     end
-    return string.format(" · %d B/s", math.floor(bps))
+    return string.format("%d B/s", math.floor(bps))
+end
+
+local function is_y2k_slide_active()
+    if not has_card then return false end
+    local cnt = mp.get_property_number("playlist-count", 1) or 1
+    local ppos = mp.get_property_number("playlist-pos", 0) or 0
+    return cnt > 1 and ppos == 0
 end
 
 local function render_loader()
+    if is_y2k_slide_active() then
+        local elapsed = mp.get_time() - boot_time
+        if elapsed >= 1.45 and not advanced_slide then
+            advanced_slide = true
+            mp.commandv("playlist-next")
+        end
+        -- Animate neon fill directly inside the generated 1280x720 Y2K card track (594..1174, 392..418)
+        local pct = math.min(0.95, elapsed / 1.45)
+        if cache_pct and cache_pct > 0 then
+            pct = math.max(pct, math.min(1.0, cache_pct / 100.0))
+        end
+        local fill_w = math.max(24, math.floor(568 * pct))
+        local spd = fmt_speed(cache_speed)
+        local tag = (spd ~= "") and string.format("%d%%  %s", math.floor(pct * 100), spd) or string.format("%d%%", math.floor(pct * 100))
+        ov.data = string.format(
+            "{\\an7\\pos(600,398)\\bord0\\shad0\\1c&H99D334&\\p1}m 0 0 l %d 0 l %d 14 l 0 14{\\p0}\n" ..
+            "{\\an9\\pos(1172,432)\\bord0\\shad0\\fs18\\b1\\1c&HF8BD38&}%s",
+            fill_w, fill_w, tag
+        )
+        ov:update()
+        return
+    end
+
     if not is_loading then
         ov:remove()
         return
     end
-    phase = (phase + 0.045) % 1.0
-    local bar_x0 = 280
-    local bar_w = 720
+
+    phase = (phase + 0.05) % 1.0
+    local bar_x0 = 300
+    local bar_w = 680
     local bar_y0 = 404
     local bar_y1 = 418
 
     local spd_txt = fmt_speed(cache_speed)
-    local dur_txt = (cache_dur and cache_dur > 0.1) and string.format(" · %.1fs", cache_dur) or ""
-    local status = "Connecting & Buffering HD Stream" .. spd_txt .. "..."
+    local spd_sfx = (spd_txt ~= "") and ("  ·  " .. spd_txt) or ""
+    local dur_txt = (cache_dur and cache_dur > 0.1) and string.format("  ·  %.1fs cached", cache_dur) or ""
+    local status = "Connecting & Buffering HD Stream" .. spd_sfx .. "..."
     local fill_x0 = bar_x0
     local fill_w = 180
     if cache_pct and cache_pct > 0 and cache_pct < 100 then
-        status = string.format("Buffering Stream (%d%%)%s%s...", math.floor(cache_pct), spd_txt, dur_txt)
+        status = string.format("Buffering Stream (%d%%)%s%s...", math.floor(cache_pct), spd_sfx, dur_txt)
         fill_w = math.max(24, math.floor(bar_w * (cache_pct / 100.0)))
     else
         local sweep = math.floor(phase * (bar_w - 160))
@@ -337,13 +397,13 @@ local function render_loader()
     local fill_x1 = math.min(bar_x0 + bar_w, fill_x0 + fill_w)
 
     local ass = string.format(
-        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H181412&\\1a&H14&\\p1}m 220 265 l 1060 265 l 1060 455 l 220 455{\\p0}\n" ..
-        "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&H8A5CF6&\\p1}m 220 265 l 1060 265 l 1060 455 l 220 455{\\p0}\n" ..
-        "{\\an5\\pos(640,305)\\bord0\\shad0\\fs20\\b1\\1c&H99D334&}%s\n" ..
-        "{\\an5\\pos(640,344)\\bord0\\shad0\\fs26\\b1\\1c&HFFFFFF&}%s\n" ..
-        "{\\an5\\pos(640,378)\\bord0\\shad0\\fs17\\1c&HB0B8C8&}%s\n" ..
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H14100D&\\1a&H18&\\p1}m 230 262 l 1050 262 l 1050 458 l 230 458{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&HFA8BA7&\\p1}m 230 262 l 1050 262 l 1050 458 l 230 458{\\p0}\n" ..
+        "{\\an5\\pos(640,302)\\bord0\\shad0\\fs19\\b1\\1c&H99D334&}✦  %s  ✦\n" ..
+        "{\\an5\\pos(640,342)\\bord0\\shad0\\fs25\\b1\\1c&HFAF4F0&}%s\n" ..
+        "{\\an5\\pos(640,376)\\bord0\\shad0\\fs17\\1c&HF8BD38&}%s\n" ..
         "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H2E2824&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}\n" ..
-        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HF65C8B&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}",
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H99D334&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}",
         meta, title, status,
         bar_x0, bar_y0, bar_x0 + bar_w, bar_y0, bar_x0 + bar_w, bar_y1, bar_x0, bar_y1,
         fill_x0, bar_y0, fill_x1, bar_y0, fill_x1, bar_y1, fill_x0, bar_y1
@@ -360,6 +420,7 @@ local function start_anim()
 end
 
 local function stop_anim()
+    if is_y2k_slide_active() then return end
     is_loading = false
     if timer then
         timer:kill()
@@ -369,11 +430,13 @@ local function stop_anim()
 end
 
 mp.register_event("playback-restart", function()
+    if is_y2k_slide_active() then return end
     local pfc = mp.get_property_bool("paused-for-cache", false)
     if not pfc then stop_anim() end
 end)
 
 mp.observe_property("paused-for-cache", "bool", function(_, val)
+    if is_y2k_slide_active() then return end
     if val then
         is_loading = true
         start_anim()
@@ -384,25 +447,246 @@ mp.observe_property("paused-for-cache", "bool", function(_, val)
 end)
 
 mp.observe_property("time-pos", "number", function(_, val)
+    if is_y2k_slide_active() then return end
     if val and val > 0.04 and not mp.get_property_bool("paused-for-cache", false) then
         stop_anim()
     end
 end)
 
-mp.observe_property("cache-buffering-state", "number", function(_, val)
-    cache_pct = val
-end)
+mp.observe_property("cache-buffering-state", "number", function(_, val) cache_pct = val end)
+mp.observe_property("cache-speed", "number", function(_, val) cache_speed = val or 0 end)
+mp.observe_property("demuxer-cache-duration", "number", function(_, val) cache_dur = val or 0 end)
 
-mp.observe_property("cache-speed", "number", function(_, val)
-    cache_speed = val or 0
-end)
+-- =============================================================================
+-- 2. Picture-in-Picture (PiP) Floating Window Controller ([p] / [P])
+-- =============================================================================
+local pip_idx = 1
+local pip_presets = {
+    { label = "Bottom-Right 30%", scale = 0.30, geom = "30%x30%-24-24" },
+    { label = "Top-Right 30%",    scale = 0.30, geom = "30%x30%-24+24" },
+    { label = "Bottom-Left 30%",  scale = 0.30, geom = "30%x30%+24-24" },
+    { label = "Top-Left 30%",     scale = 0.30, geom = "30%x30%+24+24" },
+    { label = "Compact 22%",      scale = 0.22, geom = "22%x22%-20-20" },
+    { label = "Theater 38%",      scale = 0.38, geom = "38%x38%-28-28" },
+}
 
-mp.observe_property("demuxer-cache-duration", "number", function(_, val)
-    cache_dur = val or 0
-end)
+local function apply_pip_preset()
+    local pr = pip_presets[pip_idx]
+    mp.set_property_bool("fullscreen", false)
+    mp.set_property_bool("ontop", true)
+    mp.set_property_bool("border", false)
+    mp.set_property_bool("keepaspect-window", true)
+    mp.set_property_number("window-scale", pr.scale)
+    mp.set_property("geometry", pr.geom)
+    mp.osd_message("◈ PiP Floating: " .. pr.label .. " ([P] corner, [p] exit)", 2.2)
+end
+
+local function toggle_pip()
+    pip_active = not pip_active
+    if pip_active then
+        apply_pip_preset()
+    else
+        mp.set_property_bool("ontop", false)
+        mp.set_property_bool("border", true)
+        mp.set_property_number("window-scale", 1.0)
+        mp.set_property("geometry", "50%:50%")
+        mp.osd_message("◈ PiP Floating: OFF (Standard Window)", 2.0)
+    end
+end
+
+local function cycle_pip_corner()
+    if not pip_active then
+        pip_active = true
+    else
+        pip_idx = (pip_idx % #pip_presets) + 1
+    end
+    apply_pip_preset()
+end
+
+mp.add_forced_key_binding("p", "phaenna-toggle-pip", toggle_pip)
+mp.add_forced_key_binding("P", "phaenna-cycle-pip-corner", cycle_pip_corner)
+
+-- =============================================================================
+-- 3. Multi-Color Curated Bento Video Info HUD ([i] 6s / [I] Pinned 1Hz)
+-- =============================================================================
+local hud_visible = false
+local hud_pinned = false
+local hud_tick_timer = nil
+local hud_hide_timer = nil
+
+local function fmt_clock(s)
+    if not s or s < 0 then return "--:--" end
+    local tot = math.floor(s)
+    local h = math.floor(tot / 3600)
+    local m = math.floor((tot % 3600) / 60)
+    local sec = tot % 60
+    if h > 0 then
+        return string.format("%d:%02d:%02d", h, m, sec)
+    end
+    return string.format("%02d:%02d", m, sec)
+end
+
+local function hide_info_hud()
+    hud_visible = false
+    hud_pinned = false
+    if hud_tick_timer then hud_tick_timer:kill(); hud_tick_timer = nil end
+    if hud_hide_timer then hud_hide_timer:kill(); hud_hide_timer = nil end
+    hud_ov:remove()
+end
+
+local function render_info_hud()
+    if not hud_visible then
+        hud_ov:remove()
+        return
+    end
+    local mtitle = esc_ass(mp.get_property("media-title", title))
+    if #mtitle > 68 then mtitle = string.sub(mtitle, 1, 65) .. "..." end
+
+    local pos = mp.get_property_number("time-pos", 0) or 0
+    local dur = mp.get_property_number("duration", 0) or 0
+    local pct = mp.get_property_number("percent-pos", 0) or 0
+    local spd = mp.get_property_number("speed", 1.0) or 1.0
+    local vw = mp.get_property_number("width", 0) or 0
+    local vh = mp.get_property_number("height", 0) or 0
+    local fps = mp.get_property_number("estimated-vf-fps", 0) or 0
+    local disp_fps = mp.get_property_number("display-fps", 0) or 0
+    local vcodec = esc_ass(mp.get_property("video-codec", "—")):upper()
+    local vbit = mp.get_property_number("video-bitrate", 0) or 0
+    local hwdec = esc_ass(mp.get_property("hwdec-current", ""))
+    local drops = (mp.get_property_number("decoder-frame-drop-count", 0) or 0) + (mp.get_property_number("frame-drop-count", 0) or 0)
+    local vo = esc_ass(mp.get_property("current-vo", "gpu-next"))
+    local avs = mp.get_property_number("avsync", 0) or 0
+    local cm = esc_ass(mp.get_property("video-params/colormatrix", "auto"))
+
+    local acodec = esc_ass(mp.get_property("audio-codec-name", mp.get_property("audio-codec", "—"))):upper()
+    local abit = mp.get_property_number("audio-bitrate", 0) or 0
+    local sr = mp.get_property_number("audio-params/samplerate", 0) or 0
+    local ch_n = mp.get_property_number("audio-params/channel-count", 2) or 2
+    local vol = mp.get_property_number("volume", 100) or 100
+    local muted = mp.get_property_bool("mute", false)
+    local af_s = esc_ass(mp.get_property("af", ""))
+
+    local c_dur = mp.get_property_number("demuxer-cache-duration", 0) or 0
+    local c_spd = mp.get_property_number("cache-speed", 0) or 0
+    local c_bytes = 0
+    local cst = mp.get_property_native("demuxer-cache-state")
+    if cst and cst["total-bytes"] then c_bytes = cst["total-bytes"] end
+
+    local chap = esc_ass(mp.get_property("chapter-metadata/by-key/title", ""))
+    if #chap > 28 then chap = string.sub(chap, 1, 25) .. "..." end
+
+    local q_tag = (vh >= 2160 and "4K UHD") or (vh >= 1440 and "1440p QHD") or (vh >= 1080 and "1080p FHD") or (vh >= 720 and "720p HD") or "Stream"
+    local win_badge = pip_active and "PIP FLOAT" or (mp.get_property_bool("fullscreen", false) and "FULLSCREEN" or "WINDOWED")
+    local pin_badge = hud_pinned and "PINNED 1Hz" or "AUTO 6s"
+    local hw_lbl = (hwdec ~= "" and hwdec ~= "no") and ("GPU · " .. hwdec) or "CPU Software"
+    local hw_col = (hwdec ~= "" and hwdec ~= "no") and "&H99D334&" or "&H24BFFB&"
+    local drop_col = (drops > 0) and "&H5E3FF4&" or "&H99D334&"
+    local vol_str = muted and "MUTED" or string.format("%d%%", math.floor(vol))
+    local vol_col = muted and "&H5E3FF4&" or "&H99D334&"
+    local vbit_s = (vbit > 0) and string.format("%.2f Mbps", vbit / 1000000.0) or "ABR"
+    local abit_s = (abit > 0) and string.format("%d kbps", math.floor(abit / 1000.0)) or "Auto"
+    local sr_s = (sr > 0) and string.format("%.1f kHz", sr / 1000.0) or "Auto"
+    local eq_state = (af_s ~= "") and "Active DSP/EQ" or "Bypassed / Flat"
+    local c_mib = c_bytes / 1048576.0
+    local spd_txt = fmt_speed(c_spd)
+    local buf_health = (c_dur >= 12.0) and "Healthy" or ((c_dur >= 3.0) and "Fair" or "Low")
+    local buf_col = (c_dur >= 12.0) and "&H99D334&" or ((c_dur >= 3.0) and "&H24BFFB&" or "&H5E3FF4&")
+
+    local prog_w = math.max(8, math.floor(1140 * math.min(1.0, math.max(0.0, pct / 100.0))))
+    local buf_frac = math.min(1.0, c_dur / 60.0)
+    local buf_w = math.max(12, math.floor(520 * buf_frac))
+    local chap_line = (chap ~= "") and chap or "Continuous Playback"
+
+    -- Glass Bento Card at (x: 42..1238, y: 26..376)
+    local ass = string.format(
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H18&\\p1}m 42 26 l 1238 26 l 1238 378 l 42 378{\\p0}\n" ..
+        "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&HF8BD38&\\p1}m 42 26 l 1238 26 l 1238 378 l 42 378{\\p0}\n" ..
+        "{\\an7\\pos(66,42)\\bord0\\shad0\\fs19\\b1\\1c&HF8BD38&}◈ PHAENNA INFO HUD   " ..
+        "{\\1c&H24BFFB&}[%s]   {\\1c&H99D334&}[%s]   {\\1c&HFA8BA7&}[%s]   {\\1c&HC8B8A4&}%s\n" ..
+        "{\\an7\\pos(66,70)\\bord0\\shad0\\fs24\\b1\\1c&HFAF4F0&}%s\n" ..
+        "{\\an7\\pos(66,102)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}%s / %s (%d%%)  ·  Speed %.2fx  ·  Chapter: {\\1c&HFAF4F0&}%s\n" ..
+        "{\\an7\\pos(66,128)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 1140 0 l 1140 6 l 0 6{\\p0}\n" ..
+        "{\\an7\\pos(66,128)\\bord0\\shad0\\1c&HF8BD38&\\p1}m 0 0 l %d 0 l %d 6 l 0 6{\\p0}\n" ..
+        "{\\an7\\pos(66,150)\\bord0\\shad0\\fs16\\b1\\1c&HF8BD38&}▶ VIDEO & QUALITY\n" ..
+        "{\\an7\\pos(66,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Stream  : {\\1c&HFAF4F0&\\b1}%dx%d  %s\n" ..
+        "{\\an7\\pos(66,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Codec   : {\\1c&H24BFFB&}%s  ·  %s\n" ..
+        "{\\an7\\pos(66,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Rate    : {\\1c&H99D334&}%.2f fps{\\1c&HC8B8A4&} (Disp %.0fHz)\n" ..
+        "{\\an7\\pos(66,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Frames  : {\\1c%s}%d dropped {\\1c&HC8B8A4&}· %s\n" ..
+        "{\\an7\\pos(460,150)\\bord0\\shad0\\fs16\\b1\\1c&HFA8BA7&}◈ GPU & MASTERING\n" ..
+        "{\\an7\\pos(460,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Decode  : {\\1c%s}%s\n" ..
+        "{\\an7\\pos(460,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}VideoOut: {\\1c&HF8BD38&}%s\n" ..
+        "{\\an7\\pos(460,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}DSP/EQ  : {\\1c&HFA8BA7&}%s\n" ..
+        "{\\an7\\pos(460,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}A/V Sync: {\\1c&H99D334&}%+.1f ms\n" ..
+        "{\\an7\\pos(860,150)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}♪ AUDIO & PLAYBACK\n" ..
+        "{\\an7\\pos(860,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Codec   : {\\1c&H24BFFB&}%s  ·  %s\n" ..
+        "{\\an7\\pos(860,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Output  : {\\1c&HFAF4F0&}%s  ·  %d ch\n" ..
+        "{\\an7\\pos(860,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Volume  : {\\1c%s}%s\n" ..
+        "{\\an7\\pos(860,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Window  : {\\1c&HF8BD38&}%s\n" ..
+        "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H99D334&}⚡ BUFFER HEALTH   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s\n" ..
+        "{\\an7\\pos(66,314)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 520 0 l 520 10 l 0 10{\\p0}\n" ..
+        "{\\an7\\pos(66,314)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d 10 l 0 10{\\p0}\n" ..
+        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[i] Hide  [I] Pin 1Hz  {\\1c&H99D334&}[p] PiP Float  [P] PiP Corner  {\\1c&H24BFFB&}[f] Fullscreen  {\\1c&HFA8BA7&}[F1] Raw Stats",
+        q_tag, win_badge, pin_badge, meta,
+        mtitle,
+        fmt_clock(pos), fmt_clock(dur), math.floor(pct), spd, chap_line,
+        prog_w, prog_w,
+        vw, vh, q_tag,
+        vcodec, vbit_s,
+        fps, disp_fps,
+        drop_col, drops, cm,
+        hw_col, hw_lbl,
+        vo,
+        eq_state,
+        avs * 1000.0,
+        acodec, abit_s,
+        sr_s, ch_n,
+        vol_col, vol_str,
+        win_badge,
+        c_dur, c_mib, (spd_txt ~= "") and ("· " .. spd_txt) or "", buf_col, buf_health,
+        buf_col, buf_w, buf_w
+    )
+    hud_ov.data = ass
+    hud_ov:update()
+end
+
+local function ensure_hud_timer()
+    if not hud_tick_timer then
+        hud_tick_timer = mp.add_periodic_timer(0.5, render_info_hud)
+    end
+end
+
+local function toggle_info_hud()
+    if hud_visible and not hud_pinned then
+        hide_info_hud()
+        return
+    end
+    hud_pinned = false
+    hud_visible = true
+    if hud_hide_timer then hud_hide_timer:kill() end
+    hud_hide_timer = mp.add_timeout(6.0, function()
+        if not hud_pinned then hide_info_hud() end
+    end)
+    ensure_hud_timer()
+    render_info_hud()
+end
+
+local function pin_info_hud()
+    if hud_visible and hud_pinned then
+        hide_info_hud()
+        return
+    end
+    if hud_hide_timer then hud_hide_timer:kill(); hud_hide_timer = nil end
+    hud_visible = true
+    hud_pinned = true
+    ensure_hud_timer()
+    render_info_hud()
+end
+
+mp.add_forced_key_binding("i", "phaenna-toggle-hud", toggle_info_hud)
+mp.add_forced_key_binding("I", "phaenna-pin-hud", pin_info_hud)
 
 start_anim()
-"#;
+"##;
 
 fn player_support_dir() -> PathBuf {
     Config::cache_dir()
@@ -481,6 +765,17 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         flags.push("vid=no".to_string());
     }
 
+    if opts.auto_pip {
+        flags.push("fullscreen=no".to_string());
+        flags.push("ontop=yes".to_string());
+        flags.push("border=no".to_string());
+        flags.push("keepaspect-window=yes".to_string());
+        flags.push("window-scale=0.30".to_string());
+        flags.push("geometry=30%x30%-24-24".to_string());
+    } else if opts.auto_fullscreen {
+        flags.push("fullscreen=yes".to_string());
+    }
+
     if let Some(conf_path) = prepare_youtube_input_conf() {
         flags.push(format!("input-conf={}", conf_path.to_string_lossy()));
     }
@@ -503,6 +798,12 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         }
         script_opt_parts.push(format!("phaenna_title={safe_title}"));
         script_opt_parts.push(format!("phaenna_meta={safe_meta}"));
+        let has_card = opts
+            .loading_image
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        script_opt_parts.push(format!("phaenna_has_card={}", if has_card { "1" } else { "0" }));
+        script_opt_parts.push(format!("phaenna_auto_pip={}", if opts.auto_pip { "1" } else { "0" }));
     }
 
     if opts.local_file.is_none() {
@@ -668,7 +969,12 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         flags.push(format!("af={LOUDNORM_FILTER}"));
     }
 
-    if !use_live_pipeline {
+    let has_loading_slide = opts.player == Player::Mpv
+        && opts
+            .loading_image
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+    if !use_live_pipeline && !has_loading_slide {
         if let Some(start) = opts.start_pos {
             if start > 3.0 {
                 flags.push(format!("start={:.1}", start));
@@ -761,7 +1067,25 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     for kv in shared_mpv_kv_flags(opts) {
         args.push(format!("--{kv}"));
     }
-    args.push(resolved_mpv_target(opts));
+    if let Some(img) = opts.loading_image.as_deref().filter(|p| !p.trim().is_empty()) {
+        args.push("--image-display-duration=2".to_string());
+        args.push("--prefetch-playlist=yes".to_string());
+        args.push("--loop-playlist=no".to_string());
+        args.push("--{".to_string());
+        args.push(img.to_string());
+        args.push("--}".to_string());
+        args.push("--{".to_string());
+        let use_live_pipeline = opts.is_live && opts.live_mode != LiveStreamMode::Off;
+        if !use_live_pipeline {
+            if let Some(start) = opts.start_pos.filter(|&s| s > 3.0) {
+                args.push(format!("--start={:.1}", start));
+            }
+        }
+        args.push(resolved_mpv_target(opts));
+        args.push("--}".to_string());
+    } else {
+        args.push(resolved_mpv_target(opts));
+    }
     args
 }
 
@@ -783,7 +1107,7 @@ pub fn build_vlc_args(opts: &PlayOptions) -> Vec<String> {
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
-    vec![
+    let mut args = vec![
         format!("--video-title={}", opts.title),
         format!("--network-caching={}", opts.network_mode.vlc_network_caching_ms()),
         "--http-reconnect".to_string(),
@@ -804,8 +1128,14 @@ pub fn build_vlc_args(opts: &PlayOptions) -> Vec<String> {
         "--key-rate-slower-fine=<".to_string(),
         "--key-rate-faster-fine=>".to_string(),
         "--key-frame-next=.".to_string(),
-        target,
-    ]
+    ];
+    if opts.auto_pip {
+        args.push("--video-on-top".to_string());
+    } else if opts.auto_fullscreen {
+        args.push("--fullscreen".to_string());
+    }
+    args.push(target);
+    args
 }
 
 /// Launch playback asynchronously in the background without blocking the TUI event loop!
@@ -943,6 +1273,9 @@ mod tests {
             live_auto_catchup: true,
             network_mode: NetworkMode::Normal,
             force_ipv4: false,
+            auto_fullscreen: false,
+            auto_pip: false,
+            loading_image: None,
             picture: PictureGrade::default(),
             direct_stream: None,
         };
@@ -1021,6 +1354,9 @@ mod tests {
             live_auto_catchup: true,
             network_mode: NetworkMode::Normal,
             force_ipv4: false,
+            auto_fullscreen: false,
+            auto_pip: false,
+            loading_image: None,
             picture: PictureGrade::default(),
             direct_stream: None,
         };
@@ -1066,6 +1402,9 @@ mod tests {
             live_auto_catchup: true,
             network_mode: NetworkMode::Normal,
             force_ipv4: false,
+            auto_fullscreen: false,
+            auto_pip: false,
+            loading_image: None,
             picture: PictureGrade::default(),
             direct_stream: None,
         };
@@ -1116,6 +1455,9 @@ mod tests {
             force_ipv4: true,
             picture: PictureGrade::default(),
             direct_stream: None,
+            auto_fullscreen: false,
+            auto_pip: false,
+            loading_image: None,
         };
 
         let wifi_args = build_mpv_args(&opts);
@@ -1151,6 +1493,24 @@ mod tests {
             direct_args.last().unwrap(),
             "https://cdn.example.com/video_720p.webm"
         );
+
+        let mut auto_fs_opts = opts.clone();
+        auto_fs_opts.auto_fullscreen = true;
+        auto_fs_opts.loading_image = Some("/tmp/y2k_card.jpg".to_string());
+        auto_fs_opts.start_pos = Some(65.0);
+        let fs_args = build_mpv_args(&auto_fs_opts);
+        assert!(fs_args.iter().any(|a| a == "--fullscreen=yes"));
+        assert!(fs_args.iter().any(|a| a == "--prefetch-playlist=yes"));
+        assert!(fs_args.iter().any(|a| a == "/tmp/y2k_card.jpg"));
+        assert!(fs_args.iter().any(|a| a == "--start=65.0"));
+        assert!(build_vlc_args(&auto_fs_opts).iter().any(|a| a == "--fullscreen"));
+
+        let mut pip_opts = opts;
+        pip_opts.auto_pip = true;
+        let pip_args = build_mpv_args(&pip_opts);
+        assert!(pip_args.iter().any(|a| a == "--ontop=yes"));
+        assert!(pip_args.iter().any(|a| a == "--border=no"));
+        assert!(pip_args.iter().any(|a| a == "--window-scale=0.30"));
     }
 
     #[test]

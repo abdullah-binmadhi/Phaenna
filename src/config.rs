@@ -1944,6 +1944,10 @@ pub struct Config {
     pub sponsorblock_min_secs: u8,
     #[serde(default = "default_true")]
     pub sponsorblock_osd_toast: bool,
+    #[serde(default)]
+    pub auto_fullscreen: bool,
+    #[serde(default)]
+    pub auto_pip: bool,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
     #[serde(default = "default_theme_index")]
@@ -2000,6 +2004,8 @@ impl Default for Config {
             sponsorblock_whitelist: Vec::new(),
             sponsorblock_min_secs: default_sb_min_secs(),
             sponsorblock_osd_toast: true,
+            auto_fullscreen: false,
+            auto_pip: false,
             ambilight_enabled: true,
             theme_index: default_theme_index(),
             google_oauth: GoogleOAuthConfig::default(),
@@ -2394,6 +2400,8 @@ mod tests {
             sponsorblock_whitelist: vec!["Channel One".to_string()],
             sponsorblock_min_secs: 3,
             sponsorblock_osd_toast: false,
+            auto_fullscreen: true,
+            auto_pip: false,
             ..Default::default()
         };
         cfg.save_to_path(&cfg_path).unwrap();
@@ -2407,6 +2415,8 @@ mod tests {
         assert!(loaded.is_channel_whitelisted("channel one"));
         assert_eq!(loaded.sponsorblock_min_secs, 3);
         assert!(!loaded.sponsorblock_osd_toast);
+        assert!(loaded.auto_fullscreen);
+        assert!(!loaded.auto_pip);
 
         let fps_sel = Quality::P1080.ytdl_format_for_network_and_fps(
             DubPreference::OriginalOnly,

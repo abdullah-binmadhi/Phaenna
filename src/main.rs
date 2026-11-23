@@ -2777,6 +2777,30 @@ async fn start_nonblocking_playback_with_live_opts(
         force_ipv4: state.config.force_ipv4,
         picture: state.config.picture.active_grade(),
         direct_stream,
+        auto_fullscreen: state.config.auto_fullscreen,
+        auto_pip: state.config.auto_pip,
+        loading_image: if state.config.player == Player::Mpv && eff_quality != Quality::AudioOnly {
+            let q_badge = match eff_quality {
+                Quality::Best => "BEST",
+                Quality::P2160 => "4K",
+                Quality::P1440 => "1440P",
+                Quality::P1080 => "1080P",
+                Quality::P720 => "720P",
+                Quality::P480 => "480P",
+                Quality::P360 => "360P",
+                Quality::AudioOnly => "AUDIO",
+            };
+            let variant_idx = crate::services::loading_art::next_loading_variant_index();
+            crate::services::loading_art::generate_y2k_loading_screen(
+                &video.title,
+                video.display_uploader(),
+                q_badge,
+                variant_idx,
+            )
+            .map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        },
     };
 
     match spawn_player(&opts) {
@@ -3563,6 +3587,34 @@ async fn execute_hub_action(
         HubActionId::PlayerBackend => {
             state.config.player = state.config.player.next();
             let _ = state.config.save();
+        }
+        HubActionId::AutoFullscreen => {
+            state.config.auto_fullscreen = !state.config.auto_fullscreen;
+            if state.config.auto_fullscreen && state.config.auto_pip {
+                state.config.auto_pip = false;
+            }
+            let _ = state.config.save();
+            let flag = if state.config.auto_fullscreen { "ON" } else { "OFF" };
+            state.show_toast(format!("Auto-Fullscreen on Launch: {flag}"));
+        }
+        HubActionId::PipMode => {
+            if state.has_live_ipc() {
+                state.live_playback.pip_mode = !state.live_playback.pip_mode;
+                if state.live_playback.pip_mode {
+                    state.live_playback.fullscreen = false;
+                }
+                state.send_player_cmd(PlayerCommand::SetPipMode(state.live_playback.pip_mode));
+                let flag = if state.live_playback.pip_mode { "ON" } else { "OFF" };
+                state.show_toast(format!("Floating Picture-in-Picture: {flag}"));
+            } else {
+                state.config.auto_pip = !state.config.auto_pip;
+                if state.config.auto_pip && state.config.auto_fullscreen {
+                    state.config.auto_fullscreen = false;
+                }
+                let _ = state.config.save();
+                let flag = if state.config.auto_pip { "ON" } else { "OFF" };
+                state.show_toast(format!("Auto-PiP on Launch: {flag}"));
+            }
         }
         HubActionId::NetworkMode => {
             cycle_network_mode(state);
@@ -5090,7 +5142,36 @@ async fn apply_play_options_hit(
         }
         PlayOptionsHit::ToggleFullscreen => {
             state.live_playback.fullscreen = !state.live_playback.fullscreen;
+            if state.live_playback.fullscreen {
+                state.live_playback.pip_mode = false;
+            }
             state.send_player_cmd(PlayerCommand::SetFullscreen(state.live_playback.fullscreen));
+        }
+        PlayOptionsHit::TogglePipMode => {
+            state.live_playback.pip_mode = !state.live_playback.pip_mode;
+            if state.live_playback.pip_mode {
+                state.live_playback.fullscreen = false;
+            }
+            state.send_player_cmd(PlayerCommand::SetPipMode(state.live_playback.pip_mode));
+        }
+        PlayOptionsHit::CyclePipCorner => {
+            if !state.live_playback.pip_mode {
+                state.live_playback.pip_mode = true;
+                state.live_playback.fullscreen = false;
+            }
+            state.send_player_cmd(PlayerCommand::CyclePipCorner);
+        }
+        PlayOptionsHit::ToggleAutoFullscreen => {
+            state.config.auto_fullscreen = !state.config.auto_fullscreen;
+            if state.config.auto_fullscreen && state.config.auto_pip {
+                state.config.auto_pip = false;
+            }
+            let _ = state.config.save();
+            let flag = if state.config.auto_fullscreen { "ON" } else { "OFF" };
+            state.show_toast(format!("Auto-Fullscreen on Launch: {flag}"));
+        }
+        PlayOptionsHit::ToggleInfoHud => {
+            state.send_player_cmd(PlayerCommand::ToggleInfoHud);
         }
         PlayOptionsHit::PictureDelta(prop, delta) => {
             let was_bypassed = state.live_playback.picture_bypass;
