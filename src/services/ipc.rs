@@ -242,6 +242,12 @@ pub enum PlayerCommand {
     SetPipMode(bool),
     CyclePipCorner,
     ToggleInfoHud,
+    SetThermalHint {
+        on_battery: bool,
+        battery_pct: Option<u8>,
+        thermal_tier: u8,
+        temp_c: Option<f32>,
+    },
     SetAbLoopPoint { is_b: bool, pos_secs: Option<f64> },
     ClearAbLoop,
     TakeScreenshot,
@@ -281,7 +287,9 @@ fn mastering_ipc_commands(
         json!({"command": ["set_property", "demuxer-max-back-bytes", back_b]}).to_string(),
         json!({"command": ["set_property", "tone-mapping", eff.tone_map.mpv_value()]}).to_string(),
         json!({"command": ["set_property", "hdr-compute-peak", if eff.hdr_compute_peak { "yes" } else { "no" }]}).to_string(),
-        json!({"command": ["set_property", "hwdec", eff.hwdec.mpv_value()]}).to_string(),
+        json!({"command": ["set_property", "hwdec", eff.hwdec.effective_mpv_value()]}).to_string(),
+        json!({"command": ["set_property", "dscale", "hermite"]}).to_string(),
+        json!({"command": ["script-message", "phaenna-set-governor", eff.governor_mode.mpv_opt_value()]}).to_string(),
     ];
 
     if perf == PerformanceMode::Efficient {
@@ -290,13 +298,20 @@ fn mastering_ipc_commands(
             json!({"command": ["set_property", "cscale", "bilinear"]}).to_string(),
             json!({"command": ["set_property", "deband", "no"]}).to_string(),
             json!({"command": ["set_property", "temporal-dither", "no"]}).to_string(),
+            json!({"command": ["set_property", "interpolation", "no"]}).to_string(),
+            json!({"command": ["set_property", "video-sync", "audio"]}).to_string(),
             json!({"command": ["set_property", "vd-lavc-fast", "yes"]}).to_string(),
         ]);
     } else {
+        let chroma_444_active = shader != VideoShaderMode::Off
+            && matches!(
+                eff.glsl_stage,
+                crate::config::GlslStageMode::Guided444 | crate::config::GlslStageMode::FullMastering
+            );
         let (scale, cscale) = match eff.gpu_scaler {
-            GpuScalerMode::Spline36 => ("spline36", "mitchell"),
-            GpuScalerMode::EwaLanczos => ("ewa_lanczos", "ewa_lanczos"),
-            GpuScalerMode::EwaLanczosSharp => ("ewa_lanczossharp", "ewa_lanczossharp"),
+            GpuScalerMode::Spline36 => ("spline36", if chroma_444_active { "bilinear" } else { "mitchell" }),
+            GpuScalerMode::EwaLanczos => ("ewa_lanczos", if chroma_444_active { "bilinear" } else { "ewa_lanczos" }),
+            GpuScalerMode::EwaLanczosSharp => ("ewa_lanczossharp", if chroma_444_active { "bilinear" } else { "ewa_lanczossharp" }),
         };
         cmds.push(json!({"command": ["set_property", "scale", scale]}).to_string());
         cmds.push(json!({"command": ["set_property", "cscale", cscale]}).to_string());
@@ -312,7 +327,7 @@ fn mastering_ipc_commands(
             }
             DebandTier::ThreePassStudio => {
                 cmds.push(json!({"command": ["set_property", "deband", "yes"]}).to_string());
-                cmds.push(json!({"command": ["set_property", "deband-iterations", 3]}).to_string());
+                cmds.push(json!({"command": ["set_property", "deband-iterations", 2]}).to_string());
                 cmds.push(json!({"command": ["set_property", "temporal-dither", "yes"]}).to_string());
             }
         }
@@ -502,6 +517,21 @@ impl PlayerCommand {
             }
             Self::ToggleInfoHud => {
                 vec![json!({"command": ["script-binding", "phaenna-toggle-hud"]}).to_string()]
+            }
+            Self::SetThermalHint {
+                on_battery,
+                battery_pct,
+                thermal_tier,
+                temp_c,
+            } => {
+                let batt_s = if *on_battery { "1" } else { "0" };
+                let pct_s = battery_pct.map(|p| p.to_string()).unwrap_or_default();
+                let tier_s = thermal_tier.to_string();
+                let temp_s = temp_c.map(|c| format!("{c:.1}")).unwrap_or_default();
+                vec![json!({
+                    "command": ["script-message", "phaenna-host-thermal", batt_s, pct_s, tier_s, temp_s]
+                })
+                .to_string()]
             }
             Self::SetAbLoopPoint { is_b, pos_secs } => {
                 let prop = if *is_b { "ab-loop-b" } else { "ab-loop-a" };
@@ -1044,8 +1074,24 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             }
         }
 
+        let mut thermal_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        thermal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = thermal_interval.tick() => {
+                    let snap = crate::services::platform::poll_host_power_thermal().await;
+                    let cmd = PlayerCommand::SetThermalHint {
+                        on_battery: snap.on_battery,
+                        battery_pct: snap.battery_pct,
+                        thermal_tier: snap.effective_thermal_tier(),
+                        temp_c: snap.temp_celsius,
+                    };
+                    for raw in cmd.to_mpv_json_commands() {
+                        let line = format!("{raw}\n");
+                        let _ = writer.write_all(line.as_bytes()).await;
+                    }
+                }
                 sb_res = async {
                     match sb_rx.as_mut() {
                         Some(rx) => rx.await.ok(),

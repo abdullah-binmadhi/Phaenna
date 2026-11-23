@@ -326,7 +326,7 @@ fn vcodec_rank(vcodec: &str, codec: CodecPriority, congested: bool) -> u8 {
     let is_hev = vc.starts_with("hev") || vc.starts_with("hvc");
     let is_avc = vc.starts_with("avc") || vc.starts_with("h264");
 
-    if congested || codec == CodecPriority::Av1First {
+    if congested || codec.resolve_for_host() == CodecPriority::Av1First {
         if is_av1 {
             4
         } else if is_vp9 {

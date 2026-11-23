@@ -250,22 +250,31 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
     // Codec Priority row (inline pills)
     let codec_pills = vec![
         (
-            "[AV1 Max Comp]".to_string(),
+            "[Auto Silicon]".to_string(),
             pill_style(
-                codec_prio == CodecPriority::Av1First,
-                Color::Rgb(251, 191, 36),
+                codec_prio == CodecPriority::AutoSilicon,
+                theme.primary,
                 theme.text_dim,
             ),
-            PlayOptionsHit::SetCodecPriority(CodecPriority::Av1First),
+            PlayOptionsHit::SetCodecPriority(CodecPriority::AutoSilicon),
         ),
         (
-            "[VP9 HW Cool]".to_string(),
+            "[VP9 HW]".to_string(),
             pill_style(
                 codec_prio == CodecPriority::Vp9HwFirst,
                 Color::Rgb(52, 211, 153),
                 theme.text_dim,
             ),
             PlayOptionsHit::SetCodecPriority(CodecPriority::Vp9HwFirst),
+        ),
+        (
+            "[AV1 Comp]".to_string(),
+            pill_style(
+                codec_prio == CodecPriority::Av1First,
+                Color::Rgb(251, 191, 36),
+                theme.text_dim,
+            ),
+            PlayOptionsHit::SetCodecPriority(CodecPriority::Av1First),
         ),
     ];
     render_inline_pills(
@@ -359,17 +368,17 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
     let wide_caps = p_area.width >= 48;
     let players = if wide_caps {
         [
-            (Player::Mpv, "IPC HW GLSL SB"),
-            (Player::Iina, "GLSL macOS Native"),
-            (Player::Vlc, "Wide Codec NetBuf"),
-            (Player::Browser, "Zero Config"),
+            (Player::AutoBest, "Auto libmpv Best"),
+            (Player::Mpv, "100% Universal"),
+            (Player::MpvNet, "Win libmpv 99%"),
+            (Player::Celluloid, "Linux GTK 95%"),
         ]
     } else {
         [
-            (Player::Mpv, "IPC+HW+GLSL"),
-            (Player::Iina, "GLSL+macOS"),
-            (Player::Vlc, "Wide Codec"),
-            (Player::Browser, "ZeroCfg"),
+            (Player::AutoBest, "Auto libmpv"),
+            (Player::Mpv, "Universal"),
+            (Player::MpvNet, "Win 99%"),
+            (Player::Celluloid, "GTK 95%"),
         ]
     };
     let mut p_lines = Vec::new();
@@ -459,9 +468,9 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
         )],
         hits,
     );
-    let codec_short = match codec_prio {
+    let codec_short = match codec_prio.resolve_for_host() {
         CodecPriority::Av1First => "av01",
-        CodecPriority::Vp9HwFirst => "vp9",
+        CodecPriority::Vp9HwFirst | CodecPriority::AutoSilicon => "vp9",
     };
     let fps_short = max_fps_cap
         .map(|f| format!("{f}p"))

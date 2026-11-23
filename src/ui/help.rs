@@ -251,8 +251,8 @@ pub fn render_help_modal(frame: &mut Frame, state: &mut AppState) {
                 ("s / m / t / v", "Shader, Perf, 120Hz, Live", "Eng"),
                 ("d / L / n", "AI Dub / Lang / Loudnorm", "Audio"),
                 ("c / y / o", "Subs / Style / Skip Outro", "Subs"),
-                ("Space, -/+, [/]", "Pause / Vol+-5% / Speed", "IPC"),
-                ("M / 0 / X / ShL", "Mute / Zero EQ / Stop / Edge", "mpv"),
+                ("space, -/+, [/]", "Pause / Vol+-5% / Speed", "IPC"),
+                ("p/P, i/I, g, X", "PiP / Bento HUD / Gov / Stop", "mpv"),
             ],
         ),
         (

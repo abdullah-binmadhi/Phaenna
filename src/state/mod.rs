@@ -2042,6 +2042,8 @@ pub enum SearchHit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualToggle {
     SuperRes,
+    GovernorMode,
+    OrganicGrain,
     CodecPriority,
     Hwdec,
     HdrComputePeak,
@@ -2054,8 +2056,10 @@ pub enum ManualToggle {
 }
 
 impl ManualToggle {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::SuperRes,
+        Self::GovernorMode,
+        Self::OrganicGrain,
         Self::CodecPriority,
         Self::Hwdec,
         Self::HdrComputePeak,
@@ -2445,6 +2449,7 @@ pub enum PlayOptionsHit {
     ToggleManual(ManualToggle),
     SeedManualFrom(PerformanceMode),
     DownloadNeuralShaders,
+    DownloadArtCnnShaders,
     CycleLiveMode,
     SetLiveMode(crate::config::LiveStreamMode),
     CycleNetworkMode,

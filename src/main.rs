@@ -33,7 +33,7 @@ use crate::api::ytdlp::{
 };
 use crate::config::{
     next_dub_lang, AudioEqPreset, Config, ManualMasteringConfig, MotionMode, PerformanceMode,
-    PictureGrade, PicturePreset, Player, Quality, SponsorBlockMode, SponsorCategoryPolicy,
+    PictureGrade, PicturePreset, Quality, SponsorBlockMode, SponsorCategoryPolicy,
     VideoShaderMode, EQ_BAND_LABELS,
 };
 use crate::db::{delete_account, set_active_account, upsert_account};
@@ -54,7 +54,7 @@ use crate::db::user::{
     get_watched_ids, move_continue_watching_item, pin_to_continue_watching,
     remove_continue_watching, remove_from_watch_later, save_sponsorblock_segments,
     save_user_video_comment, set_video_vote, sort_channels_by, sync_youtube_watched_items,
-    touch_watch_history, upsert_watch_session, AnalysisTab, WatchLaterSource, WatchSessionWrite,
+    touch_watch_history, AnalysisTab, WatchLaterSource,
 };
 use crate::messages::AppMessage;
 use crate::services::auth::{
@@ -70,7 +70,9 @@ use crate::services::ipc::{
     spawn_mpv_ipc_monitor, IpcMonitorConfig, LiveIpcEvent, PlayerCommand,
 };
 use crate::services::remote::start_remote_server;
-use crate::services::shaders::{download_neural_shader_pack, VideoMasteringProfile};
+use crate::services::shaders::{
+    download_artcnn_shader_pack, download_neural_shader_pack, VideoMasteringProfile,
+};
 use crate::services::substyler::SubtitleStyleConfig;
 use crate::services::updater::{
     check_for_updates, cleanup_legacy_update_files, short_sha, spawn_self_update,
@@ -170,11 +172,11 @@ async fn main() -> anyhow::Result<()> {
             Commands::Doctor => {
                 let d = detect_dependencies();
                 println!("Phaenna v{} ({})", env!("CARGO_PKG_VERSION"), env!("PHAENNA_GIT_SHA"));
-                println!("  yt-dlp : {}", if d.has_ytdlp { "READY" } else { "MISSING" });
-                println!("  mpv    : {}", if d.has_mpv { "READY" } else { "MISSING" });
-                println!("  IINA   : {}", if d.has_iina { "READY" } else { "MISSING" });
-                println!("  VLC    : {}", if d.has_vlc { "READY" } else { "MISSING" });
-                println!("  ffmpeg : {}", if d.has_ffmpeg { "READY" } else { "MISSING" });
+                println!("  yt-dlp   : {}", if d.has_ytdlp { "READY" } else { "MISSING" });
+                println!("  mpv      : {}", if d.has_mpv { "READY" } else { "MISSING" });
+                println!("  mpv.net  : {}", if d.has_mpvnet { "READY" } else { "MISSING" });
+                println!("  Celluloid: {}", if d.has_celluloid { "READY" } else { "MISSING" });
+                println!("  ffmpeg   : {}", if d.has_ffmpeg { "READY" } else { "MISSING" });
                 return Ok(());
             }
             Commands::Remote { port } => {
@@ -2691,10 +2693,7 @@ async fn start_nonblocking_playback_with_live_opts(
         .or_else(|| state.stream_ladder_cache.get(&clean_id))
         .filter(|l| l.is_fresh(now_ts))
         .cloned();
-    let direct_stream = if !is_live
-        && local_file.is_none()
-        && matches!(state.config.player, Player::Mpv | Player::Iina)
-    {
+    let direct_stream = if !is_live && local_file.is_none() {
         fresh_ladder.as_ref().and_then(|l| {
             l.select_best_pair(
                 eff_quality,
@@ -2712,7 +2711,6 @@ async fn start_nonblocking_playback_with_live_opts(
         && local_file.is_none()
         && direct_stream.is_none()
         && state.config.auto_abr_downshift
-        && state.config.player == Player::Mpv
     {
         let ck_res = cookies_path.clone();
         let vid_res = video.id.clone();
@@ -2743,11 +2741,7 @@ async fn start_nonblocking_playback_with_live_opts(
         player: state.config.player,
         cookies_path: cookies_path.clone(),
         start_pos,
-        ipc_socket: if state.config.player == Player::Mpv {
-            Some(sock_path.clone())
-        } else {
-            None
-        },
+        ipc_socket: Some(sock_path.clone()),
         subtitles_enabled: state.config.subtitles_enabled,
         sub_lang: Some(state.config.default_sub_lang.clone()),
         sub_url,
@@ -2779,7 +2773,7 @@ async fn start_nonblocking_playback_with_live_opts(
         direct_stream,
         auto_fullscreen: state.config.auto_fullscreen,
         auto_pip: state.config.auto_pip,
-        loading_art_dir: if state.config.player == Player::Mpv && eff_quality != Quality::AudioOnly {
+        loading_art_dir: if eff_quality != Quality::AudioOnly {
             crate::services::loading_art::ensure_y2k_portrait_pack()
                 .map(|p| p.to_string_lossy().into_owned())
         } else {
@@ -2801,7 +2795,7 @@ async fn start_nonblocking_playback_with_live_opts(
     };
 
     match spawn_player(&opts) {
-        Ok(Some(mut child)) => {
+        Ok(Some(_child)) => {
             let ts = now_unix();
             let _ = touch_watch_history(pool, Some(video), &video.id, ts).await;
             state.mark_video_watched(video);
@@ -2881,7 +2875,7 @@ async fn start_nonblocking_playback_with_live_opts(
             };
             state.show_toast(toast_msg);
 
-            if state.config.player == Player::Mpv {
+            {
                 let has_detail_sb = !is_live
                     && !state.detail_sponsor_segments.is_empty()
                     && state
@@ -2937,55 +2931,6 @@ async fn start_nonblocking_playback_with_live_opts(
                     skip_segments: sb_segs,
                     sponsorblock_fetch,
                     sponsor_osd_toast: state.config.sponsorblock_osd_toast,
-                });
-            } else {
-                let p_ext = pool.clone();
-                let vid_ext = video.id.clone();
-                let cid_ext = video.channel_id.clone();
-                let cname_ext = video.display_uploader().to_string();
-                let dur_ext = video.duration.unwrap_or(0) as f64;
-                let start_ext = start_pos.unwrap_or(0.0);
-                let player_lbl = state.config.player.label().to_string();
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
-                    let ended = now_unix();
-                    let raw_elapsed = (ended - ts).max(0) as f64;
-                    let watched = if dur_ext > 0.0 {
-                        raw_elapsed.min(dur_ext)
-                    } else {
-                        raw_elapsed
-                    };
-                    if watched >= 5.0 {
-                        let done = !is_live
-                            && dur_ext >= 60.0
-                            && ((start_ext + watched) / dur_ext) >= 0.85;
-                        let _ = upsert_watch_session(
-                            &p_ext,
-                            &WatchSessionWrite {
-                                video_id: &vid_ext,
-                                channel_id: cid_ext.as_deref(),
-                                channel_name: &cname_ext,
-                                source: "local_external",
-                                started_at: ts,
-                                ended_at: ended,
-                                watched_secs: watched,
-                                media_secs: watched,
-                                start_pos_secs: start_ext,
-                                end_pos_secs: (start_ext + watched).min(if dur_ext > 0.0 {
-                                    dur_ext
-                                } else {
-                                    start_ext + watched
-                                }),
-                                video_duration_secs: dur_ext,
-                                playback_speed: 1.0,
-                                sb_skipped_secs: 0.0,
-                                sb_categories_json: "{}",
-                                player: &player_lbl,
-                                completed: done,
-                            },
-                        )
-                        .await;
-                    }
                 });
             }
         }
@@ -3646,6 +3591,15 @@ async fn execute_hub_action(
             let next = state.config.performance_mode.next();
             apply_performance_mode(state, next);
         }
+        HubActionId::DynamicGovernor => {
+            apply_manual_toggle(state, ManualToggle::GovernorMode);
+        }
+        HubActionId::OrganicGrain => {
+            apply_manual_toggle(state, ManualToggle::OrganicGrain);
+        }
+        HubActionId::InstallArtCnnShaders => {
+            spawn_artcnn_shader_download(state, tx, client);
+        }
         HubActionId::InstallNeuralShaders => {
             spawn_neural_shader_download(state, tx, client);
         }
@@ -4018,6 +3972,23 @@ fn active_mastering_profile(state: &AppState) -> VideoMasteringProfile {
         .unwrap_or(VideoMasteringProfile::StandardHd)
 }
 
+fn spawn_artcnn_shader_download(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    state.show_toast("Downloading ArtCNN-C4F16 light neural 4K shader pack...");
+    let c_s = client.clone();
+    let tx_s = tx.clone();
+    tokio::spawn(async move {
+        let msg = match download_artcnn_shader_pack(&c_s).await {
+            Ok(path) => format!("ArtCNN-C4F16 installed ({})", path.display()),
+            Err(e) => format!("ArtCNN shader download failed: {}", e),
+        };
+        let _ = tx_s.send(AppMessage::ShowToast(msg)).await;
+    });
+}
+
 fn spawn_neural_shader_download(
     state: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
@@ -4121,6 +4092,14 @@ fn apply_manual_toggle(state: &mut AppState, toggle: ManualToggle) {
         ManualToggle::SuperRes => {
             m.super_res = m.super_res.next();
             format!("5K 2x Upscale: {}", m.super_res.label())
+        }
+        ManualToggle::GovernorMode => {
+            m.governor_mode = m.governor_mode.next();
+            format!("Dynamic Governor: {}", m.governor_mode.label())
+        }
+        ManualToggle::OrganicGrain => {
+            m.organic_grain = m.organic_grain.next();
+            format!("Organic Micro-Grain: {}", m.organic_grain.label())
         }
         ManualToggle::CodecPriority => {
             m.codec_priority = m.codec_priority.next();
@@ -4237,8 +4216,8 @@ fn apply_network_mode_exact(state: &mut AppState, next: crate::config::NetworkMo
 
 fn apply_content_profile(state: &mut AppState, profile: ContentProfile) {
     use crate::config::{
-        CodecPriority, DebandTier, DemuxerCachePreset, GlslStageMode, GpuScalerMode, HwdecMode,
-        SuperResMode, ToneMapMode,
+        CodecPriority, DebandTier, DemuxerCachePreset, DynamicGovernorMode, GlslStageMode,
+        GpuScalerMode, HwdecMode, OrganicGrainTier, SuperResMode, ToneMapMode,
     };
     match profile {
         ContentProfile::Cinema24p => {
@@ -4257,14 +4236,16 @@ fn apply_content_profile(state: &mut AppState, profile: ContentProfile) {
             state.config.motion_mode = MotionMode::Off;
             state.config.manual_mastering = ManualMasteringConfig {
                 super_res: SuperResMode::Auto1080p,
-                codec_priority: CodecPriority::Vp9HwFirst,
-                hwdec: HwdecMode::AutoSafe,
+                codec_priority: CodecPriority::AutoSilicon,
+                hwdec: HwdecMode::AutoZeroCopy,
                 hdr_compute_peak: false,
                 tone_map: ToneMapMode::Spline,
                 glsl_stage: GlslStageMode::FullMastering,
                 deband: DebandTier::OnePassCool,
                 gpu_scaler: GpuScalerMode::EwaLanczos,
                 demuxer_cache: DemuxerCachePreset::Medium160M,
+                organic_grain: OrganicGrainTier::Subtle,
+                governor_mode: DynamicGovernorMode::Auto,
             };
         }
         ContentProfile::CrispCode => {
@@ -4273,14 +4254,16 @@ fn apply_content_profile(state: &mut AppState, profile: ContentProfile) {
             state.config.motion_mode = MotionMode::Off;
             state.config.manual_mastering = ManualMasteringConfig {
                 super_res: SuperResMode::Off,
-                codec_priority: CodecPriority::Vp9HwFirst,
-                hwdec: HwdecMode::VideoToolbox,
+                codec_priority: CodecPriority::AutoSilicon,
+                hwdec: HwdecMode::AutoZeroCopy,
                 hdr_compute_peak: false,
                 tone_map: ToneMapMode::Spline,
                 glsl_stage: GlslStageMode::LightCas,
                 deband: DebandTier::Off,
                 gpu_scaler: GpuScalerMode::Spline36,
                 demuxer_cache: DemuxerCachePreset::Medium160M,
+                organic_grain: OrganicGrainTier::Off,
+                governor_mode: DynamicGovernorMode::CoolGuard,
             };
         }
         ContentProfile::CoolBattery => {
@@ -4970,6 +4953,9 @@ async fn apply_play_options_hit(
         }
         PlayOptionsHit::DownloadNeuralShaders => {
             spawn_neural_shader_download(state, tx, client);
+        }
+        PlayOptionsHit::DownloadArtCnnShaders => {
+            spawn_artcnn_shader_download(state, tx, client);
         }
         PlayOptionsHit::ScrollAudioTracks(delta) => {
             let total = state.live_playback.audio_tracks.len();

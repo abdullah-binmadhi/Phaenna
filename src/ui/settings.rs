@@ -23,7 +23,10 @@ pub enum HubActionId {
     SponsorBlockMode,
     VideoShaders,
     PerformanceMode,
+    DynamicGovernor,
+    OrganicGrain,
     InstallNeuralShaders,
+    InstallArtCnnShaders,
     SubtitlesEnabled,
     SubtitlePreset,
     SubtitleCollisionGuard,
@@ -63,9 +66,9 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             id: HubActionId::PlayerBackend,
             category: "▶ PLAYBACK & STREAMING",
             label: "Video Player Engine",
-            keywords: "player mpv iina vlc browser backend hwdec",
+            keywords: "player mpv mpvnet celluloid libmpv auto hwdec",
             badge: format!("[ {} ▾ ]", cfg.player.label()),
-            description: "Choose non-blocking playback engine. mpv unlocks IPC resume & SponsorBlock.",
+            description: "Choose libmpv playback engine (Auto-Best, mpv, mpv.net Windows, Celluloid Linux) with full shader, HUD & IPC parity.",
         },
         HubItem {
             id: HubActionId::AutoFullscreen,
@@ -127,9 +130,37 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             id: HubActionId::PerformanceMode,
             category: "VIDEO & SUBTITLE MASTERING",
             label: "Playback Performance Mode (RAM / GPU)",
-            keywords: "performance efficient balanced quality eco ram memory cache battery",
+            keywords: "performance efficient balanced quality eco ram memory cache battery thermal",
             badge: format!("[ {} · {} ▾ ]", cfg.performance_mode.label(), cfg.performance_mode.short_badge()),
-            description: "Switch Efficient (~350MB RAM), Balanced (~650MB RAM), or Quality (~1.4GB RAM 4K Master).",
+            description: "Switch Efficient (Cool Battery), Balanced (4:4:4 Cool), Quality (Adaptive Uncompressed 4K), or Manual.",
+        },
+        HubItem {
+            id: HubActionId::DynamicGovernor,
+            category: "VIDEO & SUBTITLE MASTERING",
+            label: "Dynamic Thermal & BPP Governor",
+            keywords: "governor thermal heat cpu gpu auto cool battery smart cadence bpp",
+            badge: format!("[ {} ▾ ]", cfg.effective_mastering().governor_mode.label()),
+            description: "Automatically adapts shader deblock, deband, 120Hz cadence & thermal step-down to live stream BPP & device headroom.",
+        },
+        HubItem {
+            id: HubActionId::OrganicGrain,
+            category: "VIDEO & SUBTITLE MASTERING",
+            label: "Organic Uncompressed Micro-Grain",
+            keywords: "grain film uncompressed banding texture detail master pts",
+            badge: format!("[ {} ▾ ]", cfg.effective_mastering().organic_grain.label()),
+            description: "Cycle PTS-seeded midtone micro-grain (OFF / Subtle Studio / Cinema Film) for uncompressed-grade texture & zero 8-bit banding.",
+        },
+        HubItem {
+            id: HubActionId::InstallArtCnnShaders,
+            category: "VIDEO & SUBTITLE MASTERING",
+            label: "Download ArtCNN-C4F16 Light Neural Pack",
+            keywords: "artcnn neural cnn download shader 4k upscale light fast install",
+            badge: if crate::services::shaders::artcnn_shader_installed() {
+                "[ INSTALLED ]".to_string()
+            } else {
+                "[ Download ]".to_string()
+            },
+            description: "Download ArtCNN_C4F16.glsl (~45% lighter GPU compute than FSRCNNX with crisp natural texture).",
         },
         HubItem {
             id: HubActionId::InstallNeuralShaders,

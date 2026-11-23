@@ -90,13 +90,14 @@ impl Quality {
     }
 
     pub fn video_selectors(self) -> &'static [&'static str] {
-        self.video_selectors_for_codec(CodecPriority::Av1First)
+        self.video_selectors_for_codec(CodecPriority::AutoSilicon)
     }
 
     pub fn video_selectors_for_codec(self, codec: CodecPriority) -> &'static [&'static str] {
+        let resolved = codec.resolve_for_host();
         match self {
-            Quality::Best => match codec {
-                CodecPriority::Vp9HwFirst => &[
+            Quality::Best => match resolved {
+                CodecPriority::Vp9HwFirst | CodecPriority::AutoSilicon => &[
                     "bestvideo[height<=?4320][vcodec^=vp9]",
                     "bestvideo[height<=?4320][vcodec^=hev]",
                     "bestvideo[height<=?4320][vcodec^=avc]",
@@ -127,7 +128,7 @@ impl Quality {
         dub_lang: &str,
         multistreams: bool,
     ) -> String {
-        self.ytdl_format_with_dub_and_codec(dub, dub_lang, multistreams, CodecPriority::Av1First)
+        self.ytdl_format_with_dub_and_codec(dub, dub_lang, multistreams, CodecPriority::AutoSilicon)
     }
 
     /// Build a `yt-dlp` format selector honoring audio dubs, multi-stream loading, and codec priority.
@@ -238,8 +239,8 @@ impl Quality {
             DubPreference::PreferDubbed => return self.ytdl_format_for_network(dub, dub_lang, multistreams, codec, net),
         };
         let h = self.max_height_or_default(4320);
-        let v_order = match codec {
-            CodecPriority::Vp9HwFirst => ["vp9", "hev", "avc"],
+        let v_order = match codec.resolve_for_host() {
+            CodecPriority::Vp9HwFirst | CodecPriority::AutoSilicon => ["vp9", "hev", "avc"],
             CodecPriority::Av1First => ["av01", "vp9", "avc"],
         };
         let mut v_parts: Vec<String> = v_order
@@ -443,14 +444,6 @@ impl NetworkMode {
         !matches!(self, Self::Normal)
     }
 
-    pub const fn vlc_network_caching_ms(self) -> u32 {
-        match self {
-            Self::Normal => 3000,
-            Self::CongestedWifi => 8000,
-            Self::UltraSaver => 12000,
-        }
-    }
-
     pub const fn live_hls_bitrate(self) -> &'static str {
         match self {
             Self::Normal => "max",
@@ -472,47 +465,49 @@ impl NetworkMode {
     }
 }
 
-/// Supported playback engines across macOS, Linux, and Windows.
+/// Supported `libmpv`-parity playback engines across Windows, Linux, and macOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Player {
     #[default]
+    #[serde(alias = "auto", alias = "iina", alias = "vlc", alias = "browser")]
+    AutoBest,
     Mpv,
-    Iina,
-    Vlc,
-    Browser,
+    #[serde(alias = "mpv.net", alias = "mpv_net")]
+    MpvNet,
+    Celluloid,
 }
 
 #[allow(dead_code)]
 impl Player {
     pub const fn all() -> [Player; 4] {
-        [Player::Mpv, Player::Iina, Player::Vlc, Player::Browser]
+        [Player::AutoBest, Player::Mpv, Player::MpvNet, Player::Celluloid]
     }
 
     pub const fn next(self) -> Self {
         match self {
-            Player::Mpv => Player::Iina,
-            Player::Iina => Player::Vlc,
-            Player::Vlc => Player::Browser,
-            Player::Browser => Player::Mpv,
+            Player::AutoBest => Player::Mpv,
+            Player::Mpv => Player::MpvNet,
+            Player::MpvNet => Player::Celluloid,
+            Player::Celluloid => Player::AutoBest,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            Player::Mpv => "MPV (IPC + Hardware Accel)",
-            Player::Iina => "IINA (macOS Native)",
-            Player::Vlc => "VLC Media Player",
-            Player::Browser => "System Web Browser",
+            Player::AutoBest => "Auto-Best (libmpv Parity)",
+            Player::Mpv => "MPV (Universal · 100% Parity)",
+            Player::MpvNet => "mpv.net (Windows · 99% Parity)",
+            Player::Celluloid => "Celluloid (Linux GTK · 95%)",
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Player::AutoBest => "auto",
             Player::Mpv => "mpv",
-            Player::Iina => "iina",
-            Player::Vlc => "vlc",
-            Player::Browser => "browser",
+            Player::MpvNet => "mpvnet",
+            Player::Celluloid => "celluloid",
         }
     }
 }
@@ -1078,11 +1073,12 @@ impl SuperResMode {
     }
 }
 
-/// Hardware-friendly VP9/HEVC priority vs. maximum-compression AV1 priority.
+/// Hardware-optimal silicon auto-selection vs explicit VP9/HEVC or AV1 priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CodecPriority {
     #[default]
+    AutoSilicon,
     Vp9HwFirst,
     Av1First,
 }
@@ -1090,21 +1086,33 @@ pub enum CodecPriority {
 impl CodecPriority {
     pub const fn next(self) -> Self {
         match self {
+            Self::AutoSilicon => Self::Vp9HwFirst,
             Self::Vp9HwFirst => Self::Av1First,
-            Self::Av1First => Self::Vp9HwFirst,
+            Self::Av1First => Self::AutoSilicon,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::AutoSilicon => "Auto-Silicon (HW Optimal)",
             Self::Vp9HwFirst => "VP9/HEVC HW (Cool)",
             Self::Av1First => "AV1 First (Max Comp)",
         }
     }
 
-    pub const fn format_sort_vcodec(self) -> &'static str {
+    /// Resolves `AutoSilicon` dynamically against the detected host GPU/Media Engine.
+    pub fn resolve_for_host(self) -> Self {
         match self {
-            Self::Vp9HwFirst => "vp9.2:vp9:h264:av01",
+            Self::AutoSilicon => {
+                crate::services::platform::detect_device_profile().recommended_codec_priority()
+            }
+            other => other,
+        }
+    }
+
+    pub fn format_sort_vcodec(self) -> &'static str {
+        match self.resolve_for_host() {
+            Self::Vp9HwFirst | Self::AutoSilicon => "vp9.2:vp9:h264:av01",
             Self::Av1First => "av01:vp9.2:vp9",
         }
     }
@@ -1115,6 +1123,7 @@ impl CodecPriority {
 #[serde(rename_all = "snake_case")]
 pub enum HwdecMode {
     #[default]
+    AutoZeroCopy,
     VideoToolbox,
     AutoSafe,
     Off,
@@ -1123,14 +1132,16 @@ pub enum HwdecMode {
 impl HwdecMode {
     pub const fn next(self) -> Self {
         match self {
+            Self::AutoZeroCopy => Self::VideoToolbox,
             Self::VideoToolbox => Self::AutoSafe,
             Self::AutoSafe => Self::Off,
-            Self::Off => Self::VideoToolbox,
+            Self::Off => Self::AutoZeroCopy,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::AutoZeroCopy => "Auto Zero-Copy HW",
             Self::VideoToolbox => "VideoToolbox HW",
             Self::AutoSafe => "Auto-Safe HW",
             Self::Off => "OFF (Software CPU)",
@@ -1139,6 +1150,7 @@ impl HwdecMode {
 
     pub const fn mpv_value(self) -> &'static str {
         match self {
+            Self::AutoZeroCopy => "auto-safe",
             Self::VideoToolbox => {
                 if cfg!(target_os = "macos") {
                     "videotoolbox"
@@ -1148,6 +1160,94 @@ impl HwdecMode {
             }
             Self::AutoSafe => "auto-safe",
             Self::Off => "no",
+        }
+    }
+
+    /// Resolves `AutoZeroCopy` dynamically to the host's native zero-copy decoder.
+    pub fn effective_mpv_value(self) -> &'static str {
+        match self {
+            Self::AutoZeroCopy => {
+                crate::services::platform::detect_device_profile().recommended_hwdec
+            }
+            other => other.mpv_value(),
+        }
+    }
+}
+
+/// Luminance-weighted temporal micro-grain restoration tier (`0` cost ~2 ALU ops/px).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganicGrainTier {
+    Off,
+    #[default]
+    Subtle,
+    Cinema,
+}
+
+#[allow(dead_code)]
+impl OrganicGrainTier {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Subtle,
+            Self::Subtle => Self::Cinema,
+            Self::Cinema => Self::Off,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Subtle => "Subtle Studio (Default)",
+            Self::Cinema => "Cinema Film",
+        }
+    }
+
+    pub const fn luma_strength(self) -> f32 {
+        match self {
+            Self::Off => 0.0,
+            Self::Subtle => 0.008,
+            Self::Cinema => 0.014,
+        }
+    }
+}
+
+/// Real-time thermal, power & stream BPP governor aggressiveness inside `mpv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicGovernorMode {
+    #[default]
+    Auto,
+    CoolGuard,
+    MaxLocked,
+    Off,
+}
+
+#[allow(dead_code)]
+impl DynamicGovernorMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::CoolGuard,
+            Self::CoolGuard => Self::MaxLocked,
+            Self::MaxLocked => Self::Off,
+            Self::Off => Self::Auto,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO · Smart Uncompressed",
+            Self::CoolGuard => "COOL GUARD · Battery/Quiet",
+            Self::MaxLocked => "MAX LOCKED · Override",
+            Self::Off => "OFF (Static Preset)",
+        }
+    }
+
+    pub const fn mpv_opt_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CoolGuard => "cool",
+            Self::MaxLocked => "max",
+            Self::Off => "off",
         }
     }
 }
@@ -1340,6 +1440,10 @@ pub struct ManualMasteringConfig {
     pub gpu_scaler: GpuScalerMode,
     #[serde(default)]
     pub demuxer_cache: DemuxerCachePreset,
+    #[serde(default)]
+    pub organic_grain: OrganicGrainTier,
+    #[serde(default)]
+    pub governor_mode: DynamicGovernorMode,
 }
 
 impl Default for ManualMasteringConfig {
@@ -1353,36 +1457,42 @@ impl ManualMasteringConfig {
         match mode {
             PerformanceMode::Efficient => Self {
                 super_res: SuperResMode::Off,
-                codec_priority: CodecPriority::Vp9HwFirst,
-                hwdec: HwdecMode::VideoToolbox,
+                codec_priority: CodecPriority::AutoSilicon,
+                hwdec: HwdecMode::AutoZeroCopy,
                 hdr_compute_peak: false,
                 tone_map: ToneMapMode::Spline,
                 glsl_stage: GlslStageMode::LightCas,
                 deband: DebandTier::Off,
                 gpu_scaler: GpuScalerMode::Spline36,
                 demuxer_cache: DemuxerCachePreset::Small48M,
+                organic_grain: OrganicGrainTier::Off,
+                governor_mode: DynamicGovernorMode::CoolGuard,
             },
             PerformanceMode::Balanced | PerformanceMode::Manual => Self {
                 super_res: SuperResMode::Off,
-                codec_priority: CodecPriority::Vp9HwFirst,
-                hwdec: HwdecMode::VideoToolbox,
+                codec_priority: CodecPriority::AutoSilicon,
+                hwdec: HwdecMode::AutoZeroCopy,
                 hdr_compute_peak: false,
                 tone_map: ToneMapMode::Spline,
                 glsl_stage: GlslStageMode::Guided444,
                 deband: DebandTier::OnePassCool,
                 gpu_scaler: GpuScalerMode::Spline36,
                 demuxer_cache: DemuxerCachePreset::Medium160M,
+                organic_grain: OrganicGrainTier::Subtle,
+                governor_mode: DynamicGovernorMode::Auto,
             },
             PerformanceMode::Quality => Self {
-                super_res: SuperResMode::Always2x,
-                codec_priority: CodecPriority::Av1First,
-                hwdec: HwdecMode::AutoSafe,
+                super_res: SuperResMode::Auto1080p,
+                codec_priority: CodecPriority::AutoSilicon,
+                hwdec: HwdecMode::AutoZeroCopy,
                 hdr_compute_peak: true,
                 tone_map: ToneMapMode::Spline,
                 glsl_stage: GlslStageMode::FullMastering,
                 deband: DebandTier::ThreePassStudio,
-                gpu_scaler: GpuScalerMode::EwaLanczosSharp,
+                gpu_scaler: GpuScalerMode::EwaLanczos,
                 demuxer_cache: DemuxerCachePreset::Large512M,
+                organic_grain: OrganicGrainTier::Subtle,
+                governor_mode: DynamicGovernorMode::Auto,
             },
         }
     }
@@ -2138,7 +2248,7 @@ mod tests {
 
         let cfg = Config {
             quality: Quality::P1440,
-            player: Player::Iina,
+            player: Player::Celluloid,
             sponsorblock_mode: SponsorBlockMode::SponsorOnly,
             shader_mode: VideoShaderMode::Reference4K,
             theme_index: 4,
@@ -2148,14 +2258,19 @@ mod tests {
 
         let loaded = Config::load_from_path(&cfg_path).unwrap();
         assert_eq!(loaded.quality, Quality::P1440);
-        assert_eq!(loaded.player, Player::Iina);
+        assert_eq!(loaded.player, Player::Celluloid);
         assert_eq!(loaded.sponsorblock_mode, SponsorBlockMode::SponsorOnly);
         assert_eq!(loaded.shader_mode, VideoShaderMode::Reference4K);
         assert_eq!(loaded.theme_index, 4);
 
-        // Legacy TOML alias compatibility (`"ultra"` -> `Reference4K`)
-        let legacy: Config = toml::from_str("shader_mode = \"ultra\"\n").unwrap();
+        // Legacy TOML alias compatibility (`"ultra"` -> `Reference4K`, `iina`/`vlc`/`browser` -> `AutoBest`)
+        let legacy: Config = toml::from_str("shader_mode = \"ultra\"\nplayer = \"iina\"\n").unwrap();
         assert_eq!(legacy.shader_mode, VideoShaderMode::Reference4K);
+        assert_eq!(legacy.player, Player::AutoBest);
+        let legacy_vlc: Config = toml::from_str("player = \"vlc\"\n").unwrap();
+        assert_eq!(legacy_vlc.player, Player::AutoBest);
+        let legacy_br: Config = toml::from_str("player = \"browser\"\n").unwrap();
+        assert_eq!(legacy_br.player, Player::AutoBest);
     }
 
     #[test]
@@ -2244,24 +2359,29 @@ mod tests {
         assert_eq!(PerformanceMode::Manual.next(), PerformanceMode::Efficient);
         assert_eq!(PerformanceMode::Manual.short_badge(), "MAN");
 
-        // Balanced preset is tuned cool for fanless Apple Silicon
+        // Balanced preset is tuned cool with AutoSilicon + Subtle Organic Grain ON by default
         let bal = ManualMasteringConfig::from_preset(PerformanceMode::Balanced);
         assert_eq!(bal.super_res, SuperResMode::Off);
-        assert_eq!(bal.codec_priority, CodecPriority::Vp9HwFirst);
-        assert_eq!(bal.hwdec, HwdecMode::VideoToolbox);
+        assert_eq!(bal.codec_priority, CodecPriority::AutoSilicon);
+        assert_eq!(bal.hwdec, HwdecMode::AutoZeroCopy);
         assert!(!bal.hdr_compute_peak);
         assert_eq!(bal.glsl_stage, GlslStageMode::Guided444);
         assert_eq!(bal.deband, DebandTier::OnePassCool);
         assert_eq!(bal.gpu_scaler, GpuScalerMode::Spline36);
+        assert_eq!(bal.organic_grain, OrganicGrainTier::Subtle);
+        assert_eq!(bal.governor_mode, DynamicGovernorMode::Auto);
 
-        // Quality preset stays unchanged at full mastering Fidelity
+        // Quality (MAX) preset uses AutoSilicon, AutoZeroCopy, conditional 1080p 2x, EWA Lanczos & Subtle Grain
         let qual = ManualMasteringConfig::from_preset(PerformanceMode::Quality);
-        assert_eq!(qual.super_res, SuperResMode::Always2x);
-        assert_eq!(qual.codec_priority, CodecPriority::Av1First);
+        assert_eq!(qual.super_res, SuperResMode::Auto1080p);
+        assert_eq!(qual.codec_priority, CodecPriority::AutoSilicon);
+        assert_eq!(qual.hwdec, HwdecMode::AutoZeroCopy);
         assert!(qual.hdr_compute_peak);
         assert_eq!(qual.glsl_stage, GlslStageMode::FullMastering);
         assert_eq!(qual.deband, DebandTier::ThreePassStudio);
-        assert_eq!(qual.gpu_scaler, GpuScalerMode::EwaLanczosSharp);
+        assert_eq!(qual.gpu_scaler, GpuScalerMode::EwaLanczos);
+        assert_eq!(qual.organic_grain, OrganicGrainTier::Subtle);
+        assert_eq!(qual.governor_mode, DynamicGovernorMode::Auto);
 
         let vp9_fmt = Quality::Best.ytdl_format_with_dub_and_codec(
             DubPreference::OriginalOnly,

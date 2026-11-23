@@ -19,8 +19,8 @@ use tokio::process::{Child, Command};
 pub struct DependencyStatus {
     pub has_ytdlp: bool,
     pub has_mpv: bool,
-    pub has_iina: bool,
-    pub has_vlc: bool,
+    pub has_mpvnet: bool,
+    pub has_celluloid: bool,
     pub has_ffmpeg: bool,
 }
 
@@ -75,13 +75,20 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        if name == "iina" || name == "iina-cli" {
-            extras.push(PathBuf::from("/Applications/IINA.app/Contents/MacOS/iina-cli"));
-            extras.push(PathBuf::from("/Applications/IINA.app/Contents/MacOS/IINA"));
-        } else if name == "vlc" {
-            extras.push(PathBuf::from("/Applications/VLC.app/Contents/MacOS/VLC"));
-        } else if name == "mpv" {
+        if name == "mpv" {
             extras.push(PathBuf::from("/Applications/mpv.app/Contents/MacOS/mpv"));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if name == "mpvnet" || name == "mpv.net" {
+            if let Some(local) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+                extras.push(local.join("Programs/mpv.net/mpvnet.exe"));
+            }
+            extras.push(PathBuf::from(r"C:\Program Files\mpv.net\mpvnet.exe"));
+        } else if name == "mpv" {
+            extras.push(PathBuf::from(r"C:\Program Files\mpv\mpv.exe"));
         }
     }
 
@@ -91,18 +98,15 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 pub fn detect_dependencies() -> DependencyStatus {
     let has_ytdlp = find_binary("yt-dlp").is_some();
     let has_mpv = find_binary("mpv").is_some();
-    let has_iina = find_binary("iina-cli").is_some()
-        || find_binary("iina").is_some()
-        || Path::new("/Applications/IINA.app").exists();
-    let has_vlc = find_binary("vlc").is_some()
-        || Path::new("/Applications/VLC.app").exists();
+    let has_mpvnet = find_binary("mpvnet").is_some() || find_binary("mpv.net").is_some();
+    let has_celluloid = find_binary("celluloid").is_some();
     let has_ffmpeg = find_binary("ffmpeg").is_some();
 
     DependencyStatus {
         has_ytdlp,
         has_mpv,
-        has_iina,
-        has_vlc,
+        has_mpvnet,
+        has_celluloid,
         has_ffmpeg,
     }
 }
@@ -228,6 +232,7 @@ p script-binding phaenna-toggle-pip
 P script-binding phaenna-cycle-pip-corner
 i script-binding phaenna-toggle-hud
 I script-binding phaenna-pin-hud
+g script-binding phaenna-cycle-governor
 F1 script-binding stats/display-stats-toggle
 L script-binding phaenna-snap-live-edge
 "#;
@@ -674,7 +679,241 @@ mp.add_forced_key_binding("p", "phaenna-toggle-pip", toggle_pip)
 mp.add_forced_key_binding("P", "phaenna-cycle-pip-corner", cycle_pip_corner)
 
 -- =============================================================================
--- 3. Multi-Color Curated Bento Video Info HUD ([i] 6s / [I] Pinned 1Hz)
+-- 3 & 4. Dynamic Thermal/BPP/Cadence Governor + Multi-Color Bento HUD
+-- =============================================================================
+local gov_mode = mp.get_opt("phaenna_gov") or "auto"
+local perf_mode = mp.get_opt("phaenna_perf") or "BAL"
+local base_grain = tonumber(mp.get_opt("phaenna_grain") or "0.008") or 0.008
+local has_shader_opts = (mp.get_opt("phaenna_shader_opts") or "1") == "1"
+local motion_mode = mp.get_opt("phaenna_motion") or "cadence"
+local device_lbl = esc_ass(mp.get_opt("phaenna_device") or "Host Auto")
+
+local host_on_battery = false
+local host_batt_pct = nil
+local host_therm_tier = 0
+local host_temp_c = nil
+
+local gov_tier = 0
+local last_drops = 0
+local last_step_up_time = 0
+local live_bpp = 0.0
+local live_scale_ratio = 1.0
+local live_deb_amt = 0.25
+local live_grain_amt = base_grain
+local live_cadence_on = false
+local live_gov_reason = "COOL"
+
+local prev_shader_opts = nil
+local prev_deband = nil
+local prev_deband_iters = nil
+local prev_interp = nil
+local prev_sync = nil
+local prev_peak = nil
+
+local function set_prop_diff(cache_val, prop, new_val, is_bool)
+    if cache_val == new_val then return cache_val end
+    if is_bool then
+        mp.set_property_bool(prop, new_val)
+    else
+        mp.set_property(prop, tostring(new_val))
+    end
+    return new_val
+end
+
+local function governor_tier_badge()
+    if gov_mode == "off" then return "GOV: OFF" end
+    if gov_tier == 3 then return "GOV: PiP/MIN SLEEP" end
+    if gov_tier == 2 then return "GOV: TIER 2 THROTTLE" end
+    if gov_tier == 1 then return "GOV: TIER 1 COOL" end
+    return "GOV: TIER 0 · OPTIMAL"
+end
+
+local function governor_tick()
+    local vw = mp.get_property_number("width", 0) or 0
+    local vh = mp.get_property_number("height", 0) or 0
+    local fps = mp.get_property_number("estimated-vf-fps", 0) or 0
+    if fps <= 0 then fps = mp.get_property_number("container-fps", 0) or 0 end
+    local vbit = mp.get_property_number("video-bitrate", 0) or 0
+    local disp_fps = mp.get_property_number("display-fps", 0) or 0
+    local osd_w = mp.get_property_number("osd-width", 0) or 0
+    local sig_peak = mp.get_property_number("video-params/sig-peak", 1.0) or 1.0
+    local pixfmt = tostring(mp.get_property("video-params/pixelformat", "") or ""):lower()
+
+    if vw > 0 and vh > 0 and fps > 0 and vbit > 0 then
+        live_bpp = vbit / (vw * vh * fps)
+    else
+        live_bpp = 0.085
+    end
+    live_scale_ratio = (vw > 0 and osd_w > 0) and (osd_w / vw) or 1.0
+
+    if gov_mode == "off" then
+        live_gov_reason = "Static"
+        return
+    end
+
+    local minimized = mp.get_property_bool("window-minimized", false)
+    local drops_now = (mp.get_property_number("decoder-frame-drop-count", 0) or 0)
+                    + (mp.get_property_number("frame-drop-count", 0) or 0)
+    local drop_delta = math.max(0, drops_now - last_drops)
+    last_drops = drops_now
+
+    local want_tier = 0
+    live_gov_reason = "Optimal"
+    if minimized or pip_active then
+        want_tier = 3
+        live_gov_reason = minimized and "Minimized" or "PiP Saver"
+    elseif gov_mode == "max" then
+        want_tier = 0
+        live_gov_reason = "Max Lock"
+    else
+        if drop_delta >= 3 then
+            want_tier = math.max(want_tier, 2)
+            live_gov_reason = "Drop Guard"
+        end
+        if host_therm_tier >= 2 then
+            want_tier = math.max(want_tier, 2)
+            live_gov_reason = "Thermal Guard"
+        elseif host_therm_tier == 1 or gov_mode == "cool" or host_on_battery then
+            want_tier = math.max(want_tier, 1)
+            live_gov_reason = host_on_battery and "Battery Opt" or "Cool Guard"
+        end
+    end
+
+    local now_t = mp.get_time()
+    if want_tier > gov_tier then
+        gov_tier = want_tier
+        last_step_up_time = now_t
+    elseif want_tier < gov_tier then
+        if want_tier == 0 and gov_tier < 3 and (now_t - last_step_up_time) < 6.0 then
+            -- 6-second hysteresis prevents rapid thermal oscillation
+        else
+            gov_tier = want_tier
+        end
+    end
+
+    local is_hdr = sig_peak > 1.05
+    local is_10bit = (pixfmt:find("10") ~= nil) or (pixfmt:find("p010") ~= nil) or (pixfmt:find("16") ~= nil)
+
+    local deb = 0.0
+    local det = 0.0
+    local cas = 0.22
+    local grn = 0.0
+
+    if minimized then
+        deb = 0.0; det = 0.0; cas = 0.0; grn = 0.0
+    elseif perf_mode == "ECO" or pip_active then
+        deb = 0.0; det = 0.0; cas = pip_active and 0.12 or 0.14; grn = 0.0
+    else
+        -- Clean high-BPP 4K needs zero blurring; starved 1080p gets strong deblock
+        if live_bpp >= 0.14 then
+            deb = 0.00
+        elseif live_bpp >= 0.09 then
+            deb = 0.22
+        elseif live_bpp >= 0.06 then
+            deb = 0.36
+        else
+            deb = 0.56
+        end
+        if gov_tier >= 2 then deb = deb * 0.5 end
+
+        if perf_mode == "MAX" then
+            det = (gov_tier == 0) and 0.12 or ((gov_tier == 1) and 0.07 or 0.0)
+            cas = (live_scale_ratio > 1.25) and 0.30 or ((live_scale_ratio > 1.02) and 0.24 or 0.16)
+        else
+            det = (gov_tier == 0) and 0.08 or 0.0
+            cas = (live_scale_ratio > 1.25) and 0.24 or 0.18
+        end
+        if gov_tier >= 2 then cas = 0.14 end
+
+        if gov_tier < 2 then
+            grn = base_grain
+            if (not is_10bit) and live_bpp < 0.08 and grn > 0 then
+                grn = math.min(0.016, grn + 0.002)
+            end
+        end
+    end
+
+    live_deb_amt = deb
+    live_grain_amt = grn
+
+    if has_shader_opts then
+        local opts_str = string.format(
+            "deblock_amt=%.2f,cas_amt=%.2f,detail_lift=%.2f,grain_amt=%.3f",
+            deb, cas, det, grn
+        )
+        prev_shader_opts = set_prop_diff(prev_shader_opts, "glsl-shader-opts", opts_str, false)
+    end
+
+    if perf_mode ~= "ECO" then
+        local want_deband = (not minimized)
+            and (not pip_active)
+            and (gov_tier < 2)
+            and (not (is_10bit and live_bpp >= 0.14))
+        local deband_s = want_deband and "yes" or "no"
+        prev_deband = set_prop_diff(prev_deband, "deband", deband_s, false)
+        if want_deband then
+            local iters = (perf_mode == "MAX" and live_bpp < 0.10 and gov_tier == 0) and 2 or 1
+            if prev_deband_iters ~= iters then
+                mp.set_property_number("deband-iterations", iters)
+                prev_deband_iters = iters
+            end
+        end
+
+        local want_peak = (is_hdr and gov_tier == 0) and "yes" or "no"
+        prev_peak = set_prop_diff(prev_peak, "hdr-compute-peak", want_peak, false)
+
+        if motion_mode == "cadence" then
+            local ratio = (disp_fps > 0 and fps > 0) and (disp_fps / fps) or 1.0
+            local nearest = math.max(1.0, math.floor(ratio + 0.5))
+            local is_integer_cadence = (math.abs(ratio - nearest) / nearest) <= 0.018
+            local want_interp = (not is_integer_cadence) and (not pip_active) and (not minimized) and (gov_tier == 0)
+            live_cadence_on = want_interp
+            local sync_mode = want_interp and "display-resample" or "audio"
+            prev_sync = set_prop_diff(prev_sync, "video-sync", sync_mode, false)
+            prev_interp = set_prop_diff(prev_interp, "interpolation", want_interp, true)
+        elseif motion_mode == "smooth120" then
+            local want_smooth = (not pip_active) and (not minimized) and (gov_tier < 2)
+            live_cadence_on = want_smooth
+            prev_sync = set_prop_diff(prev_sync, "video-sync", want_smooth and "display-resample" or "audio", false)
+            prev_interp = set_prop_diff(prev_interp, "interpolation", want_smooth, true)
+        end
+    end
+end
+
+local function cycle_governor_mode()
+    if gov_mode == "auto" then
+        gov_mode = "cool"
+    elseif gov_mode == "cool" then
+        gov_mode = "max"
+    elseif gov_mode == "max" then
+        gov_mode = "off"
+    else
+        gov_mode = "auto"
+    end
+    governor_tick()
+    mp.osd_message("◈ Dynamic Governor: " .. string.upper(gov_mode) .. " (" .. live_gov_reason .. ")", 2.2)
+end
+
+mp.add_forced_key_binding("g", "phaenna-cycle-governor", cycle_governor_mode)
+mp.register_script_message("phaenna-set-governor", function(mode)
+    if mode and mode ~= "" then
+        gov_mode = mode
+        governor_tick()
+    end
+end)
+mp.register_script_message("phaenna-host-thermal", function(batt_s, pct_s, tier_s, temp_s)
+    host_on_battery = (batt_s == "1" or batt_s == "true")
+    host_batt_pct = tonumber(pct_s or "")
+    host_therm_tier = tonumber(tier_s or "0") or 0
+    host_temp_c = tonumber(temp_s or "")
+    governor_tick()
+end)
+
+mp.add_periodic_timer(2.0, governor_tick)
+mp.register_event("file-loaded", governor_tick)
+
+-- =============================================================================
+-- Multi-Color Curated Bento Video Info HUD ([i] 6s / [I] Pinned 1Hz)
 -- =============================================================================
 local hud_visible = false
 local hud_pinned = false
@@ -721,8 +960,6 @@ local function render_info_hud()
     local vbit = mp.get_property_number("video-bitrate", 0) or 0
     local hwdec = esc_ass(mp.get_property("hwdec-current", ""))
     local drops = (mp.get_property_number("decoder-frame-drop-count", 0) or 0) + (mp.get_property_number("frame-drop-count", 0) or 0)
-    local vo = esc_ass(mp.get_property("current-vo", "gpu-next"))
-    local avs = mp.get_property_number("avsync", 0) or 0
     local cm = esc_ass(mp.get_property("video-params/colormatrix", "auto"))
 
     local acodec = esc_ass(mp.get_property("audio-codec-name", mp.get_property("audio-codec", "—"))):upper()
@@ -745,12 +982,20 @@ local function render_info_hud()
     local q_tag = (vh >= 2160 and "4K UHD") or (vh >= 1440 and "1440p QHD") or (vh >= 1080 and "1080p FHD") or (vh >= 720 and "720p HD") or "Stream"
     local win_badge = pip_active and "PIP FLOAT" or (mp.get_property_bool("fullscreen", false) and "FULLSCREEN" or "WINDOWED")
     local pin_badge = hud_pinned and "PINNED 1Hz" or "AUTO 6s"
-    local hw_lbl = (hwdec ~= "" and hwdec ~= "no") and ("GPU · " .. hwdec) or "CPU Software"
-    local hw_col = (hwdec ~= "" and hwdec ~= "no") and "&H99D334&" or "&H24BFFB&"
+    local gov_badge = governor_tier_badge()
+    local hw_lbl = (hwdec ~= "" and hwdec ~= "no") and ("HW ZeroCopy · " .. hwdec) or "CPU Software"
+    local hw_col = (hwdec ~= "" and hwdec ~= "no") and "&H99D334&" or "&H5E3FF4&"
     local drop_col = (drops > 0) and "&H5E3FF4&" or "&H99D334&"
     local vol_str = muted and "MUTED" or string.format("%d%%", math.floor(vol))
     local vol_col = muted and "&H5E3FF4&" or "&H99D334&"
     local vbit_s = (vbit > 0) and string.format("%.2f Mbps", vbit / 1000000.0) or "ABR"
+    local bpp_lbl = string.format("%.3f bpp", live_bpp)
+    local scale_lbl = string.format("%.2fx · %s", live_scale_ratio, cm)
+    local shader_lbl = string.format("Deb %.2f · Grn %.3f · %s", live_deb_amt, live_grain_amt, (perf_mode == "ECO") and "CAS" or "4:4:4")
+    local gov_detail = string.format("%s · %s", string.upper(gov_mode), live_cadence_on and "SmartSync ON" or "Native Cadence")
+    local gov_col = (gov_tier == 0) and "&H99D334&" or ((gov_tier == 1) and "&H24BFFB&" or "&HF8BD38&")
+    local host_pwr_lbl = (host_on_battery and ("BATT" .. (host_batt_pct and (" " .. host_batt_pct .. "%%") or "")) or "AC Power")
+        .. (host_temp_c and string.format(" · %.0fC", host_temp_c) or (" · " .. live_gov_reason))
     local abit_s = (abit > 0) and string.format("%d kbps", math.floor(abit / 1000.0)) or "Auto"
     local sr_s = (sr > 0) and string.format("%.1f kHz", sr / 1000.0) or "Auto"
     local eq_state = (af_s ~= "") and "Active DSP/EQ" or "Bypassed / Flat"
@@ -764,52 +1009,52 @@ local function render_info_hud()
     local buf_w = math.max(12, math.floor(520 * buf_frac))
     local chap_line = (chap ~= "") and chap or "Continuous Playback"
 
-    -- Glass Bento Card at (x: 42..1238, y: 26..376)
+    -- Glass Bento Card at (x: 42..1238, y: 26..378)
     local ass = string.format(
         "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H18&\\p1}m 42 26 l 1238 26 l 1238 378 l 42 378{\\p0}\n" ..
         "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&HF8BD38&\\p1}m 42 26 l 1238 26 l 1238 378 l 42 378{\\p0}\n" ..
-        "{\\an7\\pos(66,42)\\bord0\\shad0\\fs19\\b1\\1c&HF8BD38&}◈ PHAENNA INFO HUD   " ..
-        "{\\1c&H24BFFB&}[%s]   {\\1c&H99D334&}[%s]   {\\1c&HFA8BA7&}[%s]   {\\1c&HC8B8A4&}%s\n" ..
+        "{\\an7\\pos(66,42)\\bord0\\shad0\\fs18\\b1\\1c&HF8BD38&}◈ PHAENNA INFO HUD   " ..
+        "{\\1c&H24BFFB&}[%s]  {\\1c&H99D334&}[%s]  {\\1c&HFA8BA7&}[%s]  {\\1c%s}[%s]  {\\1c&HC8B8A4&}%s\n" ..
         "{\\an7\\pos(66,70)\\bord0\\shad0\\fs24\\b1\\1c&HFAF4F0&}%s\n" ..
         "{\\an7\\pos(66,102)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}%s / %s (%d%%)  ·  Speed %.2fx  ·  Chapter: {\\1c&HFAF4F0&}%s\n" ..
         "{\\an7\\pos(66,128)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 1140 0 l 1140 6 l 0 6{\\p0}\n" ..
         "{\\an7\\pos(66,128)\\bord0\\shad0\\1c&HF8BD38&\\p1}m 0 0 l %d 0 l %d 6 l 0 6{\\p0}\n" ..
-        "{\\an7\\pos(66,150)\\bord0\\shad0\\fs16\\b1\\1c&HF8BD38&}▶ VIDEO & QUALITY\n" ..
+        "{\\an7\\pos(66,150)\\bord0\\shad0\\fs16\\b1\\1c&HF8BD38&}▶ VIDEO & COMPRESSION\n" ..
         "{\\an7\\pos(66,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Stream  : {\\1c&HFAF4F0&\\b1}%dx%d  %s\n" ..
-        "{\\an7\\pos(66,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Codec   : {\\1c&H24BFFB&}%s  ·  %s\n" ..
+        "{\\an7\\pos(66,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Codec   : {\\1c&H24BFFB&}%s  ·  %s  (%s)\n" ..
         "{\\an7\\pos(66,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Rate    : {\\1c&H99D334&}%.2f fps{\\1c&HC8B8A4&} (Disp %.0fHz)\n" ..
-        "{\\an7\\pos(66,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Frames  : {\\1c%s}%d dropped {\\1c&HC8B8A4&}· %s\n" ..
-        "{\\an7\\pos(460,150)\\bord0\\shad0\\fs16\\b1\\1c&HFA8BA7&}◈ GPU & MASTERING\n" ..
+        "{\\an7\\pos(66,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Scale   : {\\1c%s}%d drop {\\1c&HC8B8A4&}· %s\n" ..
+        "{\\an7\\pos(460,150)\\bord0\\shad0\\fs16\\b1\\1c&HFA8BA7&}◈ DYNAMIC MASTERING\n" ..
         "{\\an7\\pos(460,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Decode  : {\\1c%s}%s\n" ..
-        "{\\an7\\pos(460,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}VideoOut: {\\1c&HF8BD38&}%s\n" ..
+        "{\\an7\\pos(460,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Pipeline: {\\1c&HF8BD38&}%s\n" ..
         "{\\an7\\pos(460,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}DSP/EQ  : {\\1c&HFA8BA7&}%s\n" ..
-        "{\\an7\\pos(460,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}A/V Sync: {\\1c&H99D334&}%+.1f ms\n" ..
-        "{\\an7\\pos(860,150)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}♪ AUDIO & PLAYBACK\n" ..
+        "{\\an7\\pos(460,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Governor: {\\1c%s}%s\n" ..
+        "{\\an7\\pos(860,150)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}♪ AUDIO & SYSTEM\n" ..
         "{\\an7\\pos(860,176)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Codec   : {\\1c&H24BFFB&}%s  ·  %s\n" ..
         "{\\an7\\pos(860,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Output  : {\\1c&HFAF4F0&}%s  ·  %d ch\n" ..
         "{\\an7\\pos(860,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Volume  : {\\1c%s}%s\n" ..
-        "{\\an7\\pos(860,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Window  : {\\1c&HF8BD38&}%s\n" ..
-        "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H99D334&}⚡ BUFFER HEALTH   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s\n" ..
+        "{\\an7\\pos(860,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Host    : {\\1c&HF8BD38&}%s\n" ..
+        "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H99D334&}⚡ BUFFER HEALTH   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s  {\\1c&HC8B8A4&}(%s)\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 520 0 l 520 10 l 0 10{\\p0}\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d 10 l 0 10{\\p0}\n" ..
-        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[i] Hide  [I] Pin 1Hz  {\\1c&H99D334&}[p] PiP Float  [P] PiP Corner  {\\1c&H24BFFB&}[f] Fullscreen  {\\1c&HFA8BA7&}[F1] Raw Stats",
-        q_tag, win_badge, pin_badge, meta,
+        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[i] Hide  [I] Pin 1Hz  {\\1c&H99D334&}[p] PiP Float  [P] Corner  {\\1c&H24BFFB&}[g] Governor  [f] Fullscreen  {\\1c&HFA8BA7&}[F1] Raw Stats",
+        q_tag, win_badge, pin_badge, gov_col, gov_badge, meta,
         mtitle,
         fmt_clock(pos), fmt_clock(dur), math.floor(pct), spd, chap_line,
         prog_w, prog_w,
         vw, vh, q_tag,
-        vcodec, vbit_s,
+        vcodec, vbit_s, bpp_lbl,
         fps, disp_fps,
-        drop_col, drops, cm,
+        drop_col, drops, scale_lbl,
         hw_col, hw_lbl,
-        vo,
+        shader_lbl,
         eq_state,
-        avs * 1000.0,
+        gov_col, gov_detail,
         acodec, abit_s,
         sr_s, ch_n,
         vol_col, vol_str,
-        win_badge,
-        c_dur, c_mib, (spd_txt ~= "") and ("· " .. spd_txt) or "", buf_col, buf_health,
+        host_pwr_lbl,
+        c_dur, c_mib, (spd_txt ~= "") and ("· " .. spd_txt) or "", buf_col, buf_health, device_lbl,
         buf_col, buf_w, buf_w
     )
     hud_ov.data = ass
@@ -906,22 +1151,13 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     } else {
         eff_master.demuxer_cache.limits()
     };
-    let hwdec_val = if opts.performance_mode == PerformanceMode::Manual {
-        eff_master.hwdec.mpv_value()
-    } else if matches!(
-        eff_master.hwdec,
-        crate::config::HwdecMode::VideoToolbox
-    ) && cfg!(target_os = "macos")
-        && opts.performance_mode == PerformanceMode::Balanced
-    {
-        "videotoolbox"
-    } else {
-        "auto-safe"
-    };
+    let hwdec_val = eff_master.hwdec.effective_mpv_value();
+    let dev = crate::services::platform::detect_device_profile();
+    let caps = crate::services::platform::detect_player_capabilities();
     let mut flags = vec![
         format!("hwdec={hwdec_val}"),
-        "vo=gpu-next".to_string(),
-        "gpu-api=auto".to_string(),
+        format!("vo={}", caps.effective_vo()),
+        format!("gpu-api={}", caps.effective_gpu_api(dev)),
         "cache=yes".to_string(),
         format!("demuxer-max-bytes={max_buf}"),
         format!("demuxer-max-back-bytes={back_buf}"),
@@ -989,6 +1225,19 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             ));
         }
         script_opt_parts.push(format!("phaenna_auto_pip={}", if opts.auto_pip { "1" } else { "0" }));
+        script_opt_parts.push(format!("phaenna_perf={}", opts.performance_mode.short_badge()));
+        script_opt_parts.push(format!("phaenna_gov={}", eff_master.governor_mode.mpv_opt_value()));
+        script_opt_parts.push(format!("phaenna_grain={:.3}", eff_master.organic_grain.luma_strength()));
+        script_opt_parts.push(format!("phaenna_shader_opts={}", if caps.has_shader_opts { "1" } else { "0" }));
+        script_opt_parts.push(format!(
+            "phaenna_motion={}",
+            match opts.motion_mode {
+                MotionMode::Off => "off",
+                MotionMode::Cadence => "cadence",
+                MotionMode::Smooth120Hz => "smooth120",
+            }
+        ));
+        script_opt_parts.push(format!("phaenna_device={}", sanitize_script_opt(&dev.inspector_header())));
     }
 
     if opts.local_file.is_none() {
@@ -1040,15 +1289,42 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             script_opt_parts.push(format!("phaenna_live_target={tgt:.1}"));
             script_opt_parts.push(format!("phaenna_live_speed={spd:.2}"));
         }
+    } else if opts.performance_mode == PerformanceMode::Efficient {
+        flags.push("video-sync=audio".to_string());
+        flags.push("interpolation=no".to_string());
+        if opts.local_file.is_none() {
+            flags.push(format!(
+                "demuxer-readahead-secs={}",
+                opts.network_mode.vod_readahead_secs()
+            ));
+            flags.push("cache-pause-initial=yes".to_string());
+            flags.push(format!(
+                "cache-pause-wait={:.1}",
+                opts.network_mode.vod_cache_pause_wait_secs()
+            ));
+            if opts.network_mode.use_disk_cache() {
+                flags.push("cache-on-disk=yes".to_string());
+            }
+        }
     } else {
         match opts.motion_mode {
             MotionMode::Off => {
+                flags.push("video-sync=audio".to_string());
                 flags.push("interpolation=no".to_string());
             }
             MotionMode::Cadence => {
-                flags.push("video-sync=display-resample".to_string());
-                flags.push("interpolation=yes".to_string());
-                flags.push("tscale=oversample".to_string());
+                // Start cool on audio sync; Dynamic Governor turns interpolation ON only for
+                // genuine non-integer refresh mismatches (e.g. 24@60Hz) when on AC & cooled.
+                flags.push("video-sync=audio".to_string());
+                flags.push("interpolation=no".to_string());
+                flags.push(
+                    if opts.performance_mode == PerformanceMode::Quality {
+                        "tscale=mitchell"
+                    } else {
+                        "tscale=oversample"
+                    }
+                    .to_string(),
+                );
             }
             MotionMode::Smooth120Hz => {
                 flags.push("video-sync=display-resample".to_string());
@@ -1238,7 +1514,23 @@ fn resolved_mpv_target(opts: &PlayOptions) -> String {
         .unwrap_or_else(|| youtube_watch_url(&opts.video_id))
 }
 
-/// Build arguments for `mpv` cleanly (pure function for unit testing).
+/// Resolve `Player::AutoBest` to the highest-parity installed `libmpv` binary on the host.
+pub fn resolve_auto_player() -> Player {
+    if find_binary("mpv").is_some() {
+        return Player::Mpv;
+    }
+    #[cfg(windows)]
+    if find_binary("mpvnet").is_some() || find_binary("mpv.net").is_some() {
+        return Player::MpvNet;
+    }
+    #[cfg(target_os = "linux")]
+    if find_binary("celluloid").is_some() {
+        return Player::Celluloid;
+    }
+    Player::Mpv
+}
+
+/// Build arguments for standalone `mpv` (pure function for unit testing).
 pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     let mut args = vec!["--force-window=immediate".to_string()];
     if let Some(ref sock) = opts.ipc_socket {
@@ -1251,10 +1543,20 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     args
 }
 
-/// Build arguments for macOS `iina-cli` translating all Reference 4K shaders,
-/// AV1/VP9 format selection, dub preference, loudnorm, cookies, and mastering flags via `--mpv-*`.
-pub fn build_iina_args(opts: &PlayOptions) -> Vec<String> {
-    let mut args = vec!["--no-stdin".to_string()];
+/// Build arguments for Windows `mpv.net` (`libmpv` native shell with full CLI/IPC/GLSL/Lua parity).
+pub fn build_mpvnet_args(opts: &PlayOptions) -> Vec<String> {
+    build_mpv_args(opts)
+}
+
+/// Build arguments for Linux `Celluloid` (`GTK4/Wayland libmpv` translating flags via `--mpv-*`).
+pub fn build_celluloid_args(opts: &PlayOptions) -> Vec<String> {
+    let mut args = vec![
+        "--new-window".to_string(),
+        "--mpv-force-window=immediate".to_string(),
+    ];
+    if let Some(ref sock) = opts.ipc_socket {
+        args.push(format!("--mpv-input-ipc-server={}", sock));
+    }
     for kv in shared_mpv_kv_flags(opts) {
         args.push(format!("--mpv-{kv}"));
     }
@@ -1262,57 +1564,19 @@ pub fn build_iina_args(opts: &PlayOptions) -> Vec<String> {
     args
 }
 
-/// Build arguments for `vlc` applying YouTube-parity keybindings in windowed & fullscreen mode.
-pub fn build_vlc_args(opts: &PlayOptions) -> Vec<String> {
-    let target = opts
-        .local_file
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
-    let mut args = vec![
-        format!("--video-title={}", opts.title),
-        format!("--network-caching={}", opts.network_mode.vlc_network_caching_ms()),
-        "--http-reconnect".to_string(),
-        "--short-jump-size=10".to_string(),
-        "--extrashort-jump-size=5".to_string(),
-        "--key-play-pause=k".to_string(),
-        "--key-jump-short=j".to_string(),
-        "--key-jump+short=l".to_string(),
-        "--key-jump-extrashort=Left".to_string(),
-        "--key-jump+extrashort=Right".to_string(),
-        "--key-vol-up=Up".to_string(),
-        "--key-vol-down=Down".to_string(),
-        "--key-vol-mute=m".to_string(),
-        "--key-toggle-fullscreen=f".to_string(),
-        "--key-leave-fullscreen=Esc".to_string(),
-        "--key-subtitle-toggle=c".to_string(),
-        "--key-audio-track=d".to_string(),
-        "--key-rate-slower-fine=<".to_string(),
-        "--key-rate-faster-fine=>".to_string(),
-        "--key-frame-next=.".to_string(),
-    ];
-    if opts.auto_pip {
-        args.push("--video-on-top".to_string());
-    } else if opts.auto_fullscreen {
-        args.push("--fullscreen".to_string());
-    }
-    args.push(target);
-    args
-}
-
-/// Launch playback asynchronously in the background without blocking the TUI event loop!
+/// Launch playback asynchronously in the background without blocking the TUI event loop.
 pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
-    let target = opts
-        .local_file
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| youtube_watch_url(&opts.video_id));
+    let resolved_player = match opts.player {
+        Player::AutoBest => resolve_auto_player(),
+        other => other,
+    };
 
-    match opts.player {
+    match resolved_player {
+        Player::AutoBest => unreachable!(),
         Player::Mpv => {
             let bin = find_binary("mpv").ok_or_else(|| {
                 AppError::Player(
-                    "mpv was not found in PATH. Install mpv or switch player in [p] Playback Studio."
+                    "mpv not found in PATH. Install mpv (e.g. brew/winget/apt) to launch streams."
                         .to_string(),
                 )
             })?;
@@ -1326,56 +1590,41 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
                 .map_err(|e| AppError::Player(format!("Failed to launch mpv: {}", e)))?;
             Ok(Some(child))
         }
-        Player::Iina => {
-            #[cfg(target_os = "macos")]
-            {
-                if let Some(cli) = find_binary("iina-cli").or_else(|| find_binary("iina")) {
-                    let args = build_iina_args(opts);
-                    let child = Command::new(cli)
-                        .args(&args)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .map_err(|e| AppError::Player(format!("Failed to launch IINA: {}", e)))?;
-                    return Ok(Some(child));
-                }
-                let child = Command::new("open")
-                    .args(["-a", "IINA", &target])
-                    .spawn()
-                    .map_err(|e| AppError::Player(format!("Failed to open IINA: {}", e)))?;
-                Ok(Some(child))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(AppError::Player("IINA is only available on macOS".to_string()))
-            }
-        }
-        Player::Vlc => {
-            let bin = find_binary("vlc").ok_or_else(|| {
-                AppError::Player("VLC not found on PATH or /Applications".to_string())
-            })?;
-            let args = build_vlc_args(opts);
+        Player::MpvNet => {
+            let bin = find_binary("mpvnet")
+                .or_else(|| find_binary("mpv.net"))
+                .ok_or_else(|| {
+                    AppError::Player(
+                        "mpv.net not found (install via `winget install mpv.net` or switch to mpv)."
+                            .to_string(),
+                    )
+                })?;
+            let args = build_mpvnet_args(opts);
             let child = Command::new(bin)
                 .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .map_err(|e| AppError::Player(format!("Failed to launch VLC: {}", e)))?;
+                .map_err(|e| AppError::Player(format!("Failed to launch mpv.net: {}", e)))?;
             Ok(Some(child))
         }
-        Player::Browser => {
-            #[cfg(target_os = "macos")]
-            let child = Command::new("open").arg(&target).spawn();
-            #[cfg(target_os = "linux")]
-            let child = Command::new("xdg-open").arg(&target).spawn();
-            #[cfg(windows)]
-            let child = Command::new("cmd").args(["/C", "start", "", &target]).spawn();
-
-            let c = child
-                .map_err(|e| AppError::Player(format!("Failed to open browser: {}", e)))?;
-            Ok(Some(c))
+        Player::Celluloid => {
+            let bin = find_binary("celluloid").ok_or_else(|| {
+                AppError::Player(
+                    "Celluloid not found in PATH (install via apt/dnf/flatpak or switch to mpv)."
+                        .to_string(),
+                )
+            })?;
+            let args = build_celluloid_args(opts);
+            let child = Command::new(bin)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| AppError::Player(format!("Failed to launch Celluloid: {}", e)))?;
+            Ok(Some(child))
         }
     }
 }
@@ -1450,7 +1699,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--start=42.5"));
         assert!(args.iter().any(|a| a.starts_with("--glsl-shaders=")));
         assert!(args.iter().any(|a| a == "--demuxer-max-bytes=512MiB"));
-        assert!(args.iter().any(|a| a.contains("format-sort=lang,res:2160")));
+        assert!(args.iter().any(|a| a.contains("format-sort=")));
         assert!(args.iter().any(|a| a == "--ytdl-raw-options-append=audio-multistreams="));
         assert!(args.iter().any(|a| a == "--alang=und,orig"));
         assert!(args.iter().any(|a| a.starts_with("--af=lavfi=")));
@@ -1460,23 +1709,32 @@ mod tests {
         assert!(args.iter().any(|a| a.starts_with("--script=")));
         assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
 
-        let vlc_args = build_vlc_args(&opts);
-        assert!(vlc_args.iter().any(|a| a == "--key-play-pause=k"));
-        assert!(vlc_args.iter().any(|a| a == "--key-toggle-fullscreen=f"));
-
         let mut eco_opts = opts.clone();
         eco_opts.performance_mode = PerformanceMode::Efficient;
+        eco_opts.motion_mode = MotionMode::Cadence;
         let eco_args = build_mpv_args(&eco_opts);
         assert!(eco_args.iter().any(|a| a == "--demuxer-max-bytes=48MiB"));
         assert!(!eco_args.iter().any(|a| a.contains("audio-multistreams")));
         assert!(eco_args.iter().any(|a| a == "--scale=spline36"));
+        assert!(eco_args.iter().any(|a| a == "--dscale=hermite"));
+        assert!(eco_args.iter().any(|a| a == "--interpolation=no"));
+        assert!(eco_args.iter().any(|a| a == "--video-sync=audio"));
 
         let mut bal_opts = opts.clone();
         bal_opts.performance_mode = PerformanceMode::Balanced;
         let bal_args = build_mpv_args(&bal_opts);
         assert!(bal_args.iter().any(|a| a == "--hdr-compute-peak=no"));
-        assert!(bal_args.iter().any(|a| a == "--cscale=mitchell"));
-        assert!(bal_args.iter().any(|a| a.contains("vcodec:vp9.2:vp9:h264:av01")));
+        assert!(bal_args.iter().any(|a| a == "--cscale=bilinear"));
+        assert!(bal_args.iter().any(|a| a == "--dscale=hermite"));
+        assert!(bal_args.iter().any(|a| a.contains("phaenna_gov=auto")));
+        assert!(bal_args.iter().any(|a| a.contains("phaenna_grain=0.008")));
+
+        let mut av1_opts = opts.clone();
+        av1_opts.performance_mode = PerformanceMode::Manual;
+        av1_opts.manual_mastering.codec_priority = crate::config::CodecPriority::Av1First;
+        assert!(build_mpv_args(&av1_opts)
+            .iter()
+            .any(|a| a.contains("format-sort=lang,res:2160,fps,hdr,vcodec:av01")));
 
         let mut man_opts = opts.clone();
         man_opts.performance_mode = PerformanceMode::Manual;
@@ -1489,16 +1747,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_iina_args_full_4k_shader_parity() {
-        let opts = PlayOptions {
+    fn test_build_mpvnet_and_celluloid_full_shader_ipc_parity() {
+        let mut opts = PlayOptions {
             video_id: "dQw4w9WgXcQ".to_string(),
             title: "Reference 4K Test".to_string(),
             local_file: None,
             quality_format: "bestvideo[height<=?4320][vcodec^=av01]+bestaudio/best".to_string(),
-            player: Player::Iina,
+            player: Player::Celluloid,
             cookies_path: None,
             start_pos: Some(18.0),
-            ipc_socket: None,
+            ipc_socket: Some("/tmp/phaenna-celluloid.sock".to_string()),
             subtitles_enabled: true,
             sub_lang: Some("en".to_string()),
             sub_url: None,
@@ -1519,7 +1777,7 @@ mod tests {
             live_auto_catchup: true,
             network_mode: NetworkMode::Normal,
             force_ipv4: false,
-            auto_fullscreen: false,
+            auto_fullscreen: true,
             auto_pip: false,
             loading_art_dir: None,
             loading_variant_idx: 0,
@@ -1529,14 +1787,27 @@ mod tests {
             direct_stream: None,
         };
 
-        let args = build_iina_args(&opts);
-        assert!(args.iter().any(|a| a == "--no-stdin"));
-        assert!(args.iter().any(|a| a.starts_with("--mpv-glsl-shaders=")));
-        assert!(args.iter().any(|a| a == "--mpv-deband=yes"));
-        assert!(args.iter().any(|a| a == "--mpv-tone-mapping=spline"));
-        assert!(args.iter().any(|a| a == "--mpv-start=18.0"));
-        assert!(args.iter().any(|a| a == "--mpv-alang=ar"));
-        assert!(args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
+        let c_args = build_celluloid_args(&opts);
+        assert!(c_args.iter().any(|a| a == "--new-window"));
+        assert!(c_args
+            .iter()
+            .any(|a| a == "--mpv-input-ipc-server=/tmp/phaenna-celluloid.sock"));
+        assert!(c_args.iter().any(|a| a.starts_with("--mpv-glsl-shaders=")));
+        assert!(c_args.iter().any(|a| a == "--mpv-deband=yes"));
+        assert!(c_args.iter().any(|a| a == "--mpv-tone-mapping=spline"));
+        assert!(c_args.iter().any(|a| a == "--mpv-fullscreen=yes"));
+        assert!(c_args.iter().any(|a| a == "--mpv-start=18.0"));
+        assert!(c_args.iter().any(|a| a == "--mpv-alang=ar"));
+        assert!(c_args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
+
+        opts.player = Player::MpvNet;
+        let m_args = build_mpvnet_args(&opts);
+        assert!(m_args
+            .iter()
+            .any(|a| a == "--input-ipc-server=/tmp/phaenna-celluloid.sock"));
+        assert!(m_args.iter().any(|a| a.starts_with("--glsl-shaders=")));
+        assert!(m_args.iter().any(|a| a == "--fullscreen=yes"));
+        assert!(m_args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
     }
 
     #[test]
@@ -1643,10 +1914,6 @@ mod tests {
         assert!(wifi_args.iter().any(|a| a == "--ytdl-raw-options-append=force-ipv4="));
         assert!(!wifi_args.iter().any(|a| a.contains("audio-multistreams")));
 
-        let vlc_args = build_vlc_args(&opts);
-        assert!(vlc_args.iter().any(|a| a == "--network-caching=8000"));
-        assert!(vlc_args.iter().any(|a| a == "--http-reconnect"));
-
         opts.direct_stream = Some(SelectedStreamPair {
             primary_url: "https://cdn.example.com/video_720p.webm".to_string(),
             audio_url: Some("https://cdn.example.com/audio_opus.webm".to_string()),
@@ -1681,7 +1948,6 @@ mod tests {
         assert!(fs_args.iter().any(|a| a.contains("phaenna_card_dir=/tmp/phaenna-portraits")));
         assert!(fs_args.iter().any(|a| a.contains("phaenna_card_idx=4")));
         assert!(fs_args.iter().any(|a| a == "--start=65.0"));
-        assert!(build_vlc_args(&auto_fs_opts).iter().any(|a| a == "--fullscreen"));
 
         let mut pip_opts = opts;
         pip_opts.auto_pip = true;
