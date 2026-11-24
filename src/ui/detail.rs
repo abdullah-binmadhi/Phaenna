@@ -1051,11 +1051,16 @@ fn render_synopsis_panel(
         .detail_hitboxes
         .push((area, DetailHit::FocusPane(0)));
 
+    let fallback_desc = if state.detail_metadata_loading {
+        "Loading full metadata, chapters, subtitles, and SponsorBlock cues..."
+    } else {
+        "No description provided for this video."
+    };
     let desc_raw = video
         .description
         .as_deref()
         .filter(|s| !s.is_empty())
-        .unwrap_or("Loading full metadata, chapters, subtitles, and SponsorBlock cues...");
+        .unwrap_or(fallback_desc);
     let lines = style_description_lines(desc_raw, video, pal, inner.width.max(12) as usize);
 
     frame.render_widget(

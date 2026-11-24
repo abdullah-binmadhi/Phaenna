@@ -1,7 +1,7 @@
 //! Fast HTTP/RSS client for zero-subprocess YouTube channel feed refreshes.
 //! Fetches public Atom XML feeds in <150ms for the 7-day Upload Radar & channel checks.
 
-use crate::db::cache::{is_valid_yt_video_id, normalize_thumb_url, Thumbnail, VideoItem};
+use crate::db::cache::{is_valid_yt_video_id, normalize_thumb_url, Thumbnail, VideoChapter, VideoItem};
 use crate::error::{AppError, Result};
 use crate::services::auth::{compute_sapisidhash, now_unix_secs, GoogleAccountSession, PHAENNA_USER_AGENT};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -2289,6 +2289,222 @@ pub async fn fetch_video_card_enrichment(
     Some((uploader, view_count, published_text, timestamp))
 }
 
+/// Fast InnerTube watch-page metadata: full synopsis description, chapters, hashtags, and channel info.
+#[derive(Debug, Clone, Default)]
+pub struct InnerTubeVideoDetails {
+    pub description: Option<String>,
+    pub chapters: Vec<VideoChapter>,
+    pub tags: Vec<String>,
+    pub uploader: Option<String>,
+    pub channel_id: Option<String>,
+    pub view_count: Option<u64>,
+    pub published_text: Option<String>,
+    pub timestamp: Option<i64>,
+}
+
+fn collect_macro_markers(val: &serde_json::Value, out: &mut Vec<(String, f64)>) {
+    match val {
+        serde_json::Value::Object(map) => {
+            if let Some(m) = map.get("macroMarkersListItemRenderer") {
+                if let Some(title) = extract_yt_text(m.get("title")) {
+                    if let Some(time_str) = extract_yt_text(m.get("timeDescription")) {
+                        if let Some(start) = crate::services::subsync::parse_timestamp(&time_str) {
+                            if !title.is_empty() && start.is_finite() && start >= 0.0 {
+                                out.push((title, start));
+                            }
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_macro_markers(child, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                collect_macro_markers(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse synopsis description, chapters, hashtags, and uploader metadata from InnerTube `/youtubei/v1/next` JSON.
+pub fn parse_innertube_video_details_json(
+    json: &serde_json::Value,
+    duration_hint: Option<u64>,
+) -> Option<InnerTubeVideoDetails> {
+    let mut primary: Option<&serde_json::Value> = None;
+    let mut secondary: Option<&serde_json::Value> = None;
+    let mut reel_hdr: Option<&serde_json::Value> = None;
+    if let Some(arr) = json
+        .pointer("/contents/twoColumnWatchNextResults/results/results/contents")
+        .and_then(|v| v.as_array())
+    {
+        for item in arr {
+            if primary.is_none() {
+                primary = item.get("videoPrimaryInfoRenderer");
+            }
+            if secondary.is_none() {
+                secondary = item.get("videoSecondaryInfoRenderer");
+            }
+            if reel_hdr.is_none() {
+                reel_hdr = item.get("reelPlayerHeaderRenderer");
+            }
+        }
+    }
+
+    let description = secondary
+        .and_then(|s| s.pointer("/attributedDescription/content"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            secondary
+                .and_then(|s| extract_yt_text(s.get("description")))
+                .map(|s| s.trim_end().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
+    let mut raw_markers: Vec<(String, f64)> = Vec::new();
+    collect_macro_markers(json, &mut raw_markers);
+    raw_markers.sort_by(|a, b| a.1.total_cmp(&b.1));
+    raw_markers.dedup_by(|a, b| (a.1 - b.1).abs() < 0.5 && a.0 == b.0);
+
+    let total_dur = duration_hint.unwrap_or(0) as f64;
+    let mut chapters = Vec::with_capacity(raw_markers.len());
+    for (idx, (title, start)) in raw_markers.iter().enumerate() {
+        let next_start = raw_markers
+            .get(idx + 1)
+            .map(|x| x.1)
+            .unwrap_or_else(|| total_dur.max(*start));
+        chapters.push(VideoChapter {
+            title: title.clone(),
+            start_time: *start,
+            end_time: next_start.max(*start),
+        });
+    }
+    if chapters.is_empty() {
+        if let Some(ref desc) = description {
+            let parsed = crate::api::ytdlp::parse_description_chapters(desc, total_dur);
+            if !parsed.is_empty() {
+                chapters = parsed;
+            }
+        }
+    }
+
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(runs) = primary
+        .and_then(|p| p.pointer("/superTitleLink/runs"))
+        .and_then(|v| v.as_array())
+    {
+        for run in runs {
+            if let Some(txt) = run.get("text").and_then(|v| v.as_str()) {
+                for tok in txt.split_whitespace() {
+                    if let Some(tag) = tok.strip_prefix('#') {
+                        if !tag.is_empty() && !tags.iter().any(|t| t == tag) {
+                            tags.push(tag.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let owner = secondary.and_then(|s| s.pointer("/owner/videoOwnerRenderer"));
+    let uploader = owner
+        .and_then(|o| extract_yt_text(o.get("title")))
+        .or_else(|| reel_hdr.and_then(|r| extract_yt_text(r.get("channelTitleText"))));
+    let channel_id = owner
+        .and_then(|o| o.pointer("/navigationEndpoint/browseEndpoint/browseId"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    let view_count = primary
+        .and_then(|p| {
+            p.pointer("/viewCount/videoViewCountRenderer/originalViewCount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    extract_yt_text(p.pointer("/viewCount/videoViewCountRenderer/viewCount"))
+                        .and_then(|s| parse_rough_views(&s))
+                })
+        })
+        .or_else(|| {
+            first_string_by_key(json, "originalViewCount").and_then(|s| s.parse::<u64>().ok())
+        });
+
+    let rel_text = primary
+        .and_then(|p| extract_yt_text(p.get("relativeDateText")))
+        .or_else(|| reel_hdr.and_then(|r| extract_yt_text(r.get("timestampText"))));
+    let date_text = primary.and_then(|p| extract_yt_text(p.get("dateText")));
+    let published_text = rel_text.clone().or_else(|| date_text.clone());
+
+    let now = now_unix_secs();
+    let timestamp = rel_text
+        .as_deref()
+        .and_then(|s| parse_relative_age_to_unix(s, now))
+        .or_else(|| date_text.as_deref().and_then(parse_english_short_date_to_unix));
+
+    if description.is_none()
+        && chapters.is_empty()
+        && tags.is_empty()
+        && uploader.is_none()
+        && channel_id.is_none()
+        && view_count.is_none()
+        && published_text.is_none()
+    {
+        return None;
+    }
+
+    Some(InnerTubeVideoDetails {
+        description,
+        chapters,
+        tags,
+        uploader,
+        channel_id,
+        view_count,
+        published_text,
+        timestamp,
+    })
+}
+
+/// Fetch synopsis description, chapters, hashtags, and uploader metadata quickly (~250ms) via InnerTube `/next`.
+pub async fn fetch_innertube_video_details(
+    client: &reqwest::Client,
+    session: Option<&GoogleAccountSession>,
+    video_id: &str,
+    duration_hint: Option<u64>,
+) -> Option<InnerTubeVideoDetails> {
+    let clean_id = video_id.trim_start_matches("RD");
+    if clean_id.is_empty() {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": INNERTUBE_CLIENT_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "videoId": clean_id
+    });
+    let req = client
+        .post("https://www.youtube.com/youtubei/v1/next?prettyPrint=false")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload);
+    let resp = apply_innertube_web_headers(req, session).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    parse_innertube_video_details_json(&json, duration_hint)
+}
+
 /// Fetch replies for a parent comment thread using its InnerTube continuation token.
 pub async fn fetch_comment_replies(
     client: &reqwest::Client,
@@ -3164,5 +3380,118 @@ mod tests {
         assert_eq!(page.shorts.len(), 1);
         assert_eq!(page.shorts[0].id, "V8rT6UI3Crg");
         assert_eq!(page.continuation.as_deref(), Some("SEARCH_CONT_2"));
+    }
+
+    #[test]
+    fn test_parse_innertube_video_details_json() {
+        let next_json = serde_json::json!({
+            "contents": {
+                "twoColumnWatchNextResults": {
+                    "results": {
+                        "results": {
+                            "contents": [
+                                {
+                                    "videoPrimaryInfoRenderer": {
+                                        "superTitleLink": {
+                                            "runs": [
+                                                { "text": "#Foldable" },
+                                                { "text": " " },
+                                                { "text": "#TechReview" }
+                                            ]
+                                        },
+                                        "viewCount": {
+                                            "videoViewCountRenderer": {
+                                                "originalViewCount": "7942"
+                                            }
+                                        },
+                                        "relativeDateText": { "simpleText": "4 hours ago" }
+                                    }
+                                },
+                                {
+                                    "videoSecondaryInfoRenderer": {
+                                        "attributedDescription": {
+                                            "content": "Hands-on hardware deep dive.\n00:00 Intro\n01:30 Display"
+                                        },
+                                        "owner": {
+                                            "videoOwnerRenderer": {
+                                                "title": { "runs": [{ "text": "Shane Craig" }] },
+                                                "navigationEndpoint": {
+                                                    "browseEndpoint": { "browseId": "UCtestChannel" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            "engagementPanels": [
+                {
+                    "engagementPanelSectionListRenderer": {
+                        "content": {
+                            "macroMarkersListRenderer": {
+                                "contents": [
+                                    {
+                                        "macroMarkersListItemRenderer": {
+                                            "title": { "simpleText": "Overview" },
+                                            "timeDescription": { "simpleText": "0:00" }
+                                        }
+                                    },
+                                    {
+                                        "macroMarkersListItemRenderer": {
+                                            "title": { "runs": [{ "text": "Hinge Mechanics" }] },
+                                            "timeDescription": { "simpleText": "2:15" }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let parsed = parse_innertube_video_details_json(&next_json, Some(441)).unwrap();
+        assert!(parsed
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("Hands-on hardware deep dive."));
+        assert_eq!(parsed.chapters.len(), 2);
+        assert_eq!(parsed.chapters[0].title, "Overview");
+        assert_eq!(parsed.chapters[0].start_time, 0.0);
+        assert_eq!(parsed.chapters[1].title, "Hinge Mechanics");
+        assert_eq!(parsed.chapters[1].start_time, 135.0);
+        assert_eq!(parsed.chapters[1].end_time, 441.0);
+        assert_eq!(parsed.tags, vec!["Foldable", "TechReview"]);
+        assert_eq!(parsed.uploader.as_deref(), Some("Shane Craig"));
+        assert_eq!(parsed.channel_id.as_deref(), Some("UCtestChannel"));
+        assert_eq!(parsed.view_count, Some(7942));
+
+        // Description timestamp fallback when native macroMarkers are absent
+        let fallback_json = serde_json::json!({
+            "contents": {
+                "twoColumnWatchNextResults": {
+                    "results": {
+                        "results": {
+                            "contents": [
+                                {
+                                    "videoSecondaryInfoRenderer": {
+                                        "attributedDescription": {
+                                            "content": "Quick test\n00:00 Start\n01:00 End"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let fb = parse_innertube_video_details_json(&fallback_json, Some(120)).unwrap();
+        assert_eq!(fb.chapters.len(), 2);
+        assert_eq!(fb.chapters[0].title, "Start");
     }
 }

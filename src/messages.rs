@@ -69,6 +69,13 @@ pub enum AppMessage {
         subtitles: Vec<SubtitleTrack>,
         ladder: Option<ResolvedStreamLadder>,
     },
+    VideoSynopsisLoaded {
+        video_id: String,
+        details: Option<crate::api::innertube::InnerTubeVideoDetails>,
+    },
+    VideoDetailsFailed {
+        video_id: String,
+    },
     StreamLadderResolved {
         video_id: String,
         ladder: ResolvedStreamLadder,

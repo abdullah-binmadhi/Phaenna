@@ -12,14 +12,15 @@ mod ui;
 use crate::api::dislike::fetch_dislikes;
 use crate::api::innertube::{
     browse_id_for_feed_key, fetch_channel_rss, fetch_channel_shorts, fetch_comment_replies,
-    fetch_innertube_shelf, fetch_search_suggestions, fetch_suggested_shorts,
-    fetch_video_card_enrichment, fetch_video_comments, innertube_edit_watch_later,
-    post_comment_reply, post_video_comment, report_youtube_watch_progress, search_innertube,
-    send_video_vote, SearchChannelCard, VideoComment, VideoVote,
+    fetch_innertube_shelf, fetch_innertube_video_details, fetch_search_suggestions,
+    fetch_suggested_shorts, fetch_video_card_enrichment, fetch_video_comments,
+    innertube_edit_watch_later, post_comment_reply, post_video_comment,
+    report_youtube_watch_progress, search_innertube, send_video_vote, SearchChannelCard,
+    VideoComment, VideoVote,
 };
 use crate::api::player::{
-    build_mpv_audio_filter_chain, detect_dependencies, ipc_socket_path, spawn_player,
-    youtube_watch_url, PlayOptions,
+    build_mpv_audio_filter_chain, classify_player_crash_stderr, detect_dependencies,
+    ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
 };
 use crate::api::translate::{
     next_preset_lang, normalize_target_lang, prev_preset_lang, translate_text,
@@ -1635,7 +1636,7 @@ async fn handle_app_message(
         }
         AppMessage::VideoDetailsLoaded {
             video_id,
-            item,
+            mut item,
             subtitles,
             ladder,
         } => {
@@ -1643,6 +1644,28 @@ async fn handle_app_message(
                 let clean = video_id.trim_start_matches("RD").to_string();
                 state.stream_ladder_cache.insert(video_id.clone(), lad.clone());
                 state.stream_ladder_cache.insert(clean, lad);
+            }
+            if state
+                .detail_video
+                .as_ref()
+                .map(|v| v.id == video_id)
+                .unwrap_or(false)
+            {
+                if let Some(ref existing) = state.detail_video {
+                    if item.description.as_deref().map(str::is_empty).unwrap_or(true) {
+                        item.description = existing.description.clone();
+                    }
+                    if item.chapters.as_ref().map(|c| c.is_empty()).unwrap_or(true) {
+                        item.chapters = existing.chapters.clone();
+                    }
+                    if item.tags.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
+                        item.tags = existing.tags.clone();
+                    }
+                }
+                state.detail_metadata_loading = false;
+                state.detail_video = Some(item.clone());
+                state.detail_subtitles = subtitles;
+                state.detail_selected_sub_idx = 0;
             }
             let _ = upsert_video(pool, &item, now_unix()).await;
             let _ = backfill_session_video_metadata(
@@ -1653,15 +1676,74 @@ async fn handle_app_message(
                 item.duration.unwrap_or(0) as f64,
             )
             .await;
+        }
+        AppMessage::VideoSynopsisLoaded { video_id, details } => {
+            let matches_detail = state
+                .detail_video
+                .as_ref()
+                .map(|v| v.id == video_id)
+                .unwrap_or(false);
+            if matches_detail {
+                state.detail_metadata_loading = false;
+            }
+            if let Some(d) = details {
+                let updated_item = if matches_detail {
+                    if let Some(ref mut v) = state.detail_video {
+                        if v.description.as_deref().map(str::is_empty).unwrap_or(true)
+                            && d.description.is_some()
+                        {
+                            v.description = d.description.clone();
+                        }
+                        if v.chapters.as_ref().map(|c| c.is_empty()).unwrap_or(true)
+                            && !d.chapters.is_empty()
+                        {
+                            v.chapters = Some(d.chapters.clone());
+                        }
+                        if v.tags.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+                            && !d.tags.is_empty()
+                        {
+                            v.tags = Some(d.tags.clone());
+                        }
+                        if v.channel_id.is_none() && d.channel_id.is_some() {
+                            v.channel_id = d.channel_id.clone();
+                        }
+                        if d.uploader.is_some()
+                            && v.uploader
+                                .as_deref()
+                                .map(|s| s.is_empty() || s == "Unknown")
+                                .unwrap_or(true)
+                        {
+                            v.uploader = d.uploader.clone();
+                        }
+                        if v.view_count.is_none() && d.view_count.is_some() {
+                            v.view_count = d.view_count;
+                        }
+                        if v.published_text.is_none() && d.published_text.is_some() {
+                            v.published_text = d.published_text.clone();
+                        }
+                        if v.timestamp.is_none() && d.timestamp.is_some() {
+                            v.timestamp = d.timestamp;
+                        }
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(item) = updated_item {
+                    let _ = upsert_video(pool, &item, now_unix()).await;
+                }
+            }
+        }
+        AppMessage::VideoDetailsFailed { video_id } => {
             if state
                 .detail_video
                 .as_ref()
                 .map(|v| v.id == video_id)
                 .unwrap_or(false)
             {
-                state.detail_video = Some(item);
-                state.detail_subtitles = subtitles;
-                state.detail_selected_sub_idx = 0;
+                state.detail_metadata_loading = false;
             }
         }
         AppMessage::StreamLadderResolved { video_id, ladder } => {
@@ -2457,6 +2539,12 @@ fn open_detail_for_video(
         }
     }
     let vid_id = video.id.clone();
+    let dur_hint = video.duration;
+    let has_cached_desc = video
+        .description
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
     state.queue_thumb_if_needed(&vid_id, &video.best_thumbnail_url());
     state.detail_video = Some(video);
     state.detail_view_mode = DetailViewMode::Overview;
@@ -2473,6 +2561,7 @@ fn open_detail_for_video(
     state.detail_comment_collapsed.clear();
     state.detail_reply_target = None;
     state.detail_comments_loading = true;
+    state.detail_metadata_loading = !has_cached_desc;
     state.detail_create_comment_params = None;
     state.detail_comment_composing = false;
     state.detail_comment_input.clear();
@@ -2487,6 +2576,21 @@ fn open_detail_for_video(
     state.detail_comment_translating.clear();
     state.overlay = ActiveOverlay::None;
     state.screen = Screen::Detail;
+
+    let c_it = client.clone();
+    let sess_it = state.auth_vault.active_account().cloned();
+    let tx_it = tx.clone();
+    let id_it = vid_id.clone();
+    tokio::spawn(async move {
+        let details =
+            fetch_innertube_video_details(&c_it, sess_it.as_ref(), &id_it, dur_hint).await;
+        let _ = tx_it
+            .send(AppMessage::VideoSynopsisLoaded {
+                video_id: id_it,
+                details,
+            })
+            .await;
+    });
 
     let cookies = state.config.cookies_path().ok();
     let force_ipv4 = state.config.force_ipv4;
@@ -2503,6 +2607,10 @@ fn open_detail_for_video(
                     subtitles: subs,
                     ladder,
                 })
+                .await;
+        } else {
+            let _ = tx_d
+                .send(AppMessage::VideoDetailsFailed { video_id: id_d })
                 .await;
         }
     });
@@ -2801,7 +2909,34 @@ async fn start_nonblocking_playback_with_live_opts(
     };
 
     match spawn_player(&opts) {
-        Ok(Some(_child)) => {
+        Ok(Some(mut child)) => {
+            let tx_watch = tx.clone();
+            let stderr_pipe = child.stderr.take();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut ring: Vec<u8> = Vec::with_capacity(8192);
+                if let Some(mut err) = stderr_pipe {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match err.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                ring.extend_from_slice(&buf[..n]);
+                                if ring.len() > 16384 {
+                                    let drop_n = ring.len() - 12288;
+                                    ring.drain(..drop_n);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(status) = child.wait().await {
+                    let err_str = String::from_utf8_lossy(&ring);
+                    if let Some(msg) = classify_player_crash_stderr(&err_str, status.code()) {
+                        let _ = tx_watch.send(AppMessage::ShowToast(msg)).await;
+                    }
+                }
+            });
             let ts = now_unix();
             let _ = touch_watch_history(pool, Some(video), &video.id, ts).await;
             state.mark_video_watched(video);

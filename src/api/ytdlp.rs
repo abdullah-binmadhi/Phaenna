@@ -103,6 +103,7 @@ fn ytdlp_bin() -> String {
 }
 
 fn apply_cookies(cmd: &mut Command, cookies_path: Option<&Path>) {
+    cmd.arg("--ignore-config");
     if let Some(p) = cookies_path {
         if p.exists() && std::fs::metadata(p).map(|m| m.len() > 20).unwrap_or(false) {
             cmd.arg("--cookies").arg(p);
@@ -763,6 +764,27 @@ pub fn parse_stream_ladder_from_ytdlp_json(
     })
 }
 
+async fn run_ytdlp_details_json(
+    cookies_path: Option<&Path>,
+    url: &str,
+    force_ipv4: bool,
+) -> Option<Value> {
+    let mut cmd = Command::new(ytdlp_bin());
+    apply_cookies(&mut cmd, cookies_path);
+    if force_ipv4 {
+        cmd.arg("--force-ipv4");
+    }
+    cmd.args(["-J", "--no-playlist", "--skip-download", url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
 /// Fetch full metadata (`yt-dlp -J --skip-download --no-playlist`) including chapters, tags, subtitles, and resolved CDN stream ladder.
 pub async fn fetch_video_details_with_ladder(
     cookies_path: Option<&Path>,
@@ -772,21 +794,12 @@ pub async fn fetch_video_details_with_ladder(
     let clean = video_id.trim_start_matches("RD");
     let url = format!("https://www.youtube.com/watch?v={}", clean);
 
-    let mut cmd = Command::new(ytdlp_bin());
-    apply_cookies(&mut cmd, cookies_path);
-    if force_ipv4 {
-        cmd.arg("--force-ipv4");
-    }
-    cmd.args(["-J", "--no-playlist", "--skip-download", &url])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    let val = match run_ytdlp_details_json(cookies_path, &url, force_ipv4).await {
+        Some(v) => v,
+        None if cookies_path.is_some() => run_ytdlp_details_json(None, &url, force_ipv4).await?,
+        None => return None,
+    };
 
-    let out = cmd.output().await.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-
-    let val: Value = serde_json::from_slice(&out.stdout).ok()?;
     let item: VideoItem = serde_json::from_value(val.clone()).ok()?;
     let mut item = enrich_ytdlp_dates(&val, item);
 

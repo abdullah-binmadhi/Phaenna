@@ -1407,6 +1407,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
                 }
             };
             flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
+            flags.push("ytdl-raw-options-append=ignore-config=".to_string());
             flags.push("ytdl-raw-options-append=no-playlist=".to_string());
             if opts.force_ipv4 {
                 flags.push("ytdl-raw-options-append=force-ipv4=".to_string());
@@ -1609,7 +1610,7 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
                 .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| AppError::Player(format!("Failed to launch mpv: {}", e)))?;
             Ok(Some(child))
@@ -1628,7 +1629,7 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
                 .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| AppError::Player(format!("Failed to launch mpv.net: {}", e)))?;
             Ok(Some(child))
@@ -1645,12 +1646,67 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
                 .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| AppError::Player(format!("Failed to launch Celluloid: {}", e)))?;
             Ok(Some(child))
         }
     }
+}
+
+/// Inspect `mpv`/`ytdl_hook` `stderr` and process exit code to surface actionable toast errors on crash.
+pub fn classify_player_crash_stderr(stderr_text: &str, exit_code: Option<i32>) -> Option<String> {
+    if stderr_text.contains("addOnDisposeCallback")
+        || stderr_text.contains("Signature solving failed")
+        || stderr_text.contains("n challenge solving failed")
+        || stderr_text.contains("Requested format is not available")
+        || stderr_text.contains("Only images are available")
+    {
+        return Some(
+            "Playback failed: yt-dlp YouTube extractor outdated — run `brew upgrade yt-dlp` (or `yt-dlp -U`)"
+                .to_string(),
+        );
+    }
+    if stderr_text.contains("HTTP Error 413") {
+        return Some(
+            "Playback failed: YouTube rejected oversized cookies (HTTP 413) — refresh session"
+                .to_string(),
+        );
+    }
+    if stderr_text.contains("Sign in to confirm")
+        || stderr_text.contains("confirm you're not a bot")
+        || stderr_text.contains("confirm you\u{2019}re not a bot")
+    {
+        return Some(
+            "Playback failed: YouTube bot check — sign in via Google Account Hub [s]"
+                .to_string(),
+        );
+    }
+    if let Some(code) = exit_code {
+        if code != 0 {
+            let err_line = stderr_text
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| {
+                    !l.is_empty()
+                        && (l.contains("ERROR:")
+                            || l.contains("[ytdl_hook]")
+                            || l.contains("Failed")
+                            || l.contains("Error"))
+                })
+                .or_else(|| stderr_text.lines().rev().map(str::trim).find(|l| !l.is_empty()));
+            if let Some(line) = err_line {
+                let mut clipped: String = line.chars().take(110).collect();
+                if line.chars().count() > 110 {
+                    clipped.push_str("...");
+                }
+                return Some(format!("Playback exited (code {code}): {clipped}"));
+            }
+            return Some(format!("Playback exited unexpectedly (code {code})"));
+        }
+    }
+    None
 }
 
 /// Generate platform-appropriate mpv IPC socket/pipe path for a playback session.
@@ -2022,5 +2078,31 @@ mod tests {
         assert!(!bypassed.contains("equalizer="));
         assert!(!bypassed.contains("volume="));
         assert!(bypassed.contains("extrastereo=m=1.45"));
+    }
+
+    #[test]
+    fn test_classify_player_crash_stderr_and_ignore_config_flag() {
+        assert!(classify_player_crash_stderr("", Some(0)).is_none());
+        let outdated = classify_player_crash_stderr(
+            "[ytdl_hook] ERROR: TypeError: a.addOnDisposeCallback is not a function",
+            Some(2),
+        )
+        .unwrap();
+        assert!(outdated.contains("yt-dlp YouTube extractor outdated"));
+
+        let err413 = classify_player_crash_stderr(
+            "[ytdl_hook] WARNING: HTTP Error 413: Request Entity Too Large",
+            Some(2),
+        )
+        .unwrap();
+        assert!(err413.contains("HTTP 413"));
+
+        let generic = classify_player_crash_stderr(
+            "[ffmpeg] TLS fatal error\nERROR: failed to open stream",
+            Some(1),
+        )
+        .unwrap();
+        assert!(generic.contains("code 1"));
+        assert!(generic.contains("ERROR: failed to open stream"));
     }
 }
