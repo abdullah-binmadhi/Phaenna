@@ -679,19 +679,21 @@ pub async fn save_playback_progress(
     .execute(&mut *tx)
     .await?;
 
-    if position_secs >= 10.0 && (duration_secs <= 0.0 || (position_secs / duration_secs) < 0.85) {
+    // Only update resume timestamp if the video is already queued in Continue Watching;
+    // un-queued playback must NOT auto-insert into Continue Watching.
+    if position_secs >= 1.0 {
         sqlx::query(
-            "INSERT INTO continue_watching (video_id, last_pos_secs, duration_secs, last_watched_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(video_id) DO UPDATE SET
-                last_pos_secs   = excluded.last_pos_secs,
-                duration_secs   = excluded.duration_secs,
-                last_watched_at = excluded.last_watched_at",
+            "UPDATE continue_watching
+             SET last_pos_secs   = ?,
+                 duration_secs   = CASE WHEN ? > 0.0 THEN ? ELSE duration_secs END,
+                 last_watched_at = ?
+             WHERE video_id = ?",
         )
-        .bind(clean)
         .bind(position_secs)
         .bind(duration_secs)
+        .bind(duration_secs)
         .bind(now)
+        .bind(clean)
         .execute(&mut *tx)
         .await?;
     }
@@ -1817,12 +1819,25 @@ mod tests {
         upsert_video(&pool, &v1, now).await.unwrap();
         upsert_video(&pool, &v2, now).await.unwrap();
 
+        // Watching an un-queued video saves global resume progress but MUST NOT add it to Continue Watching.
         save_playback_progress(&pool, "testvid0001", 600.0, 1800.0, now)
             .await
             .unwrap();
-        assert_eq!(get_continue_watching(&pool).await.unwrap().len(), 1);
+        assert_eq!(get_continue_watching(&pool).await.unwrap().len(), 0);
         let prog = get_playback_progress(&pool, "testvid0001").await.unwrap().unwrap();
         assert!((prog.0 - 600.0).abs() < 0.01);
+
+        // Explicitly queuing v2 adds it to Continue Watching and live progress updates it in-place.
+        pin_to_continue_watching(&pool, &v2, now).await.unwrap();
+        save_playback_progress(&pool, "testvid0002", 420.0, 2400.0, now + 5)
+            .await
+            .unwrap();
+        let cw = get_continue_watching(&pool).await.unwrap();
+        assert_eq!(cw.len(), 1);
+        assert_eq!(cw[0].id, "testvid0002");
+        let meta = get_continue_watching_meta_map(&pool).await.unwrap();
+        assert!((meta.get("testvid0002").unwrap().last_pos_secs - 420.0).abs() < 0.01);
+        remove_continue_watching(&pool, "testvid0002").await.unwrap();
 
         record_watched(&pool, Some(&v1), "testvid0001", now)
             .await

@@ -88,9 +88,9 @@ use crate::state::{
 use crate::ui::components::cover::{is_yt_grey_placeholder, prepare_16_9_thumbnail};
 use crate::ui::help::confirm_quit_button_rects;
 use crate::ui::home::{
-    compute_grid_metrics, continue_watching_row_at, effective_grid_area, footer_action_at,
-    grid_card_index_at, grid_columns, home_layout, shorts_source_at, top_bar_shelf_at,
-    HomeFooterAction,
+    compute_grid_metrics_for_size, continue_watching_row_at, effective_grid_area, footer_action_at,
+    grid_card_index_at_for_size, grid_columns_for_size, home_layout, shorts_source_at,
+    top_bar_shelf_at, HomeFooterAction,
 };
 use crate::ui::settings::{filtered_hub_items, HubActionId};
 use clap::{Parser, Subcommand};
@@ -330,13 +330,14 @@ async fn main() -> anyhow::Result<()> {
 
         if state.screen == Screen::Home && state.overlay == ActiveOverlay::None {
             if let Some(v) = state.current_home_video() {
+                let grid_size = state.config.grid_card_size;
                 let card_inner_w = crossterm::terminal::size()
                     .map(|(w, h)| {
                         let [_, _, grid, _] = home_layout(ratatui::layout::Rect::new(0, 0, w, h));
-                        let m = compute_grid_metrics(grid);
+                        let m = compute_grid_metrics_for_size(grid, grid_size);
                         m.base_card_width.saturating_sub(2) as usize
                     })
-                    .unwrap_or(28);
+                    .unwrap_or(34);
                 if v.title.chars().count() > card_inner_w.max(12)
                     && state.ticker_focus_started_at.elapsed() >= Duration::from_millis(640)
                     && state.ticker_last_step_at.elapsed() >= Duration::from_millis(160)
@@ -2090,7 +2091,6 @@ async fn handle_app_message(
             pos,
             duration,
         } => {
-            let need_refresh = !state.is_in_continue_watching(&video_id) && pos >= 10.0;
             state.active_playback_pos = pos;
             state.active_playback_dur = duration;
             state.record_telemetry_sample_if_due();
@@ -2100,9 +2100,6 @@ async fn handle_app_message(
                 if duration > 0.0 {
                     meta.duration_secs = duration;
                 }
-            }
-            if need_refresh {
-                refresh_continue_watching_state(state, pool).await;
             }
             if let Some(ref handle) = state.remote_handle {
                 let mut rst = handle.state.write().await;
@@ -2129,32 +2126,35 @@ async fn handle_app_message(
             state.prune_watched_from_recommended();
             refresh_continue_watching_state(state, pool).await;
 
-            let (pos, dur) = if state.active_playback_video_id.as_deref() == Some(video_id.as_str()) {
-                (state.active_playback_pos, state.active_playback_dur)
-            } else {
-                state
-                    .progress_map
-                    .get(&video_id)
-                    .or_else(|| state.progress_map.get(&clean))
-                    .copied()
-                    .unwrap_or((0.0, 0.0))
-            };
-            let sess_opt = state.auth_vault.active_account().cloned();
-            let cpath = state.config.cookies_path().ok();
-            let c_sync = client.clone();
-            tokio::spawn(async move {
-                let _ = report_youtube_watch_progress(
-                    &c_sync,
-                    sess_opt.as_ref(),
-                    cpath.as_deref(),
-                    &video_id,
-                    0.0,
-                    pos.max(1.0),
-                    (dur > 0.0).then_some(dur),
-                    false,
-                )
-                .await;
-            });
+            // Persistent YouTubeWatchSession inside ipc_monitor handles completion flush for active_account;
+            // keep one-shot fallback when only cookies-based sync is active.
+            if state.auth_vault.active_account().is_none() {
+                let (pos, dur) = if state.active_playback_video_id.as_deref() == Some(video_id.as_str()) {
+                    (state.active_playback_pos, state.active_playback_dur)
+                } else {
+                    state
+                        .progress_map
+                        .get(&video_id)
+                        .or_else(|| state.progress_map.get(&clean))
+                        .copied()
+                        .unwrap_or((0.0, 0.0))
+                };
+                let cpath = state.config.cookies_path().ok();
+                let c_sync = client.clone();
+                tokio::spawn(async move {
+                    let _ = report_youtube_watch_progress(
+                        &c_sync,
+                        None,
+                        cpath.as_deref(),
+                        &video_id,
+                        0.0,
+                        pos.max(1.0),
+                        (dur > 0.0).then_some(dur),
+                        false,
+                    )
+                    .await;
+                });
+            }
 
             state.show_toast("Marked watched (85%) + synced to YouTube");
         }
@@ -2170,14 +2170,13 @@ async fn handle_app_message(
                 state.reset_live_playback();
 
                 if let Some(vid) = finished_vid {
-                    if finished_pos > 3.0 {
-                        let sess_opt = state.auth_vault.active_account().cloned();
+                    if finished_pos > 3.0 && state.auth_vault.active_account().is_none() {
                         let cpath = state.config.cookies_path().ok();
                         let c_sync = client.clone();
                         tokio::spawn(async move {
                             let _ = report_youtube_watch_progress(
                                 &c_sync,
-                                sess_opt.as_ref(),
+                                None,
                                 cpath.as_deref(),
                                 &vid,
                                 0.0,
@@ -2970,24 +2969,26 @@ async fn start_nonblocking_playback_with_live_opts(
             }
 
             let sess_sync = state.auth_vault.active_account().cloned();
-            let vid_sync = video.id.clone();
-            let dur_sync = video.duration.map(|d| d as f64);
-            let start_sync = start_pos.unwrap_or(0.0);
-            let c_sync = client.clone();
-            let cpath_sync = cookies_path.clone();
-            tokio::spawn(async move {
-                let _ = report_youtube_watch_progress(
-                    &c_sync,
-                    sess_sync.as_ref(),
-                    cpath_sync.as_deref(),
-                    &vid_sync,
-                    start_sync,
-                    start_sync,
-                    dur_sync,
-                    true,
-                )
-                .await;
-            });
+            if sess_sync.is_none() {
+                let vid_sync = video.id.clone();
+                let dur_sync = video.duration.map(|d| d as f64);
+                let start_sync = start_pos.unwrap_or(0.0);
+                let c_sync = client.clone();
+                let cpath_sync = cookies_path.clone();
+                tokio::spawn(async move {
+                    let _ = report_youtube_watch_progress(
+                        &c_sync,
+                        None,
+                        cpath_sync.as_deref(),
+                        &vid_sync,
+                        start_sync,
+                        start_sync,
+                        dur_sync,
+                        true,
+                    )
+                    .await;
+                });
+            }
 
             let toast_msg = if force_audio_radio {
                 format!(
@@ -3072,6 +3073,7 @@ async fn start_nonblocking_playback_with_live_opts(
                     skip_segments: sb_segs,
                     sponsorblock_fetch,
                     sponsor_osd_toast: state.config.sponsorblock_osd_toast,
+                    youtube_tracking: sess_sync.map(|s| (client.clone(), s)),
                 });
             }
         }
@@ -3761,6 +3763,14 @@ async fn execute_hub_action(
         HubActionId::AmbilightBorders => {
             state.config.ambilight_enabled = !state.config.ambilight_enabled;
             let _ = state.config.save();
+        }
+        HubActionId::GridCardSize => {
+            state.config.grid_card_size = state.config.grid_card_size.next();
+            let _ = state.config.save();
+            state.show_toast(format!(
+                "Browse Grid Size: {}",
+                state.config.grid_card_size.label()
+            ));
         }
         HubActionId::ThemePalette => {
             state.config.theme_index = (state.config.theme_index + 1) % ui::theme::THEMES.len();
@@ -6529,7 +6539,14 @@ async fn handle_mouse_event(
                 let hit = if cw_deck {
                     continue_watching_row_at(grid_area, mouse.column, mouse.row, scroll, total)
                 } else {
-                    grid_card_index_at(card_grid, mouse.column, mouse.row, scroll, total)
+                    grid_card_index_at_for_size(
+                        card_grid,
+                        mouse.column,
+                        mouse.row,
+                        scroll,
+                        total,
+                        state.config.grid_card_size,
+                    )
                 };
                 if let Some(idx) = hit {
                     if state.category_cursors[state.active_category] == idx {
@@ -6573,7 +6590,7 @@ async fn handle_mouse_event(
                     return true;
                 }
             } else {
-                let cols = grid_columns(grid_area.width);
+                let cols = grid_columns_for_size(grid_area.width, state.config.grid_card_size);
                 scroll_down_grid_and_prefetch(state, pool, tx, client, cols, 1, len);
                 return true;
             }
@@ -6583,7 +6600,7 @@ async fn handle_mouse_event(
                 let cur = &mut state.category_cursors[state.active_category];
                 *cur = cur.saturating_sub(1);
             } else {
-                let cols = grid_columns(grid_area.width);
+                let cols = grid_columns_for_size(grid_area.width, state.config.grid_card_size);
                 let cur = &mut state.category_cursors[state.active_category];
                 *cur = cur.saturating_sub(cols);
             }
@@ -7045,11 +7062,12 @@ async fn handle_key_event(
     let list_len = state.current_filtered_videos().len();
     let active_cat = state.categories[state.active_category].0;
     let cw_deck = active_cat == Category::ContinueWatching && !state.continue_watching_grid_mode;
+    let grid_size = state.config.grid_card_size;
     let (cols, visible_rows) = crossterm::terminal::size()
         .map(|(w, h)| {
             let [_, _, grid_area, _] = home_layout(ratatui::layout::Rect::new(0, 0, w, h));
             let card_grid = effective_grid_area(grid_area, active_cat);
-            let m = compute_grid_metrics(card_grid);
+            let m = compute_grid_metrics_for_size(card_grid, grid_size);
             (m.cols, m.visible_rows)
         })
         .unwrap_or((3, 2));

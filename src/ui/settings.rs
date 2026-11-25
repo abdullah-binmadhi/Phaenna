@@ -31,6 +31,7 @@ pub enum HubActionId {
     SubtitlePreset,
     SubtitleCollisionGuard,
     AmbilightBorders,
+    GridCardSize,
     ThemePalette,
     RemoteQrModal,
     CastScan,
@@ -205,6 +206,14 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             keywords: "ambilight glow border color extract theme",
             badge: if cfg.ambilight_enabled { "[ ON ]".to_string() } else { "[ OFF ]".to_string() },
             description: "Sample HSV dominant hues from focused thumbnails to tint active frames.",
+        },
+        HubItem {
+            id: HubActionId::GridCardSize,
+            category: "VISUALS & THEMING",
+            label: "Browse Grid Card Size",
+            keywords: "card size grid large cinema adaptive home shorts subscriptions history watch later layout",
+            badge: format!("[ {} ▾ ]", cfg.grid_card_size.short_badge()),
+            description: "Switch Home -> Watch Later grid between Cinema 4×2 (Search-style large cards) and Adaptive Tall (3–4 wide 16:9 cards, zero slack).",
         },
         HubItem {
             id: HubActionId::ThemePalette,
@@ -459,6 +468,10 @@ mod tests {
         let filtered = filtered_hub_items(&st);
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].id, HubActionId::SponsorBlockMode);
+
+        st.settings_query = "card size".to_string();
+        let grid_filtered = filtered_hub_items(&st);
+        assert!(grid_filtered.iter().any(|it| it.id == HubActionId::GridCardSize));
 
         let backend = TestBackend::new(110, 32);
         let mut term = Terminal::new(backend).unwrap();

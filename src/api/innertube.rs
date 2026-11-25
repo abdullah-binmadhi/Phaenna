@@ -2722,7 +2722,224 @@ fn append_query(base: &str, params: &str) -> String {
     format!("{base}{sep}{params}")
 }
 
-/// Register video view & watchtime progress directly in YouTube watch history.
+/// Build YouTube HTML5 `videostats/watchtime` query string syncing the red watched progress bar & resume timestamp.
+#[allow(clippy::too_many_arguments)]
+pub fn build_watchtime_query(
+    cpn: &str,
+    st_secs: f64,
+    et_secs: f64,
+    cmt_secs: f64,
+    duration_secs: Option<f64>,
+    wall_rt_secs: f64,
+    is_paused: bool,
+    is_final: bool,
+) -> String {
+    let st = st_secs.max(0.0);
+    let et = et_secs.max(st);
+    let cmt = cmt_secs.max(0.0);
+    let rt = wall_rt_secs.max(0.5);
+    let rtn = rt + 30.0;
+    let state = if is_paused || is_final {
+        "paused"
+    } else {
+        "playing"
+    };
+    let mut q = format!(
+        "ver=2&c=WEB&cver={INNERTUBE_CLIENT_VERSION}&cpn={cpn}&st={st:.1}&et={et:.1}&cmt={cmt:.1}&rt={rt:.1}&rtn={rtn:.1}&lact={:.0}&state={state}&volume=100&muted=0",
+        rt * 1000.0
+    );
+    if let Some(dur) = duration_secs.filter(|d| *d > 0.0) {
+        q.push_str(&format!("&len={dur:.1}"));
+    }
+    if is_final {
+        q.push_str("&final=1");
+    }
+    q
+}
+
+/// Persistent YouTube playback tracking session holding one `cpn` + `/player` beacon URLs for the entire video lifecycle.
+#[derive(Debug, Clone)]
+pub struct YouTubeWatchSession {
+    client: reqwest::Client,
+    session: GoogleAccountSession,
+    video_id: String,
+    cpn: String,
+    watchtime_url: Option<String>,
+    duration_secs: Option<f64>,
+    started_at: std::time::Instant,
+    last_flush_at: std::time::Instant,
+    last_reported_pos: f64,
+    pub completed_flushed: bool,
+}
+
+impl YouTubeWatchSession {
+    /// Initialize one persistent tracking session from `/youtubei/v1/player` and send `ptracking` + `playback` + initial `watchtime`.
+    pub async fn start(
+        client: reqwest::Client,
+        session: GoogleAccountSession,
+        video_id: &str,
+        initial_pos_secs: f64,
+        duration_hint_secs: Option<f64>,
+    ) -> Option<Self> {
+        let clean_id = video_id.trim_start_matches("RD").to_string();
+        if clean_id.is_empty() {
+            return None;
+        }
+        let cpn = generate_cpn(&clean_id, now_unix_secs().max(0) as u64);
+        let player_payload = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": INNERTUBE_CLIENT_VERSION,
+                    "hl": "en",
+                    "gl": "US"
+                }
+            },
+            "videoId": clean_id,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS"
+                }
+            }
+        });
+
+        let player_req = client
+            .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&player_payload);
+
+        let resp = apply_innertube_web_headers(player_req, Some(&session))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let player_json: serde_json::Value = resp.json().await.ok()?;
+        let (playback_url, watchtime_url, ptracking_url) =
+            extract_playback_tracking_urls(&player_json);
+        let json_dur = player_json
+            .pointer("/videoDetails/lengthSeconds")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&d| d > 0.0);
+        let duration_secs = duration_hint_secs.filter(|d| *d > 0.0).or(json_dur);
+
+        let referer = format!("https://www.youtube.com/watch?v={clean_id}");
+        let start_pos = initial_pos_secs.max(0.0);
+
+        if let Some(ref p_url) = ptracking_url {
+            let url = append_query(p_url, &format!("cpn={cpn}"));
+            let _ = apply_innertube_web_headers(
+                client.get(&url).timeout(std::time::Duration::from_secs(6)),
+                Some(&session),
+            )
+            .header("Referer", &referer)
+            .send()
+            .await;
+        }
+        if let Some(ref pb_url) = playback_url {
+            let url = append_query(
+                pb_url,
+                &format!(
+                    "ver=2&c=WEB&cver={INNERTUBE_CLIENT_VERSION}&cpn={cpn}&cmt={start_pos:.1}&volume=100&muted=0&rtn=1"
+                ),
+            );
+            let _ = apply_innertube_web_headers(
+                client.get(&url).timeout(std::time::Duration::from_secs(6)),
+                Some(&session),
+            )
+            .header("Referer", &referer)
+            .send()
+            .await;
+        }
+
+        let now = std::time::Instant::now();
+        let mut sess = Self {
+            client,
+            session,
+            video_id: clean_id,
+            cpn,
+            watchtime_url,
+            duration_secs,
+            started_at: now,
+            last_flush_at: now,
+            last_reported_pos: start_pos,
+            completed_flushed: false,
+        };
+        let _ = sess.flush_progress(start_pos, false, false, false).await;
+        Some(sess)
+    }
+
+    pub fn update_duration_hint(&mut self, duration_secs: f64) {
+        if duration_secs > 0.0 && self.duration_secs.is_none() {
+            self.duration_secs = Some(duration_secs);
+        }
+    }
+
+    /// Flush cumulative watchtime progress using the same `cpn` and `/player` `watchtime_url` so YouTube updates the red bar.
+    pub async fn flush_progress(
+        &mut self,
+        current_secs: f64,
+        is_paused: bool,
+        is_final: bool,
+        mark_complete: bool,
+    ) -> bool {
+        let Some(ref wt_url) = self.watchtime_url else {
+            return false;
+        };
+        let target_pos = if mark_complete {
+            self.duration_secs
+                .unwrap_or(current_secs)
+                .max(current_secs)
+        } else {
+            current_secs.max(0.0)
+        };
+        let wall_rt = self.started_at.elapsed().as_secs_f64();
+        let since_flush = self.last_flush_at.elapsed().as_secs_f64().max(1.0);
+
+        // Keep interval physically plausible if the user scrubbed far ahead mid-playback.
+        let mut st = self.last_reported_pos.min(target_pos);
+        if !mark_complete && (target_pos - st) > (since_flush * 2.0 + 18.0) {
+            st = (target_pos - since_flush).max(0.0);
+        }
+
+        let q = build_watchtime_query(
+            &self.cpn,
+            st,
+            target_pos,
+            target_pos,
+            self.duration_secs,
+            wall_rt,
+            is_paused,
+            is_final,
+        );
+        let url = append_query(wt_url, &q);
+        let referer = format!("https://www.youtube.com/watch?v={}", self.video_id);
+        let ok = match apply_innertube_web_headers(
+            self.client.get(&url).timeout(std::time::Duration::from_secs(6)),
+            Some(&self.session),
+        )
+        .header("Referer", &referer)
+        .send()
+        .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        };
+
+        if ok {
+            self.last_reported_pos = target_pos;
+            self.last_flush_at = std::time::Instant::now();
+            if mark_complete {
+                self.completed_flushed = true;
+            }
+        }
+        ok
+    }
+}
+
+/// Register video view & watchtime progress directly in YouTube watch history (one-shot fallback).
 #[allow(clippy::too_many_arguments)]
 pub async fn report_youtube_watch_progress(
     client: &reqwest::Client,
@@ -2796,7 +3013,7 @@ pub async fn report_youtube_watch_progress(
                         let url = append_query(
                             pb_url,
                             &format!(
-                                "ver=2&c=WEB&cver={INNERTUBE_CLIENT_VERSION}&cpn={cpn}&cmt={et:.1}"
+                                "ver=2&c=WEB&cver={INNERTUBE_CLIENT_VERSION}&cpn={cpn}&cmt={et:.1}&volume=100&muted=0&rtn=1"
                             ),
                         );
                         let r = apply_innertube_web_headers(
@@ -2814,12 +3031,16 @@ pub async fn report_youtube_watch_progress(
                     }
 
                     if let Some(ref wt_url) = watchtime_url {
-                        let mut q = format!(
-                            "ver=2&c=WEB&cver={INNERTUBE_CLIENT_VERSION}&cpn={cpn}&st={st:.1}&et={et:.1}&cmt={et:.1}&state=playing"
+                        let q = build_watchtime_query(
+                            &cpn,
+                            st,
+                            et,
+                            et,
+                            duration_secs,
+                            (et - st).max(1.0),
+                            !is_initial_start,
+                            !is_initial_start,
                         );
-                        if let Some(dur) = duration_secs.filter(|d| *d > 0.0) {
-                            q.push_str(&format!("&len={dur:.1}"));
-                        }
                         let url = append_query(wt_url, &q);
                         let r = apply_innertube_web_headers(
                             client.get(&url).timeout(std::time::Duration::from_secs(6)),
@@ -2844,6 +3065,7 @@ pub async fn report_youtube_watch_progress(
             if let Some(ytdlp_bin) = crate::api::player::find_binary("yt-dlp") {
                 let watch_url = format!("https://www.youtube.com/watch?v={clean_id}");
                 let status = tokio::process::Command::new(ytdlp_bin)
+                    .arg("--ignore-config")
                     .arg("--no-warnings")
                     .arg("--simulate")
                     .arg("--skip-download")
@@ -3493,5 +3715,21 @@ mod tests {
         let fb = parse_innertube_video_details_json(&fallback_json, Some(120)).unwrap();
         assert_eq!(fb.chapters.len(), 2);
         assert_eq!(fb.chapters[0].title, "Start");
+    }
+
+    #[test]
+    fn test_build_watchtime_query_heartbeats_and_final() {
+        let mid = build_watchtime_query("ABC1234567890XYZ", 10.0, 30.0, 30.0, Some(600.0), 20.0, false, false);
+        assert!(mid.contains("cpn=ABC1234567890XYZ"));
+        assert!(mid.contains("st=10.0&et=30.0&cmt=30.0"));
+        assert!(mid.contains("rt=20.0&rtn=50.0"));
+        assert!(mid.contains("state=playing"));
+        assert!(mid.contains("len=600.0"));
+        assert!(!mid.contains("final=1"));
+
+        let fin = build_watchtime_query("ABC1234567890XYZ", 510.0, 600.0, 600.0, Some(600.0), 580.0, true, true);
+        assert!(fin.contains("state=paused"));
+        assert!(fin.contains("final=1"));
+        assert!(fin.contains("et=600.0&cmt=600.0"));
     }
 }

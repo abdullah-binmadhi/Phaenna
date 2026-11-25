@@ -2034,6 +2034,44 @@ fn default_sb_min_secs() -> u8 {
     1
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GridCardSize {
+    #[default]
+    #[serde(alias = "cinema", alias = "4x2")]
+    CinemaLarge,
+    #[serde(alias = "adaptive", alias = "tall")]
+    AdaptiveLarge,
+}
+
+#[allow(dead_code)]
+impl GridCardSize {
+    pub const fn all() -> [Self; 2] {
+        [Self::CinemaLarge, Self::AdaptiveLarge]
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::CinemaLarge => Self::AdaptiveLarge,
+            Self::AdaptiveLarge => Self::CinemaLarge,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CinemaLarge => "Cinema Large (3–4 Cols × 2 Tall Rows)",
+            Self::AdaptiveLarge => "Adaptive Large (Wide 16:9 · Zero Slack)",
+        }
+    }
+
+    pub const fn short_badge(self) -> &'static str {
+        match self {
+            Self::CinemaLarge => "Cinema 4×2",
+            Self::AdaptiveLarge => "Adaptive Tall",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -2103,6 +2141,8 @@ pub struct Config {
     #[serde(default = "default_theme_index")]
     pub theme_index: usize,
     #[serde(default)]
+    pub grid_card_size: GridCardSize,
+    #[serde(default)]
     pub google_oauth: GoogleOAuthConfig,
     #[serde(default)]
     pub custom_cookies_path: Option<PathBuf>,
@@ -2158,6 +2198,7 @@ impl Default for Config {
             auto_pip: false,
             ambilight_enabled: true,
             theme_index: default_theme_index(),
+            grid_card_size: GridCardSize::default(),
             google_oauth: GoogleOAuthConfig::default(),
             custom_cookies_path: None,
             cache: CacheConfig::default(),
@@ -2334,6 +2375,23 @@ mod tests {
         let cycled = Player::Mpv.next_for_host();
         assert!(cycled.is_supported_on_host());
         assert_eq!(Player::Mpv.resolve_supported_for_host(), Player::Mpv);
+    }
+
+    #[test]
+    fn test_grid_card_size_cycling_and_toml_roundtrip() {
+        assert_eq!(GridCardSize::default(), GridCardSize::CinemaLarge);
+        assert_eq!(GridCardSize::CinemaLarge.next(), GridCardSize::AdaptiveLarge);
+        assert_eq!(GridCardSize::AdaptiveLarge.next(), GridCardSize::CinemaLarge);
+
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("grid_size.toml");
+        let cfg = Config {
+            grid_card_size: GridCardSize::AdaptiveLarge,
+            ..Default::default()
+        };
+        cfg.save_to_path(&cfg_path).unwrap();
+        let loaded = Config::load_from_path(&cfg_path).unwrap();
+        assert_eq!(loaded.grid_card_size, GridCardSize::AdaptiveLarge);
     }
 
     #[test]

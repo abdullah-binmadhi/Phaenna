@@ -2,6 +2,7 @@
 //! Tracks live `time-pos` & `duration`, persists playback resume state every 4s,
 //! triggers 85% completion watch logging, and performs automatic SponsorBlock segment skipping.
 
+use crate::api::innertube::YouTubeWatchSession;
 use crate::api::sponsorblock::{
     category_label, fetch_sponsor_segments, filter_segments_for_mode_with_outro, from_db_rows,
     SponsorSegment,
@@ -10,10 +11,11 @@ use crate::config::{
     DebandTier, GpuScalerMode, ManualMasteringConfig, MotionMode, NetworkMode, PerformanceMode,
     PictureGrade, SponsorBlockMode, VideoShaderMode,
 };
-use crate::services::substyler::SubtitleStyleConfig;
 use crate::db;
 use crate::messages::AppMessage;
+use crate::services::auth::GoogleAccountSession;
 use crate::services::shaders::{prepare_video_shaders_with_mastering, VideoMasteringProfile};
+use crate::services::substyler::SubtitleStyleConfig;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
@@ -71,6 +73,7 @@ pub struct IpcMonitorConfig {
     pub skip_segments: Vec<SponsorSegment>,
     pub sponsorblock_fetch: Option<(reqwest::Client, SponsorBlockMode, bool)>,
     pub sponsor_osd_toast: bool,
+    pub youtube_tracking: Option<(reqwest::Client, GoogleAccountSession)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1050,6 +1053,25 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
         let mut pending_reset_start = false;
         let mut sb_rx: Option<oneshot::Receiver<Vec<SponsorSegment>>> = None;
 
+        // Persistent YouTube playback + watchtime tracking session (one cpn/plid for entire watch)
+        let mut yt_watch_rx: Option<oneshot::Receiver<Option<YouTubeWatchSession>>> = None;
+        let mut yt_watch: Option<YouTubeWatchSession> = None;
+        let mut yt_heartbeat_count: usize = 0;
+        let mut last_yt_flush = std::time::Instant::now();
+        if let Some((yt_client, yt_sess)) = config.youtube_tracking.clone() {
+            let (y_tx, y_rx) = oneshot::channel();
+            let y_vid = config.video_id.clone();
+            let y_init_pos = config.initial_pos_secs;
+            let y_dur_hint = (config.duration_hint_secs > 0.0).then_some(config.duration_hint_secs);
+            tokio::spawn(async move {
+                let res =
+                    YouTubeWatchSession::start(yt_client, yt_sess, &y_vid, y_init_pos, y_dur_hint)
+                        .await;
+                let _ = y_tx.send(res);
+            });
+            yt_watch_rx = Some(y_rx);
+        }
+
         if skip_segments.is_empty() && !config.is_live {
             if let Some((sb_client, sb_mode, skip_outro)) = config.sponsorblock_fetch.clone() {
                 if sb_mode != SponsorBlockMode::Off {
@@ -1103,6 +1125,19 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                         skip_segments = segs;
                     }
                 }
+                yt_res = async {
+                    match yt_watch_rx.as_mut() {
+                        Some(rx) => rx.await.ok().flatten(),
+                        None => std::future::pending().await,
+                    }
+                }, if yt_watch_rx.is_some() => {
+                    yt_watch_rx = None;
+                    if let Some(mut sess) = yt_res {
+                        sess.update_duration_hint(last_dur);
+                        yt_watch = Some(sess);
+                        last_yt_flush = std::time::Instant::now();
+                    }
+                }
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(PlayerCommand::UpdateSkipSegments(new_segs)) => {
@@ -1154,6 +1189,9 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                             "duration" => {
                                 if val > 0.0 {
                                     last_dur = val;
+                                    if let Some(ref mut yw) = yt_watch {
+                                        yw.update_duration_hint(val);
+                                    }
                                 }
                             }
                             "time-pos" => {
@@ -1221,12 +1259,29 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                         now_unix(),
                                     )
                                     .await;
+                                    if let Some(ref mut yw) = yt_watch {
+                                        yw.flush_progress(last_pos, false, true, true).await;
+                                        last_yt_flush = std::time::Instant::now();
+                                    }
                                     let _ = config
                                         .tx
                                         .send(AppMessage::VideoAutoCompleted {
                                             video_id: config.video_id.clone(),
                                         })
                                         .await;
+                                }
+
+                                // Periodic YouTube watchtime heartbeat matching official [10s, 20s, 30s, then 30s] cadence
+                                let next_yt_gap = if yt_heartbeat_count < 3 { 10 } else { 30 };
+                                if last_yt_flush.elapsed() >= Duration::from_secs(next_yt_gap)
+                                    && last_pos > 1.0
+                                    && !tracker.is_paused
+                                {
+                                    if let Some(ref mut yw) = yt_watch {
+                                        last_yt_flush = std::time::Instant::now();
+                                        yt_heartbeat_count += 1;
+                                        yw.flush_progress(last_pos, false, false, false).await;
+                                    }
                                 }
 
                                 if last_ui_tick.elapsed() >= Duration::from_millis(900) {
@@ -1297,6 +1352,10 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
         }
 
         // Persist final position and session telemetry when mpv closes
+        let completed_at_exit = marked_watched
+            || (!config.is_live
+                && (is_completion_threshold_reached(last_pos, last_dur)
+                    || (last_dur > 0.0 && last_pos >= (last_dur - 4.0).max(last_dur * 0.85))));
         if !config.is_live && last_pos > 3.0 {
             let _ = db::user::save_playback_progress(
                 &config.pool,
@@ -1307,13 +1366,13 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
             )
             .await;
         }
+        if let Some(mut yw) = yt_watch {
+            if !yw.completed_flushed && (last_pos > 3.0 || completed_at_exit) {
+                yw.flush_progress(last_pos, true, true, completed_at_exit).await;
+            }
+        }
         tracker
-            .flush(
-                &config,
-                last_pos,
-                last_dur,
-                marked_watched || (!config.is_live && is_completion_threshold_reached(last_pos, last_dur)),
-            )
+            .flush(&config, last_pos, last_dur, completed_at_exit)
             .await;
 
         #[cfg(unix)]

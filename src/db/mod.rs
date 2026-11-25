@@ -81,6 +81,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'youtube_sync'",
     )
     .await?;
+    // Continue Watching is strictly an explicit manual queue (`[a]`); prune any legacy implicit rows.
+    sqlx::query("DELETE FROM continue_watching WHERE pinned_manually = 0")
+        .execute(pool)
+        .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS user_video_comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
