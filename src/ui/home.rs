@@ -114,9 +114,9 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
 
     let cols = match size_mode {
         GridCardSize::CinemaLarge => {
-            if usable_w >= 136 {
+            if usable_w >= 164 {
                 4
-            } else if usable_w >= 92 {
+            } else if usable_w >= 104 {
                 3
             } else if usable_w >= 56 {
                 2
@@ -146,16 +146,17 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
 
     let (visible_rows, card_height, best_gap) = match size_mode {
         GridCardSize::CinemaLarge => {
-            let rows: usize = if avail_h >= 44 {
+            let rows: usize = if avail_h >= 42 {
                 3
-            } else if avail_h >= 16 {
+            } else if avail_h >= 25 {
                 2
             } else {
                 1
             };
             let rgap: u16 = if rows > 1 && avail_h >= 20 { 1 } else { 0 };
             let total_rgap = (rows.saturating_sub(1) as u16) * rgap;
-            let ch = (avail_h.saturating_sub(total_rgap) / (rows as u16)).max(8);
+            let ch = (avail_h.saturating_sub(total_rgap) / (rows as u16))
+                .clamp(8, 20);
             (rows, ch, rgap)
         }
         GridCardSize::AdaptiveLarge => {
@@ -167,7 +168,7 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
             let mut best_gap = 1u16;
 
             for row_gap in [1u16, 0u16] {
-                for cand_h in (11u16..=18u16).rev() {
+                for cand_h in (12u16..=18u16).rev() {
                     let step = cand_h + row_gap;
                     let rows = ((avail_h + row_gap) / step).max(1) as usize;
                     let used_h =
@@ -382,7 +383,7 @@ pub fn footer_action_at(footer_area: Rect, col: u16, row: u16) -> Option<HomeFoo
 }
 
 pub fn home_layout(frame_area: Rect) -> [Rect; 4] {
-    let hero_h = if frame_area.height < 32 {
+    let hero_h = if frame_area.height <= 36 {
         8
     } else {
         HERO_HEIGHT
@@ -1828,11 +1829,16 @@ mod tests {
     #[test]
     fn test_compute_grid_metrics_fills_width_and_height_cleanly() {
         for mode in [GridCardSize::CinemaLarge, GridCardSize::AdaptiveLarge] {
-            for (w, h) in [(100u16, 30u16), (175, 46), (240, 65)] {
+            for (w, h) in [(100u16, 30u16), (152, 34), (175, 46), (240, 65)] {
                 let [_, _, grid, _] = home_layout(Rect::new(0, 0, w, h));
                 let m = compute_grid_metrics_for_size(grid, mode);
                 assert!(m.cols >= 2 && m.cols <= 4);
                 assert!(m.visible_rows >= 1);
+                assert!(
+                    m.card_height >= 12,
+                    "card_height too short for full-width 16:9 thumbs & [NEW] row at {w}x{h} ({mode:?}): {}",
+                    m.card_height
+                );
 
                 let (last_x, last_w) = m.col_x_and_width(m.cols - 1);
                 let right_edge = last_x + last_w;
