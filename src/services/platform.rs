@@ -199,6 +199,8 @@ impl PlayerCapabilities {
         match dev.recommended_gpu_api {
             "d3d11" if self.has_d3d11 => "d3d11",
             "vulkan" if self.has_vulkan => "vulkan",
+            "auto" => "auto",
+            "opengl" if self.has_opengl => "opengl",
             _ if self.has_vulkan => "vulkan",
             _ if self.has_d3d11 => "d3d11",
             _ => "auto",
@@ -399,7 +401,7 @@ fn infer_gpu_vendor(lower: &str, drm_vendor_hex: Option<&str>) -> GpuVendor {
         GpuVendor::Amd
     } else if lower.contains("intel") || lower.contains("iris") || lower.contains("uhd") || lower.contains("arc") {
         GpuVendor::Intel
-    } else if lower.contains("apple") {
+    } else if lower.contains("apple") || lower.contains("asahi") {
         GpuVendor::Apple
     } else {
         GpuVendor::Unknown
@@ -476,7 +478,7 @@ pub fn parse_linux_profile(
     let (hwdec, gpu_api) = match vendor {
         GpuVendor::Nvidia => ("nvdec", "vulkan"),
         GpuVendor::Amd | GpuVendor::Intel => ("vaapi", "vulkan"),
-        GpuVendor::Apple => ("auto-safe", "vulkan"),
+        GpuVendor::Apple => ("auto-safe", "auto"),
         GpuVendor::Unknown => ("auto-safe", "auto"),
     };
 
@@ -484,6 +486,7 @@ pub fn parse_linux_profile(
         GpuVendor::Nvidia => "NVIDIA GPU",
         GpuVendor::Amd => "AMD Radeon GPU",
         GpuVendor::Intel => "Intel Graphics",
+        GpuVendor::Apple => "Apple Silicon GPU",
         _ => "Linux GPU",
     };
 
@@ -730,6 +733,22 @@ fn probe_device_profile_uncached() -> DeviceProfile {
                         .and_then(|l| l.split(": ").nth(1))
                         .map(|s| s.trim().to_string())
                 })
+            })
+            .or_else(|| {
+                let model = std::fs::read_to_string("/proc/device-tree/model")
+                    .ok()
+                    .map(|s| s.trim_matches('\0').trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let is_asahi = (0..4).any(|i| {
+                    std::fs::read_to_string(format!("/sys/class/drm/card{i}/device/uevent"))
+                        .is_ok_and(|u| u.contains("DRIVER=asahi"))
+                });
+                match (model, is_asahi) {
+                    (Some(m), true) => Some(format!("{m} (Asahi AGX)")),
+                    (Some(m), false) => Some(m),
+                    (None, true) => Some("Apple Silicon GPU (Asahi AGX)".to_string()),
+                    (None, false) => None,
+                }
             });
         let mem_bytes = std::fs::read_to_string("/proc/meminfo").ok().and_then(|txt| {
             txt.lines().find_map(|l| {
@@ -750,10 +769,8 @@ fn probe_device_profile_uncached() -> DeviceProfile {
             .flatten()
             .flatten()
             .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .to_ascii_uppercase()
-                    .starts_with("BAT")
+                let name = e.file_name().to_string_lossy().to_ascii_uppercase();
+                name.starts_with("BAT") || name.contains("BATTERY")
             });
         parse_linux_profile(
             vainfo_out.as_deref(),
@@ -783,6 +800,33 @@ fn probe_device_profile_uncached() -> DeviceProfile {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_has_vulkan_icd() -> bool {
+    for env_key in ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"] {
+        if let Some(val) = std::env::var_os(env_key) {
+            if !val.is_empty() {
+                return true;
+            }
+        }
+    }
+    let mut dirs = vec![
+        std::path::PathBuf::from("/usr/share/vulkan/icd.d"),
+        std::path::PathBuf::from("/etc/vulkan/icd.d"),
+        std::path::PathBuf::from("/usr/local/share/vulkan/icd.d"),
+    ];
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        dirs.push(home.join(".local/share/vulkan/icd.d"));
+    }
+    dirs.into_iter().any(|dir| {
+        std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+    })
+}
+
 fn probe_player_capabilities_uncached() -> PlayerCapabilities {
     let bin_path = find_binary("mpv")
         .or_else(|| find_binary("mpvnet"))
@@ -804,7 +848,13 @@ fn probe_player_capabilities_uncached() -> PlayerCapabilities {
         .unwrap_or_default();
     let list_opts = run_cmd_stdout(&bin, &["--list-options"]).unwrap_or_default();
 
-    parse_mpv_capabilities(&name, &ver, &vo_help, &api_help, &list_opts)
+    #[allow(unused_mut)]
+    let mut caps = parse_mpv_capabilities(&name, &ver, &vo_help, &api_help, &list_opts);
+    #[cfg(target_os = "linux")]
+    {
+        caps.has_vulkan = caps.has_vulkan && linux_has_vulkan_icd();
+    }
+    caps
 }
 
 /// Non-blocking periodic host power & thermal monitor for the Dynamic Governor IPC loop.
@@ -845,12 +895,19 @@ pub async fn poll_host_power_thermal() -> PowerThermalSnapshot {
         if let Ok(mut rd) = tokio::fs::read_dir("/sys/class/power_supply").await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let name = entry.file_name().to_string_lossy().into_owned();
+                let upper = name.to_ascii_uppercase();
                 let base = entry.path();
-                if name.starts_with("AC") || name.starts_with("ADP") {
+                if upper.starts_with("AC")
+                    || upper.starts_with("ADP")
+                    || upper.ends_with("-AC")
+                    || upper == "AC"
+                {
                     if let Ok(v) = tokio::fs::read_to_string(base.join("online")).await {
                         ac_online = Some(v);
                     }
-                } else if name.starts_with("BAT") && bat_cap.is_none() {
+                } else if (upper.starts_with("BAT") || upper.contains("BATTERY"))
+                    && bat_cap.is_none()
+                {
                     bat_status = tokio::fs::read_to_string(base.join("status")).await.ok();
                     bat_cap = tokio::fs::read_to_string(base.join("capacity")).await.ok();
                 }
@@ -1005,6 +1062,20 @@ mod tests {
         assert_eq!(nv.display_server, "X11");
         assert_eq!(nv.recommended_hwdec, "nvdec");
         assert!(nv.hw_av1_decode);
+
+        let asahi = parse_linux_profile(
+            None,
+            None,
+            Some("Apple MacBook Air (13-inch, M2, 2022) (Asahi AGX)"),
+            true,
+            Some(16 * 1024 * 1024 * 1024),
+            true,
+        );
+        assert_eq!(asahi.gpu_vendor, GpuVendor::Apple);
+        assert_eq!(asahi.recommended_hwdec, "auto-safe");
+        assert_eq!(asahi.recommended_gpu_api, "auto");
+        assert!(!asahi.hw_av1_decode);
+        assert!(asahi.is_laptop_or_handheld);
     }
 
     #[test]
