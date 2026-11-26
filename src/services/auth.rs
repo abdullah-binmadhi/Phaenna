@@ -1,40 +1,25 @@
-//! Self-contained In-App Google Sign-In, OAuth2 (Device Code + Kitty Split PKCE),
-//! isolated session vault (`~/.config/phaenna/auth.json`, mode `0600`), and `SAPISIDHASH`
-//! signing — zero browser SQLite cookie scraping.
+//! Isolated Google Browser-Popup Sign-In, `auth.json` (`0600`) multi-account vault,
+//! and InnerTube `SAPISIDHASH` signing — zero daily-browser SQLite scraping.
 
+use crate::api::player::find_binary;
 use crate::config::GoogleOAuthConfig;
 use crate::db::AccountRow;
 use crate::error::{AppError, Result};
-use crate::services::remote::generate_terminal_qr;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use rand::RngCore;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, SET_COOKIE, USER_AGENT};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const GOOGLE_YOUTUBE_SERVICE_LOGIN_URL: &str =
     "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
 
-pub const PKCE_CALLBACK_PORT: u16 = 41933;
-pub const PKCE_REDIRECT_URI: &str = "http://127.0.0.1:41933/google/callback";
-pub const GOOGLE_DEVICE_CODE_ENDPOINT: &str = "https://oauth2.googleapis.com/device/code";
 pub const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
-pub const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-pub const GOOGLE_USERINFO_ENDPOINT: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
-pub const YOUTUBE_CHANNELS_MINE_ENDPOINT: &str =
-    "https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true";
-pub const YOUTUBE_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/youtube openid email profile";
 pub const PHAENNA_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -44,47 +29,6 @@ pub fn now_unix_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// Zeroize-backed password buffer whose memory is scrubbed on clear and drop.
-#[derive(Clone, Default, Zeroize, ZeroizeOnDrop)]
-pub struct SecurePassword(String);
-
-impl std::fmt::Debug for SecurePassword {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SecurePassword([REDACTED])")
-    }
-}
-
-#[allow(dead_code)]
-impl SecurePassword {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn push(&mut self, c: char) {
-        self.0.push(c);
-    }
-
-    pub fn pop(&mut self) {
-        self.0.pop();
-    }
-
-    pub fn clear(&mut self) {
-        self.0.zeroize();
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.chars().count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn masked(&self) -> String {
-        "•".repeat(self.len())
-    }
 }
 
 /// Authentication mechanism that issued a Google session in Phaenna's vault.
@@ -109,7 +53,7 @@ impl AuthKind {
         match self {
             Self::OAuthDevice => "Google Device Code (Auto-Refresh)",
             Self::OAuthPkce => "Google OAuth2 PKCE (Auto-Refresh)",
-            Self::FirstParty => "Google Session (In-App Vault)",
+            Self::FirstParty => "Browser Popup Session (Isolated Vault)",
         }
     }
 }
@@ -142,12 +86,12 @@ pub struct GoogleAccountSession {
 }
 
 impl GoogleAccountSession {
-    /// True when the OAuth2 access token expires within 90 seconds (or is already expired).
+    /// True when an OAuth2 access token expires within 90 seconds (or is already expired).
     pub fn is_token_expiring(&self, now_unix: i64) -> bool {
         matches!(self.expires_at, Some(exp) if now_unix >= exp - 90)
     }
 
-    /// Remaining validity window in seconds (None if session uses persistent cookies without expiry).
+    /// Remaining validity window in seconds (None for persistent browser-popup cookie sessions).
     pub fn token_ttl_secs(&self, now_unix: i64) -> Option<i64> {
         self.expires_at.map(|exp| (exp - now_unix).max(0))
     }
@@ -161,7 +105,7 @@ impl GoogleAccountSession {
             .map(String::as_str)
     }
 
-    /// Deterministic `Cookie:` header built from isolated first-party session cookies.
+    /// Deterministic `Cookie:` header built from isolated session cookies.
     pub fn cookie_header(&self) -> Option<String> {
         if self.cookies.is_empty() {
             return None;
@@ -176,7 +120,7 @@ impl GoogleAccountSession {
         Some(joined)
     }
 
-    /// Format isolated session cookies into a temporary Netscape cookie jar when needed by `yt-dlp`.
+    /// Format isolated session cookies into a Netscape cookie jar for `yt-dlp` / `mpv`.
     pub fn to_netscape_cookies(&self) -> Option<String> {
         if let Some(ref raw) = self.netscape_cookies {
             if !raw.trim().is_empty() {
@@ -337,113 +281,34 @@ fn set_owner_only_perms(path: &Path) {
     }
 }
 
-/// 2FA verification challenge kind presented inline inside `[L]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum ChallengeKind {
-    TotpCode,
-    SmsCode { hint: String },
-    GooglePrompt { number: Option<u8> },
-    BackupCode,
-}
-
-/// OAuth2 flow waiting to resume once the user supplies a Google Cloud OAuth client ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingOAuthFlow {
-    DeviceCode,
-    KittyPkce,
-}
-
-/// Multi-stage state machine driving the `[L]` Google Identity Hub overlay.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Interactive state machine for the `[L]` Google Account Hub modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoginStep {
+    #[default]
     Hub,
-    EmailInput,
-    PasswordInput,
-    TwoFactorChallenge(ChallengeKind),
-    AwaitingDeviceQr,
-    AwaitingKittySso,
-    ClientIdSetup,
+    AwaitingBrowserPopup,
 }
 
-/// Active RFC 8628 Device Code authorization payload rendered inside `[L]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceCodeSession {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_url: String,
-    pub verification_url_complete: String,
-    pub expires_at: i64,
-    pub interval_secs: u64,
-    pub qr_lines: Vec<String>,
-}
-
-/// Interactive state for the `[L]` Google Identity Hub modal.
-#[derive(Debug)]
+/// Interactive state for the `[L]` Google Account Hub modal.
+#[derive(Debug, Default)]
 pub struct LoginUiState {
     pub step: LoginStep,
-    pub email: String,
-    pub password: SecurePassword,
-    pub show_password: bool,
-    pub two_factor_code: String,
-    pub backup_mode: bool,
-    pub client_id_input: String,
-    pub client_secret_input: String,
-    pub setup_field_idx: usize,
-    pub setup_after: Option<PendingOAuthFlow>,
     pub account_cursor: usize,
     pub status_banner: Option<String>,
     pub error_banner: Option<String>,
     pub busy: bool,
-    pub device_session: Option<DeviceCodeSession>,
-    pub kitty_auth_url: Option<String>,
-    pub pending_flow_cookies: HashMap<String, String>,
-    pub pending_challenge_token: Option<String>,
+    pub popup_launcher: Option<String>,
     pub cancel_tx: Option<watch::Sender<bool>>,
 }
 
-impl Default for LoginUiState {
-    fn default() -> Self {
-        Self {
-            step: LoginStep::Hub,
-            email: String::new(),
-            password: SecurePassword::default(),
-            show_password: false,
-            two_factor_code: String::new(),
-            backup_mode: false,
-            client_id_input: String::new(),
-            client_secret_input: String::new(),
-            setup_field_idx: 0,
-            setup_after: None,
-            account_cursor: 0,
-            status_banner: None,
-            error_banner: None,
-            busy: false,
-            device_session: None,
-            kitty_auth_url: None,
-            pending_flow_cookies: HashMap::new(),
-            pending_challenge_token: None,
-            cancel_tx: None,
-        }
-    }
-}
-
 impl LoginUiState {
-    /// Cancel any background pollers/listeners and zeroize sensitive transient buffers.
+    /// Cancel any active popup watcher and clear transient UI flags.
     pub fn reset_transient(&mut self) {
         if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(true);
         }
-        self.password.clear();
-        self.show_password = false;
-        self.two_factor_code.zeroize();
-        self.backup_mode = false;
         self.busy = false;
-        self.device_session = None;
-        self.kitty_auth_url = None;
-        self.pending_flow_cookies.clear();
-        self.pending_challenge_token = None;
-        self.setup_after = None;
+        self.popup_launcher = None;
     }
 
     pub fn back_to_hub(&mut self) {
@@ -452,7 +317,7 @@ impl LoginUiState {
     }
 }
 
-/// Resolved Google OAuth2 client credentials for Device Code / Loopback PKCE.
+/// Resolved Google OAuth2 client credentials (used for silent refresh of legacy OAuth sessions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthClient {
     pub client_id: String,
@@ -506,26 +371,6 @@ pub fn compute_sapisidhash(sapisid: &str, origin: &str, unix_ts: i64) -> String 
     format!("{unix_ts}_{hex}")
 }
 
-/// Generate a 43-character URL-safe PKCE `code_verifier` (RFC 7636).
-pub fn generate_pkce_verifier() -> String {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Compute S256 PKCE `code_challenge = BASE64URL(SHA256(verifier))`.
-pub fn compute_pkce_s256_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    URL_SAFE_NO_PAD.encode(digest)
-}
-
-/// Generate a cryptographic OAuth2 `state` anti-CSRF nonce.
-pub fn generate_oauth_state() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
 fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 2);
     for byte in input.as_bytes() {
@@ -551,638 +396,23 @@ fn encode_form(params: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-fn decode_query_component(s: &str) -> String {
-    let plus_spaces = s.replace('+', " ");
-    let bytes = plus_spaces.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
-                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
-                    decoded.push(val);
-                    i += 3;
-                    continue;
-                }
-            }
-        }
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-/// Parse an HTTP request line `/google/callback?code=...&state=...` into `(code, state)`.
-pub fn parse_oauth_callback_query(request_line: &str) -> Result<(String, String)> {
-    let path_and_query = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| AppError::Auth("Malformed HTTP callback request line".into()))?;
-
-    let (path, query) = path_and_query
-        .split_once('?')
-        .ok_or_else(|| AppError::Auth("OAuth callback missing query parameters".into()))?;
-    if !path.starts_with("/google/callback") {
-        return Err(AppError::Auth(format!("Unexpected callback path: {path}")));
-    }
-
-    let mut code = None;
-    let mut state = None;
-    let mut error = None;
-    for pair in query.split('&') {
-        let Some((k, v)) = pair.split_once('=') else {
-            continue;
-        };
-        let val = decode_query_component(v);
-        match k {
-            "code" => code = Some(val),
-            "state" => state = Some(val),
-            "error" => error = Some(val),
-            _ => {}
-        }
-    }
-
-    if let Some(err) = error {
-        return Err(AppError::Auth(format!("Google returned OAuth error: {err}")));
-    }
-    match (code, state) {
-        (Some(c), Some(s)) if !c.is_empty() && !s.is_empty() => Ok((c, s)),
-        _ => Err(AppError::Auth(
-            "OAuth callback did not include authorization code and state".into(),
-        )),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct DeviceCodeResponse {
-    device_code: String,
-    user_code: String,
-    #[serde(default = "default_verification_url")]
-    verification_url: String,
-    #[serde(default)]
-    verification_url_complete: Option<String>,
-    #[serde(default = "default_expires_in")]
-    expires_in: i64,
-    #[serde(default = "default_poll_interval")]
-    interval: u64,
-}
-
-fn default_verification_url() -> String {
-    "https://www.google.com/device".to_string()
-}
-
-fn default_expires_in() -> i64 {
-    1800
-}
-
-fn default_poll_interval() -> u64 {
-    5
-}
-
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct OAuthTokenResponse {
-    pub access_token: String,
+struct OAuthTokenResponse {
+    access_token: String,
     #[serde(default)]
-    pub refresh_token: Option<String>,
+    refresh_token: Option<String>,
     #[serde(default = "default_token_ttl")]
-    pub expires_in: i64,
-    #[serde(default)]
-    pub token_type: Option<String>,
+    expires_in: i64,
 }
 
 fn default_token_ttl() -> i64 {
     3600
 }
 
-#[derive(Debug, Deserialize)]
-struct OAuthErrorBody {
-    error: String,
-    #[serde(default)]
-    error_description: Option<String>,
-}
-
-/// Classified poll status for RFC 8628 Google Device Code token polling.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DevicePollStatus {
-    Pending,
-    SlowDown,
-    Approved(OAuthTokenResponse),
-    Failed(String),
-}
-
-/// Interpret Google's `/token` response during Device Code polling.
-pub fn parse_device_token_response(status_code: u16, body: &str) -> DevicePollStatus {
-    if (200..300).contains(&status_code) {
-        if let Ok(tok) = serde_json::from_str::<OAuthTokenResponse>(body) {
-            return DevicePollStatus::Approved(tok);
-        }
-    }
-    if let Ok(err) = serde_json::from_str::<OAuthErrorBody>(body) {
-        return match err.error.as_str() {
-            "authorization_pending" => DevicePollStatus::Pending,
-            "slow_down" => DevicePollStatus::SlowDown,
-            "access_denied" => {
-                DevicePollStatus::Failed("Sign-in declined on approval device".to_string())
-            }
-            "expired_token" => {
-                DevicePollStatus::Failed("Device code expired — press [2] to generate a new QR".to_string())
-            }
-            other => DevicePollStatus::Failed(
-                err.error_description
-                    .unwrap_or_else(|| format!("Google OAuth error: {other}")),
-            ),
-        };
-    }
-    DevicePollStatus::Failed(format!(
-        "Unexpected token endpoint response (HTTP {status_code})"
-    ))
-}
-
-/// Flow B — Request a Google Device Code + terminal half-block QR matrix.
-pub async fn request_device_code(
-    client: &reqwest::Client,
-    oauth: &OAuthClient,
-) -> Result<DeviceCodeSession> {
-    let body = encode_form(&[
-        ("client_id", &oauth.client_id),
-        ("scope", YOUTUBE_OAUTH_SCOPE),
-    ]);
-    let resp = client
-        .post(GOOGLE_DEVICE_CODE_ENDPOINT)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await?;
-
-    let status = resp.status();
-    let text = resp.text().await?;
-    if !status.is_success() {
-        let msg = serde_json::from_str::<OAuthErrorBody>(&text)
-            .map(|e| e.error_description.unwrap_or(e.error))
-            .unwrap_or(text);
-        return Err(AppError::Auth(format!(
-            "Google Device Code request failed (HTTP {}): {msg}",
-            status.as_u16()
-        )));
-    }
-
-    let parsed: DeviceCodeResponse = serde_json::from_str(&text)
-        .map_err(|e| AppError::Parse(format!("Invalid Device Code JSON: {e}")))?;
-
-    let full_url = parsed.verification_url_complete.clone().unwrap_or_else(|| {
-        format!(
-            "{}?user_code={}",
-            parsed.verification_url,
-            percent_encode(&parsed.user_code)
-        )
-    });
-    let qr_lines = generate_terminal_qr(&full_url);
-
-    Ok(DeviceCodeSession {
-        device_code: parsed.device_code,
-        user_code: parsed.user_code,
-        verification_url: parsed.verification_url,
-        verification_url_complete: full_url,
-        expires_at: now_unix_secs() + parsed.expires_in,
-        interval_secs: parsed.interval.max(3),
-        qr_lines,
-    })
-}
-
-/// Flow B — Background poller resolving `GoogleAccountSession` once the user approves on phone/device.
-pub async fn poll_device_code_until_done(
-    client: reqwest::Client,
-    oauth: OAuthClient,
-    session: DeviceCodeSession,
-    mut cancel_rx: watch::Receiver<bool>,
-) -> std::result::Result<GoogleAccountSession, String> {
-    let mut interval = session.interval_secs.max(3);
-
-    loop {
-        if *cancel_rx.borrow() {
-            return Err("Cancelled by user".to_string());
-        }
-        if now_unix_secs() >= session.expires_at {
-            return Err("Device code expired — press [2] to generate a fresh QR".to_string());
-        }
-
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    return Err("Cancelled by user".to_string());
-                }
-            }
-        }
-
-        let mut params = vec![
-            ("client_id", oauth.client_id.as_str()),
-            ("device_code", session.device_code.as_str()),
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ];
-        if !oauth.client_secret.is_empty() {
-            params.push(("client_secret", oauth.client_secret.as_str()));
-        }
-
-        let resp = match client
-            .post(GOOGLE_TOKEN_ENDPOINT)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(encode_form(&params))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => continue, // transient network jitter while waiting
-        };
-
-        let status_code = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        match parse_device_token_response(status_code, &body) {
-            DevicePollStatus::Pending => continue,
-            DevicePollStatus::SlowDown => {
-                interval = (interval + 5).min(30);
-            }
-            DevicePollStatus::Failed(reason) => return Err(reason),
-            DevicePollStatus::Approved(tok) => {
-                return build_oauth_session(&client, tok, AuthKind::OAuthDevice)
-                    .await
-                    .map_err(|e| e.to_string());
-            }
-        }
-    }
-}
-
-/// Build Google's OAuth2 authorization URL with S256 PKCE for loopback `127.0.0.1:41933`.
-pub fn build_pkce_authorize_url(client_id: &str, code_challenge: &str, state: &str) -> String {
-    let params = [
-        ("client_id", client_id),
-        ("redirect_uri", PKCE_REDIRECT_URI),
-        ("response_type", "code"),
-        ("scope", YOUTUBE_OAUTH_SCOPE),
-        ("code_challenge", code_challenge),
-        ("code_challenge_method", "S256"),
-        ("state", state),
-        ("access_type", "offline"),
-        ("prompt", "select_account consent"),
-    ];
-    format!("{GOOGLE_AUTH_ENDPOINT}?{}", encode_form(&params))
-}
-
-/// Launch the login page inside Kitty's right split via `terminal-browser` when running inside Kitty,
-/// or fall back cleanly to the platform opener if not inside Kitty.
-pub fn open_url_in_kitty_or_system(url: &str, prefer_kitty_split: bool) -> &'static str {
-    let in_kitty = std::env::var_os("KITTY_PID").is_some();
-    if prefer_kitty_split && in_kitty {
-        if let Ok(child) = std::process::Command::new("terminal-browser")
-            .args(["open", url, "--split", "right", "--size", "0.35"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            let _ = child;
-            return "Kitty right split (terminal-browser)";
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
-
-    "local loopback SSO pane"
-}
-
-fn build_dark_callback_html(title: &str, detail: &str, is_error: bool) -> String {
-    let accent = if is_error { "#f87171" } else { "#4ade80" };
-    let icon = if is_error { "!" } else { "OK" };
-    format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>Phaenna Auth</title>\
-<style>body{{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;\
-background:#0b0b12;color:#f4f4f6;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}}\
-.card{{border:1px solid #27273a;background:#141422;padding:32px 36px;border-radius:14px;\
-max-width:440px;text-align:center;}}.badge{{font-size:36px;color:{accent};margin-bottom:8px;}}\
-h1{{font-size:20px;margin:0 0 8px 0;}}p{{color:#a1a1b5;font-size:14px;line-height:1.5;margin:0;}}\
-</style></head><body><div class='card'><div class='badge'>{icon}</div>\
-<h1>{title}</h1><p>{detail}</p></div></body></html>"
-    )
-}
-
-async fn write_http_response(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(resp.as_bytes()).await;
-    let _ = stream.flush().await;
-}
-
-/// Flow C — Single-shot loopback PKCE OAuth2 listener on `127.0.0.1:41933` with Kitty split support.
-pub async fn run_loopback_pkce_flow(
-    client: reqwest::Client,
-    oauth: OAuthClient,
-    prefer_kitty_split: bool,
-    mut cancel_rx: watch::Receiver<bool>,
-    on_url_ready: impl FnOnce(String, &'static str),
-) -> std::result::Result<GoogleAccountSession, String> {
-    let listener = TcpListener::bind(("127.0.0.1", PKCE_CALLBACK_PORT))
-        .await
-        .map_err(|e| {
-            format!(
-                "Port {PKCE_CALLBACK_PORT} busy or unavailable for OAuth callback: {e}"
-            )
-        })?;
-
-    let verifier = generate_pkce_verifier();
-    let challenge = compute_pkce_s256_challenge(&verifier);
-    let state_nonce = generate_oauth_state();
-    let auth_url = build_pkce_authorize_url(&oauth.client_id, &challenge, &state_nonce);
-    let launcher_label = open_url_in_kitty_or_system(&auth_url, prefer_kitty_split);
-    on_url_ready(auth_url, launcher_label);
-
-    let deadline = tokio::time::sleep(Duration::from_secs(300));
-    tokio::pin!(deadline);
-
-    let code = loop {
-        tokio::select! {
-            _ = &mut deadline => {
-                return Err("Loopback OAuth timed out after 5 minutes".to_string());
-            }
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    return Err("OAuth sign-in cancelled".to_string());
-                }
-            }
-            accepted = listener.accept() => {
-                let (mut stream, _) = accepted.map_err(|e| format!("Callback accept failed: {e}"))?;
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let first_line = req.lines().next().unwrap_or("");
-
-                if first_line.contains("/favicon.ico") {
-                    write_http_response(&mut stream, "404 Not Found", "").await;
-                    continue;
-                }
-
-                match parse_oauth_callback_query(first_line) {
-                    Ok((auth_code, recv_state)) if recv_state == state_nonce => {
-                        let html = build_dark_callback_html(
-                            "Connected to Phaenna",
-                            "Google authorization succeeded. You can close this split pane and return to Phaenna.",
-                            false,
-                        );
-                        write_http_response(&mut stream, "200 OK", &html).await;
-                        break auth_code;
-                    }
-                    Ok(_) => {
-                        let html = build_dark_callback_html(
-                            "Security Check Failed",
-                            "OAuth state nonce mismatch. Please restart sign-in inside Phaenna.",
-                            true,
-                        );
-                        write_http_response(&mut stream, "400 Bad Request", &html).await;
-                        return Err("OAuth state mismatch (possible CSRF interruption)".to_string());
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        let html = build_dark_callback_html("Google Sign-In Cancelled", &msg, true);
-                        write_http_response(&mut stream, "400 Bad Request", &html).await;
-                        return Err(msg);
-                    }
-                }
-            }
-        }
-    };
-
-    let mut params = vec![
-        ("client_id", oauth.client_id.as_str()),
-        ("code", code.as_str()),
-        ("code_verifier", verifier.as_str()),
-        ("grant_type", "authorization_code"),
-        ("redirect_uri", PKCE_REDIRECT_URI),
-    ];
-    if !oauth.client_secret.is_empty() {
-        params.push(("client_secret", oauth.client_secret.as_str()));
-    }
-
-    let resp = client
-        .post(GOOGLE_TOKEN_ENDPOINT)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(encode_form(&params))
-        .send()
-        .await
-        .map_err(|e| format!("Token exchange network error: {e}"))?;
-
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "Token exchange failed (HTTP {}): {text}",
-            status.as_u16()
-        ));
-    }
-
-    let tok: OAuthTokenResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("Invalid OAuth token JSON: {e}"))?;
-    build_oauth_session(&client, tok, AuthKind::OAuthPkce)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Outcome of Flow A in-TUI Google Credential & 2FA submission.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum DirectAuthOutcome {
-    SignedIn(Box<GoogleAccountSession>),
-    NeedsTwoFactor {
-        kind: ChallengeKind,
-        cookies: HashMap<String, String>,
-        challenge_token: Option<String>,
-    },
-    RequiresModernSso {
-        reason: String,
-    },
-}
-
-fn absorb_set_cookies(headers: &reqwest::header::HeaderMap, jar: &mut HashMap<String, String>) {
-    for val in headers.get_all(SET_COOKIE) {
-        if let Ok(raw) = val.to_str() {
-            if let Some((kv, _)) = raw.split_once(';') {
-                if let Some((name, value)) = kv.split_once('=') {
-                    let k = name.trim();
-                    let v = value.trim();
-                    if !k.is_empty() && !v.is_empty() && !v.eq_ignore_ascii_case("deleted") {
-                        jar.insert(k.to_string(), v.to_string());
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn cookie_header_from_map(jar: &HashMap<String, String>) -> String {
-    let mut pairs: Vec<(&String, &String)> = jar.iter().collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    pairs
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 fn has_google_auth_cookies(jar: &HashMap<String, String>) -> bool {
     let has_sid = jar.contains_key("SID") || jar.contains_key("__Secure-3PSID");
     let has_sapisid = jar.contains_key("SAPISID") || jar.contains_key("__Secure-3PAPISID");
     has_sid && has_sapisid
-}
-
-/// Flow A — Submit email & password directly inside Phaenna's TUI without external browsers.
-/// Handles classic cookie issuance, 2-Step Verification detection, and clean Passkey/BotGuard fallback guidance.
-pub async fn submit_direct_credentials(
-    client: &reqwest::Client,
-    email: &str,
-    password: &SecurePassword,
-) -> Result<DirectAuthOutcome> {
-    let trimmed_email = email.trim();
-    if trimmed_email.is_empty() || !trimmed_email.contains('@') {
-        return Err(AppError::Auth("Enter a valid Google email address.".into()));
-    }
-    if password.is_empty() {
-        return Err(AppError::Auth("Password cannot be empty.".into()));
-    }
-
-    let mut jar: HashMap<String, String> = HashMap::new();
-
-    // 1. Prime initial Google ServiceLogin session cookies
-    let init_url = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
-    let init_resp = client
-        .get(init_url)
-        .header(USER_AGENT, PHAENNA_USER_AGENT)
-        .send()
-        .await?;
-    absorb_set_cookies(init_resp.headers(), &mut jar);
-    let init_html = init_resp.text().await.unwrap_or_default();
-
-    let gxf = extract_hidden_input(&init_html, "gxf").unwrap_or_default();
-    let dsh = extract_hidden_input(&init_html, "dsh").unwrap_or_default();
-
-    // 2. Submit credentials to Google's ServiceLoginAuth endpoint with active jar
-    let mut form_fields = vec![
-        ("Email", trimmed_email),
-        ("Passwd", password.as_str()),
-        ("service", "youtube"),
-        ("continue", "https://www.youtube.com/"),
-    ];
-    if !gxf.is_empty() {
-        form_fields.push(("gxf", gxf.as_str()));
-    }
-    if !dsh.is_empty() {
-        form_fields.push(("dsh", dsh.as_str()));
-    }
-
-    let auth_resp = client
-        .post("https://accounts.google.com/signin/v1/lookup")
-        .header(USER_AGENT, PHAENNA_USER_AGENT)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(COOKIE, cookie_header_from_map(&jar))
-        .body(encode_form(&form_fields))
-        .send()
-        .await?;
-    absorb_set_cookies(auth_resp.headers(), &mut jar);
-    let auth_body = auth_resp.text().await.unwrap_or_default();
-
-    if has_google_auth_cookies(&jar) {
-        let mut session = build_first_party_session(trimmed_email, jar, None);
-        hydrate_innertube_identity(client, &mut session).await;
-        return Ok(DirectAuthOutcome::SignedIn(Box::new(session)));
-    }
-
-    // Check for interactive 2FA challenge hints returned by Google
-    let lower = auth_body.to_ascii_lowercase();
-    if lower.contains("totp") || lower.contains("authenticator") {
-        return Ok(DirectAuthOutcome::NeedsTwoFactor {
-            kind: ChallengeKind::TotpCode,
-            cookies: jar,
-            challenge_token: extract_hidden_input(&auth_body, "TL"),
-        });
-    }
-    if lower.contains("sms") || lower.contains("phone") && lower.contains("code") {
-        return Ok(DirectAuthOutcome::NeedsTwoFactor {
-            kind: ChallengeKind::SmsCode {
-                hint: "your recovery phone".to_string(),
-            },
-            cookies: jar,
-            challenge_token: extract_hidden_input(&auth_body, "TL"),
-        });
-    }
-    if lower.contains("prompt") || lower.contains("tap yes") {
-        return Ok(DirectAuthOutcome::NeedsTwoFactor {
-            kind: ChallengeKind::GooglePrompt { number: None },
-            cookies: jar,
-            challenge_token: extract_hidden_input(&auth_body, "TL"),
-        });
-    }
-
-    Ok(DirectAuthOutcome::RequiresModernSso {
-        reason: "Google requires Passkey / JS BotGuard verification for direct password sign-in. Press [1] for Instant Kitty Split Sign-In or [3] for Phone QR.".to_string(),
-    })
-}
-
-/// Flow A — Submit inline 2FA OTP / SMS / Backup code against an active challenge session.
-pub async fn submit_two_factor_challenge(
-    client: &reqwest::Client,
-    email: &str,
-    code: &str,
-    mut jar: HashMap<String, String>,
-    challenge_token: Option<String>,
-) -> Result<DirectAuthOutcome> {
-    let cleaned: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    if cleaned.len() < 6 {
-        return Err(AppError::Auth(
-            "Enter at least 6 digits for 2-Step Verification.".into(),
-        ));
-    }
-
-    let mut fields = vec![("Pin", cleaned.as_str()), ("service", "youtube")];
-    let tl = challenge_token.unwrap_or_default();
-    if !tl.is_empty() {
-        fields.push(("TL", tl.as_str()));
-    }
-
-    let resp = client
-        .post("https://accounts.google.com/signin/challenge/totp")
-        .header(USER_AGENT, PHAENNA_USER_AGENT)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(COOKIE, cookie_header_from_map(&jar))
-        .body(encode_form(&fields))
-        .send()
-        .await?;
-    absorb_set_cookies(resp.headers(), &mut jar);
-
-    if has_google_auth_cookies(&jar) {
-        let mut session = build_first_party_session(email, jar, None);
-        hydrate_innertube_identity(client, &mut session).await;
-        return Ok(DirectAuthOutcome::SignedIn(Box::new(session)));
-    }
-
-    Ok(DirectAuthOutcome::RequiresModernSso {
-        reason: "Google rejected direct 2FA submission (WebAuthn / JS challenge required). Press [1] for Instant Kitty Split Sign-In or [3] for Phone QR.".to_string(),
-    })
-}
-
-fn extract_hidden_input(html: &str, field_name: &str) -> Option<String> {
-    let needle = format!("name=\"{field_name}\"");
-    let pos = html.find(&needle)?;
-    let window = &html[pos..html.len().min(pos + 300)];
-    let val_pos = window.find("value=\"")?;
-    let rest = &window[val_pos + 7..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 fn build_first_party_session(
@@ -1398,7 +628,9 @@ async fn cdp_fetch_cookies_and_optionally_close(
     if close_after_capture && has_google_auth_cookies(&jar) && jar.contains_key("LOGIN_INFO") {
         if is_dedicated_instance {
             let _ = ws_tx
-                .send(Message::Text(r#"{"id":2,"method":"Browser.close","params":{}}"#.into()))
+                .send(Message::Text(
+                    r#"{"id":2,"method":"Browser.close","params":{}}"#.into(),
+                ))
                 .await;
         } else {
             for tid in auth_target_ids {
@@ -1416,12 +648,223 @@ async fn cdp_fetch_cookies_and_optionally_close(
     Some((jar, netscape, target_urls))
 }
 
-/// Zero-Setup Flow: Open Google's official YouTube sign-in inside Kitty's right split
-/// (`terminal-browser --split right --no-merge`) and bridge authenticated session cookies via CDP.
-pub async fn run_kitty_split_google_signin(
-    client: reqwest::Client,
+fn find_chromium_popup_browser() -> Option<(PathBuf, &'static str)> {
+    let candidates: &[(&str, &str)] = &[
+        ("chromium", "Chromium"),
+        ("chromium-browser", "Chromium"),
+        ("google-chrome", "Google Chrome"),
+        ("google-chrome-stable", "Google Chrome"),
+        ("brave", "Brave"),
+        ("brave-browser", "Brave"),
+        ("microsoft-edge", "Microsoft Edge"),
+        ("microsoft-edge-stable", "Microsoft Edge"),
+        ("vivaldi", "Vivaldi"),
+        ("vivaldi-stable", "Vivaldi"),
+    ];
+    for (bin, label) in candidates {
+        if let Some(path) = find_binary(bin) {
+            return Some((path, label));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mac_apps: &[(&str, &str)] = &[
+            (
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "Google Chrome",
+            ),
+            (
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                "Brave",
+            ),
+            (
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                "Chromium",
+            ),
+            (
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "Microsoft Edge",
+            ),
+        ];
+        for (p, label) in mac_apps {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                return Some((path, label));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let win_bins: &[(&str, &str)] = &[
+            (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "Google Chrome"),
+            (r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "Google Chrome"),
+            (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", "Brave"),
+            (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "Microsoft Edge"),
+        ];
+        for (p, label) in win_bins {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                return Some((path, label));
+            }
+        }
+    }
+
+    None
+}
+
+fn allocate_ephemeral_cdp_port() -> std::result::Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("Failed to allocate local CDP port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed reading local CDP port: {e}"))?
+        .port();
+    Ok(port)
+}
+
+/// RAII cleanup guard ensuring an isolated popup browser process and temporary profile dir never leak.
+struct PopupBrowserGuard {
+    child: Option<Child>,
+    profile_dir: PathBuf,
+}
+
+impl PopupBrowserGuard {
+    fn shutdown(&mut self) {
+        if let Some(ref mut ch) = self.child {
+            match ch.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    let _ = ch.kill();
+                    let _ = ch.wait();
+                }
+            }
+        }
+        self.child = None;
+        let _ = std::fs::remove_dir_all(&self.profile_dir);
+    }
+}
+
+impl Drop for PopupBrowserGuard {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Build the Chromium `--app` popup launch argument vector (pure helper for unit tests).
+pub fn build_chromium_popup_args(port: u16, profile_dir: &Path, url: &str) -> Vec<String> {
+    vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", profile_dir.to_string_lossy()),
+        format!("--app={url}"),
+        "--window-size=500,720".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--new-window".to_string(),
+    ]
+}
+
+fn session_ready_from_cdp(
+    jar: &HashMap<String, String>,
+    urls: &[String],
+) -> bool {
+    let still_on_accounts = urls.iter().any(|u| u.contains("accounts.google.com"));
+    let landed_on_youtube = urls.iter().any(|u| u.contains("youtube.com"));
+    !still_on_accounts
+        && (landed_on_youtube || jar.contains_key("LOGIN_INFO"))
+        && has_google_auth_cookies(jar)
+        && jar.contains_key("LOGIN_INFO")
+}
+
+async fn run_chromium_popup_signin(
+    client: &reqwest::Client,
+    browser_path: &Path,
+    browser_label: &str,
     mut cancel_rx: watch::Receiver<bool>,
-    on_status: impl Fn(String),
+    on_ready: impl FnOnce(String),
+) -> std::result::Result<GoogleAccountSession, String> {
+    let port = allocate_ephemeral_cdp_port()?;
+    let profile_dir = std::env::temp_dir().join(format!(
+        "phaenna-auth-popup-{}-{}",
+        std::process::id(),
+        port
+    ));
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    std::fs::create_dir_all(&profile_dir)
+        .map_err(|e| format!("Failed creating temporary browser profile: {e}"))?;
+
+    let args = build_chromium_popup_args(port, &profile_dir, GOOGLE_YOUTUBE_SERVICE_LOGIN_URL);
+    let child = Command::new(browser_path)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed launching {browser_label} popup: {e}"))?;
+
+    let mut guard = PopupBrowserGuard {
+        child: Some(child),
+        profile_dir,
+    };
+
+    on_ready(format!("{browser_label} popup"));
+
+    let deadline = tokio::time::sleep(Duration::from_secs(300));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                guard.shutdown();
+                return Err("Browser sign-in timed out after 5 minutes".to_string());
+            }
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    guard.shutdown();
+                    return Err("Sign-in cancelled".to_string());
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(900)) => {}
+        }
+
+        if *cancel_rx.borrow() {
+            guard.shutdown();
+            return Err("Sign-in cancelled".to_string());
+        }
+
+        if let Some(ref mut ch) = guard.child {
+            if let Ok(Some(_)) = ch.try_wait() {
+                guard.shutdown();
+                return Err(
+                    "Browser sign-in window was closed before completing login.".to_string(),
+                );
+            }
+        }
+
+        let Some((jar, netscape, target_urls)) =
+            cdp_fetch_cookies_and_optionally_close(client, port, false, true).await
+        else {
+            continue;
+        };
+
+        if session_ready_from_cdp(&jar, &target_urls) {
+            let _ = cdp_fetch_cookies_and_optionally_close(client, port, true, true).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            guard.shutdown();
+
+            let mut session =
+                build_first_party_session("google-account@youtube", jar, Some(netscape));
+            hydrate_innertube_identity(client, &mut session).await;
+            return Ok(session);
+        }
+    }
+}
+
+async fn run_terminal_browser_popup_signin(
+    client: &reqwest::Client,
+    mut cancel_rx: watch::Receiver<bool>,
+    on_ready: impl FnOnce(String),
 ) -> std::result::Result<GoogleAccountSession, String> {
     let pre_existing_ports: HashSet<u16> = discover_terminal_browser_instances()
         .await
@@ -1429,7 +872,7 @@ pub async fn run_kitty_split_google_signin(
         .map(|(p, _)| p)
         .collect();
 
-    std::process::Command::new("terminal-browser")
+    Command::new("terminal-browser")
         .args([
             "open",
             GOOGLE_YOUTUBE_SERVICE_LOGIN_URL,
@@ -1443,16 +886,9 @@ pub async fn run_kitty_split_google_signin(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| {
-            format!(
-                "Could not launch terminal-browser ({e}). Use [2] In-TUI Form or ensure terminal-browser is in PATH."
-            )
-        })?;
+        .map_err(|e| format!("Could not launch terminal-browser ({e})"))?;
 
-    on_status(
-        "Opened Google Sign-In in Kitty right split — sign in there to connect automatically"
-            .to_string(),
-    );
+    on_ready("Kitty split (terminal-browser)".to_string());
 
     let deadline = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(deadline);
@@ -1460,59 +896,77 @@ pub async fn run_kitty_split_google_signin(
     loop {
         tokio::select! {
             _ = &mut deadline => {
-                return Err("Kitty split sign-in timed out after 5 minutes".to_string());
+                return Err("Browser sign-in timed out after 5 minutes".to_string());
             }
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
-                    return Err("OAuth sign-in cancelled".to_string());
+                    return Err("Sign-in cancelled".to_string());
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(1200)) => {}
         }
 
         if *cancel_rx.borrow() {
-            return Err("OAuth sign-in cancelled".to_string());
+            return Err("Sign-in cancelled".to_string());
         }
 
-        let instances = discover_terminal_browser_instances().await;
-        // Prefer newly spawned split pane before any pre-existing terminal-browser windows.
-        let mut ordered = instances.clone();
+        let mut ordered = discover_terminal_browser_instances().await;
         ordered.sort_by_key(|(port, _)| usize::from(pre_existing_ports.contains(port)));
 
         for (port, ls_urls) in ordered {
             let Some((jar, netscape, target_urls)) =
-                cdp_fetch_cookies_and_optionally_close(&client, port, false, false).await
+                cdp_fetch_cookies_and_optionally_close(client, port, false, false).await
             else {
                 continue;
             };
 
-            let all_urls: Vec<&String> = if target_urls.is_empty() {
-                ls_urls.iter().collect()
+            let all_urls: Vec<String> = if target_urls.is_empty() {
+                ls_urls
             } else {
-                target_urls.iter().collect()
+                target_urls
             };
-            let still_on_accounts = all_urls.iter().any(|u| u.contains("accounts.google.com"));
-            let landed_on_youtube = all_urls.iter().any(|u| u.contains("youtube.com"));
 
-            if !still_on_accounts
-                && (landed_on_youtube || jar.contains_key("LOGIN_INFO"))
-                && has_google_auth_cookies(&jar)
-                && jar.contains_key("LOGIN_INFO")
-            {
+            if session_ready_from_cdp(&jar, &all_urls) {
                 let is_dedicated = !pre_existing_ports.contains(&port);
                 let _ =
-                    cdp_fetch_cookies_and_optionally_close(&client, port, true, is_dedicated).await;
+                    cdp_fetch_cookies_and_optionally_close(client, port, true, is_dedicated).await;
 
                 let mut session =
                     build_first_party_session("google-account@youtube", jar, Some(netscape));
-                hydrate_innertube_identity(&client, &mut session).await;
+                hydrate_innertube_identity(client, &mut session).await;
                 return Ok(session);
             }
         }
     }
 }
 
-/// Silently refresh an expiring OAuth2 access token using its stored `refresh_token`.
+/// Launch an isolated Browser Popup for official Google Sign-In and auto-capture YouTube cookies via CDP.
+pub async fn run_browser_popup_google_signin(
+    client: reqwest::Client,
+    cancel_rx: watch::Receiver<bool>,
+    on_ready: impl FnOnce(String),
+) -> std::result::Result<GoogleAccountSession, String> {
+    if let Some((path, label)) = find_chromium_popup_browser() {
+        return run_chromium_popup_signin(&client, &path, label, cancel_rx, on_ready).await;
+    }
+
+    if find_binary("terminal-browser").is_some() {
+        return run_terminal_browser_popup_signin(&client, cancel_rx, on_ready).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    let msg = "No Chromium-based browser found (chromium, google-chrome, brave, edge). Install Chromium (e.g. `sudo pacman -S chromium`) and press [Enter] to sign in.";
+    #[cfg(target_os = "macos")]
+    let msg = "No Chromium-based browser found (Google Chrome, Chromium, Brave, Edge). Install Chrome or Chromium and press [Enter] to sign in.";
+    #[cfg(target_os = "windows")]
+    let msg = "No Chromium-based browser found (Edge, Chrome, Brave). Install Edge or Chrome and press [Enter] to sign in.";
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let msg = "No Chromium-based browser found for popup sign-in.";
+
+    Err(msg.to_string())
+}
+
+/// Silently refresh an expiring OAuth2 access token if a legacy OAuth session is stored.
 pub async fn refresh_session_token(
     client: &reqwest::Client,
     oauth: Option<&OAuthClient>,
@@ -1561,104 +1015,6 @@ pub async fn refresh_session_token(
     session.expires_at = Some(now + tok.expires_in);
     session.last_refreshed = now;
     Ok(true)
-}
-
-#[derive(Debug, Deserialize)]
-struct GoogleUserInfo {
-    #[serde(default)]
-    sub: String,
-    #[serde(default)]
-    email: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    picture: Option<String>,
-}
-
-async fn build_oauth_session(
-    client: &reqwest::Client,
-    tok: OAuthTokenResponse,
-    auth_kind: AuthKind,
-) -> Result<GoogleAccountSession> {
-    let now = now_unix_secs();
-    let mut session = GoogleAccountSession {
-        account_id: format!("oauth:{now}"),
-        email: "google-account@youtube".to_string(),
-        display_name: "YouTube Member".to_string(),
-        channel_id: None,
-        channel_handle: None,
-        avatar_url: None,
-        auth_kind,
-        access_token: Some(tok.access_token.clone()),
-        refresh_token: tok.refresh_token,
-        expires_at: Some(now + tok.expires_in),
-        cookies: HashMap::new(),
-        netscape_cookies: None,
-        added_at: now,
-        last_refreshed: now,
-    };
-    hydrate_google_and_youtube_profile(client, &tok.access_token, &mut session).await;
-    Ok(session)
-}
-
-/// Populate email, avatar, and YouTube channel ID/handle using Google OAuth userinfo & YouTube API v3.
-pub async fn hydrate_google_and_youtube_profile(
-    client: &reqwest::Client,
-    access_token: &str,
-    session: &mut GoogleAccountSession,
-) {
-    if let Ok(resp) = client
-        .get(GOOGLE_USERINFO_ENDPOINT)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .send()
-        .await
-    {
-        if resp.status().is_success() {
-            if let Ok(info) = resp.json::<GoogleUserInfo>().await {
-                if !info.sub.is_empty() {
-                    session.account_id = info.sub;
-                }
-                if !info.email.is_empty() {
-                    session.email = info.email;
-                }
-                if let Some(name) = info.name.filter(|s| !s.is_empty()) {
-                    session.display_name = name;
-                }
-                if info.picture.is_some() {
-                    session.avatar_url = info.picture;
-                }
-            }
-        }
-    }
-
-    if let Ok(resp) = client
-        .get(YOUTUBE_CHANNELS_MINE_ENDPOINT)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .send()
-        .await
-    {
-        if resp.status().is_success() {
-            if let Ok(val) = resp.json::<serde_json::Value>().await {
-                if let Some(first) = val
-                    .get("items")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                {
-                    if let Some(cid) = first.get("id").and_then(|v| v.as_str()) {
-                        session.channel_id = Some(cid.to_string());
-                    }
-                    if let Some(snip) = first.get("snippet") {
-                        if let Some(title) = snip.get("title").and_then(|v| v.as_str()) {
-                            session.display_name = title.to_string();
-                        }
-                        if let Some(handle) = snip.get("customUrl").and_then(|v| v.as_str()) {
-                            session.channel_handle = Some(handle.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn extract_menu_text(val: &serde_json::Value) -> Option<String> {
@@ -1720,7 +1076,12 @@ pub fn extract_account_menu_identity(
             serde_json::Value::String(s) => {
                 if handle.is_none() && s.starts_with('@') && s.len() > 2 && !s.contains(' ') {
                     *handle = Some(s.clone());
-                } else if email.is_none() && s.contains('@') && !s.starts_with('@') && s.contains('.') && !s.contains(' ') {
+                } else if email.is_none()
+                    && s.contains('@')
+                    && !s.starts_with('@')
+                    && s.contains('.')
+                    && !s.contains(' ')
+                {
                     *email = Some(s.clone());
                 }
             }
@@ -1773,7 +1134,9 @@ async fn hydrate_innertube_identity(client: &reqwest::Client, session: &mut Goog
                 }
                 if let Some(h) = handle {
                     session.channel_handle = Some(h.clone());
-                    if session.display_name == "Google User" || session.display_name == "google-account" {
+                    if session.display_name == "Google User"
+                        || session.display_name == "google-account"
+                    {
                         session.display_name = h.trim_start_matches('@').to_string();
                     }
                 }
@@ -1794,65 +1157,12 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_pkce_s256_challenge_and_sapisidhash_determinism() {
-        // RFC 7636 Appendix B test vector
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-        assert_eq!(compute_pkce_s256_challenge(verifier), expected);
-
-        let gen = generate_pkce_verifier();
-        assert_eq!(gen.len(), 43);
-
+    fn test_sapisidhash_determinism() {
         let h1 = compute_sapisidhash("test_sapisid", "https://www.youtube.com", 1_700_000_000);
         let h2 = compute_sapisidhash("test_sapisid", "https://www.youtube.com", 1_700_000_000);
         assert_eq!(h1, h2);
         assert!(h1.starts_with("1700000000_"));
         assert_eq!(h1.len(), "1700000000_".len() + 40);
-    }
-
-    #[test]
-    fn test_parse_device_token_responses() {
-        assert_eq!(
-            parse_device_token_response(428, r#"{"error":"authorization_pending"}"#),
-            DevicePollStatus::Pending
-        );
-        assert_eq!(
-            parse_device_token_response(400, r#"{"error":"slow_down"}"#),
-            DevicePollStatus::SlowDown
-        );
-        assert!(matches!(
-            parse_device_token_response(403, r#"{"error":"access_denied"}"#),
-            DevicePollStatus::Failed(_)
-        ));
-        assert!(matches!(
-            parse_device_token_response(400, r#"{"error":"expired_token"}"#),
-            DevicePollStatus::Failed(_)
-        ));
-        let ok_json = r#"{"access_token":"ya29.abc","refresh_token":"1//xyz","expires_in":3600,"token_type":"Bearer"}"#;
-        match parse_device_token_response(200, ok_json) {
-            DevicePollStatus::Approved(tok) => {
-                assert_eq!(tok.access_token, "ya29.abc");
-                assert_eq!(tok.refresh_token.as_deref(), Some("1//xyz"));
-                assert_eq!(tok.expires_in, 3600);
-            }
-            other => panic!("Expected Approved, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_oauth_callback_query_and_state_validation() {
-        let (code, state) = parse_oauth_callback_query(
-            "GET /google/callback?state=nonce_123&code=4%2F0AfJohX HTTP/1.1",
-        )
-        .unwrap();
-        assert_eq!(code, "4/0AfJohX");
-        assert_eq!(state, "nonce_123");
-
-        assert!(parse_oauth_callback_query(
-            "GET /google/callback?error=access_denied&state=nonce_123 HTTP/1.1"
-        )
-        .is_err());
-        assert!(parse_oauth_callback_query("GET /other?code=a&state=b HTTP/1.1").is_err());
     }
 
     #[test]
@@ -1862,33 +1172,33 @@ mod tests {
 
         let mut vault = AuthVault::default();
         vault.upsert_session(GoogleAccountSession {
-            account_id: "sub_1".into(),
+            account_id: "yt:one@gmail.com".into(),
             email: "one@gmail.com".into(),
             display_name: "Account One".into(),
             channel_id: Some("UC111".into()),
             channel_handle: Some("@one".into()),
             avatar_url: None,
-            auth_kind: AuthKind::OAuthDevice,
-            access_token: Some("tok1".into()),
-            refresh_token: Some("ref1".into()),
-            expires_at: Some(9_999_999_999),
-            cookies: HashMap::new(),
+            auth_kind: AuthKind::FirstParty,
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+            cookies: HashMap::from([("SAPISID".into(), "s1".into())]),
             netscape_cookies: None,
             added_at: 100,
             last_refreshed: 100,
         });
         vault.upsert_session(GoogleAccountSession {
-            account_id: "sub_2".into(),
+            account_id: "yt:two@gmail.com".into(),
             email: "two@gmail.com".into(),
             display_name: "Account Two".into(),
             channel_id: Some("UC222".into()),
             channel_handle: Some("@two".into()),
             avatar_url: None,
-            auth_kind: AuthKind::OAuthPkce,
-            access_token: Some("tok2".into()),
-            refresh_token: Some("ref2".into()),
-            expires_at: Some(9_999_999_999),
-            cookies: HashMap::new(),
+            auth_kind: AuthKind::FirstParty,
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+            cookies: HashMap::from([("SAPISID".into(), "s2".into())]),
             netscape_cookies: None,
             added_at: 200,
             last_refreshed: 200,
@@ -1905,25 +1215,42 @@ mod tests {
 
         let mut loaded = AuthVault::load_from_path(&vault_path).unwrap();
         assert_eq!(loaded.accounts.len(), 2);
-        assert_eq!(loaded.active_account().unwrap().account_id, "sub_2");
+        assert_eq!(loaded.active_account().unwrap().account_id, "yt:two@gmail.com");
 
-        assert!(loaded.set_active("sub_1"));
+        assert!(loaded.set_active("yt:one@gmail.com"));
         assert_eq!(loaded.active_account().unwrap().email, "one@gmail.com");
 
-        assert!(loaded.remove_account("sub_1"));
-        assert_eq!(loaded.active_account().unwrap().account_id, "sub_2");
+        assert!(loaded.remove_account("yt:one@gmail.com"));
+        assert_eq!(loaded.active_account().unwrap().account_id, "yt:two@gmail.com");
     }
 
     #[test]
-    fn test_secure_password_zeroize_and_redacted_debug() {
-        let mut pw = SecurePassword::default();
-        pw.push('s');
-        pw.push('e');
-        pw.push('c');
-        assert_eq!(pw.masked(), "•••");
-        assert_eq!(format!("{pw:?}"), "SecurePassword([REDACTED])");
-        pw.clear();
-        assert!(pw.is_empty());
+    fn test_chromium_popup_args_and_cdp_session_readiness() {
+        let dir = PathBuf::from("/tmp/phaenna-popup-test");
+        let args = build_chromium_popup_args(49152, &dir, GOOGLE_YOUTUBE_SERVICE_LOGIN_URL);
+        assert!(args.contains(&"--remote-debugging-port=49152".to_string()));
+        assert!(args.contains(&"--user-data-dir=/tmp/phaenna-popup-test".to_string()));
+        assert!(args.iter().any(|a| a.starts_with("--app=https://accounts.google.com/")));
+        assert!(args.contains(&"--window-size=500,720".to_string()));
+
+        let mut jar = HashMap::from([
+            ("SAPISID".into(), "sapi".into()),
+            ("SID".into(), "sid".into()),
+            ("LOGIN_INFO".into(), "li".into()),
+        ]);
+        assert!(!session_ready_from_cdp(
+            &jar,
+            &["https://accounts.google.com/v3/signin".to_string()]
+        ));
+        assert!(session_ready_from_cdp(
+            &jar,
+            &["https://www.youtube.com/".to_string()]
+        ));
+        jar.remove("LOGIN_INFO");
+        assert!(!session_ready_from_cdp(
+            &jar,
+            &["https://www.youtube.com/".to_string()]
+        ));
     }
 
     #[test]

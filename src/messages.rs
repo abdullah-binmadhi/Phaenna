@@ -6,11 +6,10 @@ use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
 use crate::db::cache::{VideoItem, VideoStatsUpdate};
-use crate::services::auth::{ChallengeKind, DeviceCodeSession, GoogleAccountSession};
+use crate::services::auth::GoogleAccountSession;
 use crate::services::cast::CastDevice;
 use crate::services::ipc::{LiveIpcEvent, PlayerCommand};
 use crate::services::updater::UpdateInfo;
-use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug)]
@@ -130,18 +129,8 @@ pub enum AppMessage {
     },
 
     // In-App Google Auth & Identity Hub
-    AuthDeviceCodeReady(DeviceCodeSession),
-    AuthKittyUrlReady {
-        url: String,
-        launcher: &'static str,
-    },
-    AuthChallengeRequired {
-        kind: ChallengeKind,
-        cookies: HashMap<String, String>,
-        challenge_token: Option<String>,
-    },
-    AuthNeedsModernSso {
-        reason: String,
+    AuthPopupReady {
+        launcher: String,
     },
     AuthSignedIn(GoogleAccountSession),
     AuthRefreshed(GoogleAccountSession),

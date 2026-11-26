@@ -249,7 +249,7 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             } else {
                 "[ Guest ]".to_string()
             },
-            description: "Sign in inside Phaenna (Email+2FA, Instant QR Device Code, or Kitty Split SSO).",
+            description: "Sign in via isolated Google Browser Popup (Passkeys, 2FA & multi-account vault).",
         },
         HubItem {
             id: HubActionId::UploadRadar,

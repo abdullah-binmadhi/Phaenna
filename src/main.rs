@@ -59,10 +59,8 @@ use crate::db::user::{
 };
 use crate::messages::AppMessage;
 use crate::services::auth::{
-    now_unix_secs, poll_device_code_until_done, refresh_session_token, request_device_code,
-    resolve_oauth_client, run_kitty_split_google_signin, run_loopback_pkce_flow,
-    submit_direct_credentials, submit_two_factor_challenge, ChallengeKind, DirectAuthOutcome,
-    LoginStep, PendingOAuthFlow, GOOGLE_YOUTUBE_SERVICE_LOGIN_URL,
+    now_unix_secs, refresh_session_token, resolve_oauth_client, run_browser_popup_google_signin,
+    LoginStep,
 };
 use crate::services::calendar::{bucket_videos_by_week, compute_week_bounds};
 use crate::services::cast::{discover_devices, resolve_tv_stream_url, start_casting};
@@ -1932,45 +1930,11 @@ async fn handle_app_message(
             };
             entry.next_retry_at = Instant::now() + Duration::from_secs(delay_secs);
         }
-        AppMessage::AuthDeviceCodeReady(dev) => {
-            state.login_ui.busy = false;
-            state.login_ui.error_banner = None;
+        AppMessage::AuthPopupReady { launcher } => {
+            state.login_ui.popup_launcher = Some(launcher.clone());
             state.login_ui.status_banner = Some(format!(
-                "QR Ready! Scan with phone camera or enter {} at google.com/device",
-                dev.user_code
+                "Opened Google Sign-In in {launcher} — complete login to connect"
             ));
-            state.login_ui.device_session = Some(dev);
-            state.login_ui.step = LoginStep::AwaitingDeviceQr;
-        }
-        AppMessage::AuthKittyUrlReady { url, launcher } => {
-            state.login_ui.kitty_auth_url = Some(url);
-            state.login_ui.status_banner = Some(format!(
-                "Opened Google SSO in {launcher} — complete login to return"
-            ));
-        }
-        AppMessage::AuthChallengeRequired {
-            kind,
-            cookies,
-            challenge_token,
-        } => {
-            state.login_ui.busy = false;
-            state.login_ui.password.clear();
-            state.login_ui.two_factor_code.clear();
-            state.login_ui.pending_flow_cookies = cookies;
-            state.login_ui.pending_challenge_token = challenge_token;
-            state.login_ui.error_banner = None;
-            state.login_ui.status_banner = Some(
-                "2-Step Verification requested — enter your 6-digit code inside Phaenna."
-                    .to_string(),
-            );
-            state.login_ui.step = LoginStep::TwoFactorChallenge(kind);
-        }
-        AppMessage::AuthNeedsModernSso { reason } => {
-            state.login_ui.busy = false;
-            state.login_ui.password.clear();
-            state.login_ui.pending_flow_cookies.clear();
-            state.login_ui.step = LoginStep::Hub;
-            state.login_ui.error_banner = Some(reason);
         }
         AppMessage::AuthSignedIn(session) => {
             let label = format!("Signed in as {} ({})", session.display_name, session.email);
@@ -1989,7 +1953,8 @@ async fn handle_app_message(
             state.login_ui.status_banner = Some("Google OAuth2 token silently refreshed".into());
         }
         AppMessage::AuthFailed(err) => {
-            state.login_ui.busy = false;
+            state.login_ui.reset_transient();
+            state.login_ui.step = LoginStep::Hub;
             state.login_ui.error_banner = Some(err.clone());
             state.show_toast(format!("✕ Auth error: {err}"));
         }
@@ -8364,74 +8329,7 @@ async fn persist_auth_vault_and_cookies(state: &AppState, pool: &SqlitePool) {
     }
 }
 
-fn open_client_id_setup(state: &mut AppState, after: Option<PendingOAuthFlow>) {
-    state.login_ui.reset_transient();
-    state.login_ui.error_banner = None;
-    state.login_ui.client_id_input = state
-        .config
-        .google_oauth
-        .client_id
-        .clone()
-        .unwrap_or_default();
-    state.login_ui.client_secret_input = state
-        .config
-        .google_oauth
-        .client_secret
-        .clone()
-        .unwrap_or_default();
-    state.login_ui.setup_field_idx = 0;
-    state.login_ui.setup_after = after;
-    state.login_ui.status_banner = Some(
-        "Enter your Google Cloud OAuth Client ID (TVs / Desktop App) to enable QR & Kitty SSO."
-            .to_string(),
-    );
-    state.login_ui.step = LoginStep::ClientIdSetup;
-}
-
-fn start_device_code_flow(
-    state: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    client: &reqwest::Client,
-) {
-    let Some(oauth) = resolve_oauth_client(&state.config.google_oauth) else {
-        open_client_id_setup(state, Some(PendingOAuthFlow::DeviceCode));
-        return;
-    };
-
-    state.login_ui.reset_transient();
-    state.login_ui.error_banner = None;
-    state.login_ui.busy = true;
-    state.login_ui.step = LoginStep::AwaitingDeviceQr;
-    state.login_ui.status_banner = Some("Requesting Google Device Code & terminal QR...".into());
-
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    state.login_ui.cancel_tx = Some(cancel_tx);
-
-    let c_clone = client.clone();
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        match request_device_code(&c_clone, &oauth).await {
-            Ok(dev) => {
-                let dev_for_poll = dev.clone();
-                let _ = tx_clone.send(AppMessage::AuthDeviceCodeReady(dev)).await;
-                match poll_device_code_until_done(c_clone, oauth, dev_for_poll, cancel_rx).await {
-                    Ok(session) => {
-                        let _ = tx_clone.send(AppMessage::AuthSignedIn(session)).await;
-                    }
-                    Err(e) if e != "Cancelled by user" => {
-                        let _ = tx_clone.send(AppMessage::AuthFailed(e)).await;
-                    }
-                    Err(_) => {}
-                }
-            }
-            Err(e) => {
-                let _ = tx_clone.send(AppMessage::AuthFailed(e.to_string())).await;
-            }
-        }
-    });
-}
-
-fn start_kitty_split_signin(
+fn start_browser_popup_signin(
     state: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
@@ -8439,10 +8337,9 @@ fn start_kitty_split_signin(
     state.login_ui.reset_transient();
     state.login_ui.error_banner = None;
     state.login_ui.busy = true;
-    state.login_ui.step = LoginStep::AwaitingKittySso;
-    state.login_ui.kitty_auth_url = Some(GOOGLE_YOUTUBE_SERVICE_LOGIN_URL.to_string());
+    state.login_ui.step = LoginStep::AwaitingBrowserPopup;
     state.login_ui.status_banner =
-        Some("Launching official Google Sign-In in Kitty right split...".into());
+        Some("Launching isolated Google Sign-In browser popup...".into());
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     state.login_ui.cancel_tx = Some(cancel_tx);
@@ -8451,177 +8348,42 @@ fn start_kitty_split_signin(
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         let tx_status = tx_clone.clone();
-        let res = run_kitty_split_google_signin(c_clone, cancel_rx, move |_status| {
-            let _ = tx_status.try_send(AppMessage::AuthKittyUrlReady {
-                url: GOOGLE_YOUTUBE_SERVICE_LOGIN_URL.to_string(),
-                launcher: "Kitty right split (terminal-browser)",
-            });
+        let res = run_browser_popup_google_signin(c_clone, cancel_rx, move |launcher| {
+            let _ = tx_status.try_send(AppMessage::AuthPopupReady { launcher });
         })
         .await;
         match res {
             Ok(session) => {
                 let _ = tx_clone.send(AppMessage::AuthSignedIn(session)).await;
             }
-            Err(e) if e != "OAuth sign-in cancelled" => {
+            Err(e) if e != "Sign-in cancelled" => {
                 let _ = tx_clone.send(AppMessage::AuthFailed(e)).await;
             }
             Err(_) => {}
         }
     });
-}
-
-fn start_kitty_pkce_flow(
-    state: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    client: &reqwest::Client,
-) {
-    let Some(oauth) = resolve_oauth_client(&state.config.google_oauth) else {
-        open_client_id_setup(state, Some(PendingOAuthFlow::KittyPkce));
-        return;
-    };
-
-    state.login_ui.reset_transient();
-    state.login_ui.error_banner = None;
-    state.login_ui.busy = true;
-    state.login_ui.step = LoginStep::AwaitingKittySso;
-    state.login_ui.status_banner =
-        Some("Starting loopback callback listener on 127.0.0.1:41933...".into());
-
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    state.login_ui.cancel_tx = Some(cancel_tx);
-
-    let c_clone = client.clone();
-    let tx_clone = tx.clone();
-    let prefer_kitty = state.config.google_oauth.prefer_kitty_split;
-    tokio::spawn(async move {
-        let tx_url = tx_clone.clone();
-        let res = run_loopback_pkce_flow(
-            c_clone,
-            oauth,
-            prefer_kitty,
-            cancel_rx,
-            move |url, launcher| {
-                let _ = tx_url.try_send(AppMessage::AuthKittyUrlReady { url, launcher });
-            },
-        )
-        .await;
-        match res {
-            Ok(session) => {
-                let _ = tx_clone.send(AppMessage::AuthSignedIn(session)).await;
-            }
-            Err(e) if e != "OAuth sign-in cancelled" => {
-                let _ = tx_clone.send(AppMessage::AuthFailed(e)).await;
-            }
-            Err(_) => {}
-        }
-    });
-}
-
-fn launch_direct_login(
-    state: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    client: &reqwest::Client,
-) {
-    let email = state.login_ui.email.trim().to_string();
-    let pw = state.login_ui.password.clone();
-    state.login_ui.password.clear();
-    state.login_ui.busy = true;
-    state.login_ui.error_banner = None;
-    state.login_ui.status_banner = Some("Authenticating with Google inside Phaenna...".into());
-
-    let c_clone = client.clone();
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        let msg = match submit_direct_credentials(&c_clone, &email, &pw).await {
-            Ok(DirectAuthOutcome::SignedIn(sess)) => AppMessage::AuthSignedIn(*sess),
-            Ok(DirectAuthOutcome::NeedsTwoFactor {
-                kind,
-                cookies,
-                challenge_token,
-            }) => AppMessage::AuthChallengeRequired {
-                kind,
-                cookies,
-                challenge_token,
-            },
-            Ok(DirectAuthOutcome::RequiresModernSso { reason }) => {
-                AppMessage::AuthNeedsModernSso { reason }
-            }
-            Err(e) => AppMessage::AuthFailed(e.to_string()),
-        };
-        let _ = tx_clone.send(msg).await;
-    });
-}
-
-fn launch_two_factor_submit(
-    state: &mut AppState,
-    tx: &mpsc::Sender<AppMessage>,
-    client: &reqwest::Client,
-) {
-    let email = state.login_ui.email.trim().to_string();
-    let code = state.login_ui.two_factor_code.clone();
-    let cookies = state.login_ui.pending_flow_cookies.clone();
-    let token = state.login_ui.pending_challenge_token.clone();
-
-    state.login_ui.busy = true;
-    state.login_ui.error_banner = None;
-    state.login_ui.status_banner = Some("Verifying 2-Step Verification code...".into());
-
-    let c_clone = client.clone();
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        let msg = match submit_two_factor_challenge(&c_clone, &email, &code, cookies, token).await {
-            Ok(DirectAuthOutcome::SignedIn(sess)) => AppMessage::AuthSignedIn(*sess),
-            Ok(DirectAuthOutcome::NeedsTwoFactor {
-                kind,
-                cookies,
-                challenge_token,
-            }) => AppMessage::AuthChallengeRequired {
-                kind,
-                cookies,
-                challenge_token,
-            },
-            Ok(DirectAuthOutcome::RequiresModernSso { reason }) => {
-                AppMessage::AuthNeedsModernSso { reason }
-            }
-            Err(e) => AppMessage::AuthFailed(e.to_string()),
-        };
-        let _ = tx_clone.send(msg).await;
-    });
-}
-
-fn is_plain_text_char(modifiers: KeyModifiers) -> bool {
-    !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 async fn handle_login_overlay_key(
     code: KeyCode,
-    modifiers: KeyModifiers,
+    _modifiers: KeyModifiers,
     state: &mut AppState,
     pool: &SqlitePool,
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
 ) {
-    match state.login_ui.step.clone() {
+    match state.login_ui.step {
         LoginStep::Hub => match code {
             KeyCode::Esc | KeyCode::Char('L') => {
                 state.login_ui.reset_transient();
                 state.overlay = ActiveOverlay::None;
             }
-            KeyCode::Char('1') | KeyCode::Char('+') => {
-                start_kitty_split_signin(state, tx, client);
+            KeyCode::Char('+') | KeyCode::Char('a') | KeyCode::Char('1') => {
+                start_browser_popup_signin(state, tx, client);
             }
             KeyCode::Enter if !state.auth_vault.is_authenticated() => {
-                start_kitty_split_signin(state, tx, client);
+                start_browser_popup_signin(state, tx, client);
             }
-            KeyCode::Char('2') => {
-                state.login_ui.reset_transient();
-                state.login_ui.error_banner = None;
-                state.login_ui.status_banner =
-                    Some("Step 1/3: Enter your Google or Workspace email address".into());
-                state.login_ui.step = LoginStep::EmailInput;
-            }
-            KeyCode::Char('3') => start_device_code_flow(state, tx, client),
-            KeyCode::Char('o') => open_client_id_setup(state, None),
             KeyCode::Char('r') if state.auth_vault.is_authenticated() => {
                 trigger_swr_feed_refreshes(state, pool, tx, client, true);
                 state.show_toast("Refreshing personalized YouTube shelves...");
@@ -8668,161 +8430,14 @@ async fn handle_login_overlay_key(
             }
             _ => {}
         },
-        LoginStep::EmailInput => match code {
-            KeyCode::Esc => state.login_ui.back_to_hub(),
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                state.login_ui.email.clear();
-            }
-            KeyCode::Backspace => {
-                state.login_ui.email.pop();
-            }
-            KeyCode::Enter => {
-                let trimmed = state.login_ui.email.trim();
-                if trimmed.is_empty() || !trimmed.contains('@') {
-                    state.login_ui.error_banner =
-                        Some("Enter a valid Google email address (e.g. name@gmail.com).".into());
-                } else {
-                    state.login_ui.error_banner = None;
-                    state.login_ui.status_banner =
-                        Some("Step 2/3: Password held strictly in Zeroize RAM".into());
-                    state.login_ui.step = LoginStep::PasswordInput;
-                }
-            }
-            KeyCode::Char(c) if is_plain_text_char(modifiers) => {
-                state.login_ui.email.push(c);
-            }
-            _ => {}
-        },
-        LoginStep::PasswordInput => match code {
+        LoginStep::AwaitingBrowserPopup => match code {
             KeyCode::Esc => {
-                state.login_ui.password.clear();
-                state.login_ui.error_banner = None;
-                state.login_ui.step = LoginStep::EmailInput;
+                state.login_ui.back_to_hub();
+                state.login_ui.status_banner = Some("Browser sign-in cancelled".into());
             }
-            KeyCode::Tab => {
-                state.login_ui.show_password = !state.login_ui.show_password;
-            }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                state.login_ui.password.clear();
-            }
-            KeyCode::Backspace => {
-                state.login_ui.password.pop();
-            }
-            KeyCode::Enter => {
-                if state.login_ui.password.is_empty() {
-                    state.login_ui.error_banner = Some("Password cannot be empty.".into());
-                } else {
-                    launch_direct_login(state, tx, client);
-                }
-            }
-            KeyCode::Char(c) if is_plain_text_char(modifiers) => {
-                state.login_ui.password.push(c);
-            }
-            _ => {}
-        },
-        LoginStep::TwoFactorChallenge(ref kind) => match code {
-            KeyCode::Esc => state.login_ui.back_to_hub(),
-            KeyCode::Char('b') => {
-                state.login_ui.backup_mode = !state.login_ui.backup_mode;
-                state.login_ui.two_factor_code.clear();
-            }
-            KeyCode::Char('3') => start_device_code_flow(state, tx, client),
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                state.login_ui.two_factor_code.clear();
-            }
-            KeyCode::Backspace => {
-                state.login_ui.two_factor_code.pop();
-            }
-            KeyCode::Enter => launch_two_factor_submit(state, tx, client),
-            KeyCode::Char(c) if is_plain_text_char(modifiers) && c.is_ascii_alphanumeric() => {
-                let target_len = if state.login_ui.backup_mode
-                    || matches!(kind, ChallengeKind::BackupCode)
-                {
-                    8
-                } else {
-                    6
-                };
-                if state.login_ui.two_factor_code.len() < target_len {
-                    state.login_ui.two_factor_code.push(c);
-                    if !state.login_ui.backup_mode
-                        && !matches!(kind, ChallengeKind::BackupCode)
-                        && state.login_ui.two_factor_code.len() == 6
-                    {
-                        launch_two_factor_submit(state, tx, client);
-                    }
-                }
-            }
-            _ => {}
-        },
-        LoginStep::AwaitingDeviceQr => match code {
-            KeyCode::Esc => state.login_ui.back_to_hub(),
             KeyCode::Char('L') => {
                 state.login_ui.back_to_hub();
                 state.overlay = ActiveOverlay::None;
-            }
-            KeyCode::Char('3') => start_device_code_flow(state, tx, client),
-            _ => {}
-        },
-        LoginStep::AwaitingKittySso => match code {
-            KeyCode::Esc => state.login_ui.back_to_hub(),
-            KeyCode::Char('L') => {
-                state.login_ui.back_to_hub();
-                state.overlay = ActiveOverlay::None;
-            }
-            _ => {}
-        },
-        LoginStep::ClientIdSetup => match code {
-            KeyCode::Esc => state.login_ui.back_to_hub(),
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                state.login_ui.setup_field_idx = 1 - state.login_ui.setup_field_idx;
-            }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if state.login_ui.setup_field_idx == 0 {
-                    state.login_ui.client_id_input.clear();
-                } else {
-                    state.login_ui.client_secret_input.clear();
-                }
-            }
-            KeyCode::Backspace => {
-                if state.login_ui.setup_field_idx == 0 {
-                    state.login_ui.client_id_input.pop();
-                } else {
-                    state.login_ui.client_secret_input.pop();
-                }
-            }
-            KeyCode::Enter => {
-                let cid = state.login_ui.client_id_input.trim().to_string();
-                let csec = state.login_ui.client_secret_input.trim().to_string();
-                if cid.is_empty() {
-                    state.login_ui.error_banner =
-                        Some("OAuth Client ID cannot be empty.".into());
-                } else {
-                    state.config.google_oauth.client_id = Some(cid);
-                    state.config.google_oauth.client_secret =
-                        if csec.is_empty() { None } else { Some(csec) };
-                    let _ = state.config.save();
-                    state.login_ui.error_banner = None;
-                    state.login_ui.status_banner =
-                        Some("Saved OAuth Client ID to ~/.config/phaenna/config.toml".into());
-                    match state.login_ui.setup_after.take() {
-                        Some(PendingOAuthFlow::DeviceCode) => {
-                            start_device_code_flow(state, tx, client);
-                        }
-                        Some(PendingOAuthFlow::KittyPkce) => {
-                            start_kitty_pkce_flow(state, tx, client);
-                        }
-                        None => {
-                            state.login_ui.step = LoginStep::Hub;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char(c) if is_plain_text_char(modifiers) => {
-                if state.login_ui.setup_field_idx == 0 {
-                    state.login_ui.client_id_input.push(c);
-                } else {
-                    state.login_ui.client_secret_input.push(c);
-                }
             }
             _ => {}
         },
