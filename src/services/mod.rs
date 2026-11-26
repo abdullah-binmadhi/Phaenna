@@ -4,6 +4,7 @@ pub mod cast;
 pub mod downloader;
 pub mod ipc;
 pub mod loading_art;
+pub mod pip;
 pub mod platform;
 pub mod remote;
 pub mod shaders;

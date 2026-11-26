@@ -229,7 +229,8 @@ RIGHT seek 5
 UP add volume 5
 DOWN add volume -5
 m cycle mute
-f cycle fullscreen
+f script-binding phaenna-toggle-fullscreen
+F script-binding phaenna-toggle-fullscreen
 ESC set fullscreen no
 c cycle sub-visibility
 < add speed -0.25
@@ -653,101 +654,17 @@ mp.observe_property("cache-speed", "number", function(_, val) cache_speed = val 
 mp.observe_property("demuxer-cache-duration", "number", function(_, val) cache_dur = val or 0 end)
 
 -- =============================================================================
--- 2. Picture-in-Picture (PiP) Floating Window Controller ([p] / [P])
+-- 2. Picture-in-Picture (PiP) & Fullscreen Controller ([p] / [P] / [f])
 -- =============================================================================
 local pip_idx = 1
 local pip_presets = {
-    { label = "Bottom-Right 30%", scale = 0.30, geom = "30%x30%-24-24", corner = "br", pad = 24 },
-    { label = "Top-Right 30%",    scale = 0.30, geom = "30%x30%-24+24", corner = "tr", pad = 24 },
-    { label = "Bottom-Left 30%",  scale = 0.30, geom = "30%x30%+24-24", corner = "bl", pad = 24 },
-    { label = "Top-Left 30%",     scale = 0.30, geom = "30%x30%+24+24", corner = "tl", pad = 24 },
-    { label = "Compact 22%",      scale = 0.22, geom = "22%x22%-20-20", corner = "br", pad = 20 },
-    { label = "Theater 38%",      scale = 0.38, geom = "38%x38%-28-28", corner = "br", pad = 28 },
+    { label = "Bottom-Right 30%", scale = 0.30, geom = "30%x30%-24-24" },
+    { label = "Top-Right 30%",    scale = 0.30, geom = "30%x30%-24+24" },
+    { label = "Bottom-Left 30%",  scale = 0.30, geom = "30%x30%+24-24" },
+    { label = "Top-Left 30%",     scale = 0.30, geom = "30%x30%+24+24" },
+    { label = "Compact 22%",      scale = 0.22, geom = "22%x22%-20-20" },
+    { label = "Theater 38%",      scale = 0.38, geom = "38%x38%-28-28" },
 }
-
-local function hyprland_sync_pip(enable, pr)
-    local sig = os.getenv("HYPRLAND_INSTANCE_SIGNATURE")
-    if not sig or sig == "" then return end
-    local utils = require("mp.utils")
-    local pid = utils.getpid and utils.getpid() or nil
-    if not pid or pid <= 0 then return end
-
-    local lua_code
-    if enable then
-        lua_code = string.format([[
-local ws = hl.get_windows({ pid = %d })
-local w = ws and ws[1]
-if not w then return end
-local m = w.monitor or (hl.get_monitors() and hl.get_monitors()[1])
-if not m then return end
-local sc = (m.scale and m.scale > 0) and m.scale or 1
-local mw = math.floor(m.width / sc)
-local mh = math.floor(m.height / sc)
-local mx = m.x or 0
-local my = m.y or 0
-local res = m.reserved or {}
-local r_left = res[1] or 0
-local r_top = res[2] or 0
-local r_right = res[3] or 0
-local r_bot = res[4] or 0
-local tw = math.max(240, math.floor(mw * %.2f))
-local th = math.max(135, math.floor(tw * 9 / 16))
-local pad = %d
-local corner = %q
-local px = mx + mw - r_right - tw - pad
-local py = my + mh - r_bot - th - pad
-if corner == "tr" then
-    py = my + r_top + pad
-elseif corner == "bl" then
-    px = mx + r_left + pad
-elseif corner == "tl" then
-    px = mx + r_left + pad
-    py = my + r_top + pad
-end
-hl.dispatch(hl.dsp.window.float({ action = "set", window = w }))
-hl.dispatch(hl.dsp.window.pin({ action = "set", window = w }))
-hl.dispatch(hl.dsp.window.resize({ x = tw, y = th, exact = true, window = w }))
-hl.dispatch(hl.dsp.window.move({ x = px, y = py, window = w }))
-]], pid, pr.scale, pr.pad, pr.corner)
-    else
-        lua_code = string.format([[
-local ws = hl.get_windows({ pid = %d })
-local w = ws and ws[1]
-if not w then return end
-hl.dispatch(hl.dsp.window.pin({ action = "unset", window = w }))
-hl.dispatch(hl.dsp.window.float({ action = "unset", window = w }))
-]], pid)
-    end
-
-    mp.command_native_async({
-        name = "subprocess",
-        playback_only = false,
-        detach = false,
-        capture_stdout = true,
-        capture_stderr = true,
-        args = { "hyprctl", "eval", lua_code },
-    }, function(ok, res)
-        if not ok or (res and res.status ~= 0) then
-            -- Fallback for classic Hyprland (<0.55) keyword dispatchers
-            local sel = "pid:" .. tostring(pid)
-            local batch
-            if enable then
-                batch = string.format(
-                    "dispatch setfloating %s ; dispatch pin %s ; dispatch resizewindowpixel exact %d%% %d%%,%s",
-                    sel, sel, math.floor(pr.scale * 100), math.floor(pr.scale * 100), sel
-                )
-            else
-                batch = string.format("dispatch pin %s ; dispatch settiled %s", sel, sel)
-            end
-            mp.command_native_async({
-                name = "subprocess",
-                playback_only = false,
-                detach = false,
-                args = { "hyprctl", "--batch", batch },
-            }, function() end)
-        end
-    end)
-end
 
 local function apply_pip_preset()
     local pr = pip_presets[pip_idx]
@@ -757,8 +674,15 @@ local function apply_pip_preset()
     mp.set_property_bool("keepaspect-window", true)
     mp.set_property_number("window-scale", pr.scale)
     mp.set_property("geometry", pr.geom)
-    hyprland_sync_pip(true, pr)
     mp.osd_message("◈ PiP Floating: " .. pr.label .. " ([P] corner, [p] exit)", 2.2)
+end
+
+local function exit_pip_window_props()
+    pip_active = false
+    mp.set_property_bool("ontop", false)
+    mp.set_property_bool("border", true)
+    mp.set_property_number("window-scale", 1.0)
+    mp.set_property("geometry", "50%:50%")
 end
 
 local function toggle_pip()
@@ -766,19 +690,10 @@ local function toggle_pip()
     if pip_active then
         apply_pip_preset()
     else
-        mp.set_property_bool("ontop", false)
-        mp.set_property_bool("border", true)
-        mp.set_property_number("window-scale", 1.0)
-        mp.set_property("geometry", "50%:50%")
-        hyprland_sync_pip(false, pip_presets[pip_idx])
+        exit_pip_window_props()
         mp.osd_message("◈ PiP Floating: OFF (Standard Window)", 2.0)
     end
-end
-
-if pip_active then
-    mp.add_timeout(0.35, function()
-        if pip_active then hyprland_sync_pip(true, pip_presets[pip_idx]) end
-    end)
+    mp.commandv("script-message", "phaenna-ipc-toggle-pip", pip_active and "1" or "0", tostring(pip_idx - 1))
 end
 
 local function cycle_pip_corner()
@@ -788,10 +703,33 @@ local function cycle_pip_corner()
         pip_idx = (pip_idx % #pip_presets) + 1
     end
     apply_pip_preset()
+    mp.commandv("script-message", "phaenna-ipc-cycle-pip", tostring(pip_idx - 1))
 end
+
+local function toggle_fullscreen()
+    local next_fs = not mp.get_property_bool("fullscreen", false)
+    if pip_active then
+        next_fs = true
+        exit_pip_window_props()
+    end
+    mp.set_property_bool("fullscreen", next_fs)
+    mp.commandv("script-message", "phaenna-ipc-toggle-fullscreen", next_fs and "1" or "0")
+end
+
+mp.register_script_message("phaenna-pip-sync", function(active_s, idx_s)
+    local next_active = (active_s == "1" or active_s == "true")
+    local idx_num = tonumber(idx_s)
+    if idx_num ~= nil then
+        pip_idx = (math.floor(idx_num) % #pip_presets) + 1
+    end
+    pip_active = next_active
+    if hud_visible then render_info_hud() end
+end)
 
 mp.add_forced_key_binding("p", "phaenna-toggle-pip", toggle_pip)
 mp.add_forced_key_binding("P", "phaenna-cycle-pip-corner", cycle_pip_corner)
+mp.add_forced_key_binding("f", "phaenna-toggle-fullscreen", toggle_fullscreen)
+mp.add_forced_key_binding("F", "phaenna-toggle-fullscreen-upper", toggle_fullscreen)
 
 -- =============================================================================
 -- 3 & 4. Dynamic Thermal/BPP/Cadence Governor + Multi-Color Bento HUD
@@ -1283,6 +1221,17 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         flags.push("vid=no".to_string());
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        flags.push(format!(
+            "wayland-app-id={}",
+            crate::services::pip::PHAENNA_WAYLAND_APP_ID
+        ));
+        flags.push(format!(
+            "x11-name={}",
+            crate::services::pip::PHAENNA_WAYLAND_APP_ID
+        ));
+    }
     if opts.auto_pip {
         flags.push("fullscreen=no".to_string());
         flags.push("ontop=yes".to_string());
@@ -1290,21 +1239,8 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         flags.push("keepaspect-window=yes".to_string());
         flags.push("window-scale=0.30".to_string());
         flags.push("geometry=30%x30%-24-24".to_string());
-        #[cfg(target_os = "linux")]
-        {
-            flags.push("wayland-app-id=phaenna-pip".to_string());
-            flags.push("x11-name=phaenna-pip".to_string());
-            flags.push("autofit=30%x30%".to_string());
-        }
-    } else {
-        #[cfg(target_os = "linux")]
-        {
-            flags.push("wayland-app-id=phaenna-mpv".to_string());
-            flags.push("x11-name=phaenna-mpv".to_string());
-        }
-        if opts.auto_fullscreen {
-            flags.push("fullscreen=yes".to_string());
-        }
+    } else if opts.auto_fullscreen {
+        flags.push("fullscreen=yes".to_string());
     }
 
     if let Some(conf_path) = prepare_youtube_input_conf() {

@@ -243,7 +243,7 @@ pub enum PlayerCommand {
     SetPitchCorrection(bool),
     SetFullscreen(bool),
     SetPipMode(bool),
-    CyclePipCorner,
+    ApplyPipCorner(usize),
     ToggleInfoHud,
     SetThermalHint {
         on_battery: bool,
@@ -492,17 +492,29 @@ impl PlayerCommand {
                 vec![json!({"command": ["set_property", "audio-pitch-correction", on]}).to_string()]
             }
             Self::SetFullscreen(on) => {
-                vec![json!({"command": ["set_property", "fullscreen", on]}).to_string()]
+                if *on {
+                    vec![
+                        json!({"command": ["set_property", "ontop", false]}).to_string(),
+                        json!({"command": ["set_property", "border", true]}).to_string(),
+                        json!({"command": ["set_property", "window-scale", 1.0]}).to_string(),
+                        json!({"command": ["script-message", "phaenna-pip-sync", "0", "0"]}).to_string(),
+                        json!({"command": ["set_property", "fullscreen", true]}).to_string(),
+                    ]
+                } else {
+                    vec![json!({"command": ["set_property", "fullscreen", false]}).to_string()]
+                }
             }
             Self::SetPipMode(on) => {
                 if *on {
+                    let pr = crate::services::pip::pip_preset(0);
                     vec![
                         json!({"command": ["set_property", "fullscreen", false]}).to_string(),
                         json!({"command": ["set_property", "ontop", true]}).to_string(),
                         json!({"command": ["set_property", "border", false]}).to_string(),
                         json!({"command": ["set_property", "keepaspect-window", true]}).to_string(),
-                        json!({"command": ["set_property", "window-scale", 0.30]}).to_string(),
-                        json!({"command": ["set_property", "geometry", "30%x30%-24-24"]}).to_string(),
+                        json!({"command": ["set_property", "window-scale", pr.scale]}).to_string(),
+                        json!({"command": ["set_property", "geometry", pr.mpv_geometry]}).to_string(),
+                        json!({"command": ["script-message", "phaenna-pip-sync", "1", "0"]}).to_string(),
                         json!({"command": ["show-text", "◈ Picture-in-Picture: ON ([p] toggle, [P] corner)", 2400]}).to_string(),
                     ]
                 } else {
@@ -511,12 +523,24 @@ impl PlayerCommand {
                         json!({"command": ["set_property", "border", true]}).to_string(),
                         json!({"command": ["set_property", "window-scale", 1.0]}).to_string(),
                         json!({"command": ["set_property", "geometry", "50%:50%"]}).to_string(),
+                        json!({"command": ["script-message", "phaenna-pip-sync", "0", "0"]}).to_string(),
                         json!({"command": ["show-text", "◈ Picture-in-Picture: OFF (Standard Window)", 2000]}).to_string(),
                     ]
                 }
             }
-            Self::CyclePipCorner => {
-                vec![json!({"command": ["script-binding", "phaenna-cycle-pip-corner"]}).to_string()]
+            Self::ApplyPipCorner(corner_idx) => {
+                let idx = *corner_idx % crate::services::pip::PIP_PRESETS.len();
+                let pr = crate::services::pip::pip_preset(idx);
+                vec![
+                    json!({"command": ["set_property", "fullscreen", false]}).to_string(),
+                    json!({"command": ["set_property", "ontop", true]}).to_string(),
+                    json!({"command": ["set_property", "border", false]}).to_string(),
+                    json!({"command": ["set_property", "keepaspect-window", true]}).to_string(),
+                    json!({"command": ["set_property", "window-scale", pr.scale]}).to_string(),
+                    json!({"command": ["set_property", "geometry", pr.mpv_geometry]}).to_string(),
+                    json!({"command": ["script-message", "phaenna-pip-sync", "1", idx.to_string()]}).to_string(),
+                    json!({"command": ["show-text", format!("◈ PiP Floating: {} ([P] corner, [p] exit)", pr.label), 2200]}).to_string(),
+                ]
             }
             Self::ToggleInfoHud => {
                 vec![json!({"command": ["script-binding", "phaenna-toggle-hud"]}).to_string()]
@@ -722,6 +746,27 @@ pub fn parse_property_change(line: &str) -> Option<(String, f64)> {
         return Some((name, data));
     }
     None
+}
+
+/// Parse mpv JSON-RPC `client-message` event line -> `(message_name, args)`.
+pub fn parse_client_message(line: &str) -> Option<(String, Vec<String>)> {
+    let parsed: Value = serde_json::from_str(line).ok()?;
+    if parsed.get("event")?.as_str()? != "client-message" {
+        return None;
+    }
+    let arr = parsed.get("args")?.as_array()?;
+    let cmd = arr.first()?.as_str()?.to_string();
+    let args = arr
+        .iter()
+        .skip(1)
+        .filter_map(|v| {
+            v.as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| v.as_f64().map(|n| n.to_string()))
+                .or_else(|| v.as_bool().map(|b| b.to_string()))
+        })
+        .collect();
+    Some((cmd, args))
 }
 
 /// Parse any observed mpv property-change line into a typed `LiveIpcEvent`.
@@ -1184,6 +1229,49 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                             .await;
                     }
 
+                    if let Some((cmd_name, args)) = parse_client_message(&line) {
+                        match cmd_name.as_str() {
+                            "phaenna-ipc-toggle-pip" => {
+                                let enabled = args
+                                    .first()
+                                    .is_some_and(|s| s == "1" || s == "true");
+                                let corner_idx = args
+                                    .get(1)
+                                    .and_then(|s| s.parse::<usize>().ok());
+                                let _ = config
+                                    .tx
+                                    .send(AppMessage::PipToggleFromPlayer {
+                                        enabled,
+                                        corner_idx,
+                                    })
+                                    .await;
+                                continue;
+                            }
+                            "phaenna-ipc-cycle-pip" => {
+                                let corner_idx = args
+                                    .first()
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                let _ = config
+                                    .tx
+                                    .send(AppMessage::PipCornerFromPlayer { corner_idx })
+                                    .await;
+                                continue;
+                            }
+                            "phaenna-ipc-toggle-fullscreen" => {
+                                let enabled = args
+                                    .first()
+                                    .is_some_and(|s| s == "1" || s == "true");
+                                let _ = config
+                                    .tx
+                                    .send(AppMessage::FullscreenToggleFromPlayer { enabled })
+                                    .await;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     if let Some((name, val)) = parse_property_change(&line) {
                         match name.as_str() {
                             "duration" => {
@@ -1616,6 +1704,20 @@ mod tests {
         };
         let clean = leaky_track.display_label();
         assert!(!clean.contains("ns=EhC"), "CDN URL params leaked: {clean}");
+
+        let (msg_name, msg_args) = parse_client_message(
+            r#"{"event":"client-message","args":["phaenna-ipc-toggle-pip","1","2"]}"#,
+        )
+        .unwrap();
+        assert_eq!(msg_name, "phaenna-ipc-toggle-pip");
+        assert_eq!(msg_args, vec!["1", "2"]);
+
+        let (fs_name, fs_args) = parse_client_message(
+            r#"{"event":"client-message","args":["phaenna-ipc-toggle-fullscreen","1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(fs_name, "phaenna-ipc-toggle-fullscreen");
+        assert_eq!(fs_args, vec!["1"]);
         assert!(clean.contains("WebM Opus"));
     }
 }

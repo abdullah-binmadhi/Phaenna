@@ -1964,8 +1964,10 @@ async fn handle_app_message(
             sock_path,
             stream_hint,
             is_local,
+            player_pid,
         } => {
             state.reset_live_playback();
+            state.live_playback.player_pid = player_pid;
             state.live_playback.is_local_file = is_local;
             state.live_playback.playback_started_at = Some(Instant::now());
             if let Some((h, fps, tbr)) = stream_hint {
@@ -2158,6 +2160,76 @@ async fn handle_app_message(
                     let mut rst = handle.state.write().await;
                     rst.is_playing = false;
                 }
+            }
+        }
+        AppMessage::PipToggleFromPlayer {
+            enabled,
+            corner_idx,
+        } => {
+            state.live_playback.pip_mode = enabled;
+            state.live_playback.ontop = enabled;
+            state.config.auto_pip = enabled;
+            if enabled {
+                state.live_playback.fullscreen = false;
+                state.config.auto_fullscreen = false;
+                if let Some(idx) = corner_idx {
+                    state.live_playback.pip_corner_idx =
+                        idx % services::pip::PIP_PRESETS.len();
+                }
+            }
+            let _ = state.config.save();
+            spawn_linux_pip_task(
+                enabled,
+                state.live_playback.pip_corner_idx,
+                state.live_playback.player_pid,
+                false,
+                Some(tx.clone()),
+            );
+            state.show_toast(if enabled {
+                "◈ Picture-in-Picture: ON (Floating Corner)"
+            } else {
+                "◈ Picture-in-Picture: OFF (Standard Window)"
+            });
+        }
+        AppMessage::PipCornerFromPlayer { corner_idx } => {
+            let n = services::pip::PIP_PRESETS.len();
+            state.live_playback.pip_mode = true;
+            state.live_playback.ontop = true;
+            state.live_playback.fullscreen = false;
+            state.config.auto_pip = true;
+            state.config.auto_fullscreen = false;
+            state.live_playback.pip_corner_idx = corner_idx % n;
+            let _ = state.config.save();
+            spawn_linux_pip_task(
+                true,
+                state.live_playback.pip_corner_idx,
+                state.live_playback.player_pid,
+                false,
+                Some(tx.clone()),
+            );
+            let label = services::pip::PIP_CORNER_LABELS[state.live_playback.pip_corner_idx % n];
+            state.show_toast(format!("◈ PiP Corner: {label}"));
+        }
+        AppMessage::FullscreenToggleFromPlayer { enabled } => {
+            state.live_playback.fullscreen = enabled;
+            if enabled {
+                state.live_playback.pip_mode = false;
+                state.live_playback.ontop = false;
+                state.config.auto_pip = false;
+                let _ = state.config.save();
+            }
+            spawn_linux_fullscreen_task(enabled, state.live_playback.player_pid, false, Some(tx.clone()));
+            state.show_toast(if enabled {
+                "❖ Fullscreen: ON"
+            } else {
+                "❖ Fullscreen: OFF"
+            });
+        }
+        AppMessage::LinuxPipOutcome(outcome) => {
+            if let services::pip::PipApplyOutcome::UnsupportedCompositor(de) = outcome {
+                state.show_toast(format!(
+                    "◈ PiP positioning isn't supported by {de} Wayland"
+                ));
             }
         }
         AppMessage::DownloadProgress {
@@ -2873,6 +2945,18 @@ async fn start_nonblocking_playback_with_live_opts(
 
     match spawn_player(&opts) {
         Ok(Some(mut child)) => {
+            let player_pid = child.id();
+            if opts.auto_pip {
+                spawn_linux_pip_task(
+                    true,
+                    state.live_playback.pip_corner_idx,
+                    player_pid,
+                    true,
+                    Some(tx.clone()),
+                );
+            } else if opts.auto_fullscreen {
+                spawn_linux_fullscreen_task(true, player_pid, true, Some(tx.clone()));
+            }
             let tx_watch = tx.clone();
             let stderr_pipe = child.stderr.take();
             tokio::spawn(async move {
@@ -3020,6 +3104,7 @@ async fn start_nonblocking_playback_with_live_opts(
                         sock_path: sock_path.clone(),
                         stream_hint,
                         is_local,
+                        player_pid,
                     })
                     .await;
 
@@ -3046,6 +3131,114 @@ async fn start_nonblocking_playback_with_live_opts(
             state.show_toast(format!("✕ {}", e));
         }
     }
+}
+
+fn spawn_linux_pip_task(
+    enabled: bool,
+    corner_idx: usize,
+    player_pid: Option<u32>,
+    wait_for_map: bool,
+    tx: Option<tokio::sync::mpsc::Sender<AppMessage>>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        tokio::spawn(async move {
+            let outcome =
+                services::pip::apply_linux_pip(enabled, corner_idx, player_pid, wait_for_map)
+                    .await;
+            if let Some(sender) = tx {
+                let _ = sender.send(AppMessage::LinuxPipOutcome(outcome)).await;
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (enabled, corner_idx, player_pid, wait_for_map, tx);
+    }
+}
+
+fn spawn_linux_fullscreen_task(
+    enable: bool,
+    player_pid: Option<u32>,
+    wait_for_map: bool,
+    tx: Option<tokio::sync::mpsc::Sender<AppMessage>>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        tokio::spawn(async move {
+            let outcome =
+                services::pip::apply_linux_fullscreen(enable, player_pid, wait_for_map).await;
+            if let Some(sender) = tx {
+                let _ = sender.send(AppMessage::LinuxPipOutcome(outcome)).await;
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (enable, player_pid, wait_for_map, tx);
+    }
+}
+
+fn toggle_live_fullscreen_action(
+    state: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let next = !state.live_playback.fullscreen;
+    state.live_playback.fullscreen = next;
+    if next {
+        state.live_playback.pip_mode = false;
+        state.live_playback.ontop = false;
+        state.config.auto_pip = false;
+        let _ = state.config.save();
+    }
+    state.send_player_cmd(PlayerCommand::SetFullscreen(next));
+    spawn_linux_fullscreen_task(next, state.live_playback.player_pid, false, Some(tx.clone()));
+}
+
+fn toggle_live_pip_action(state: &mut AppState, tx: &tokio::sync::mpsc::Sender<AppMessage>) {
+    let next = !state.live_playback.pip_mode;
+    state.live_playback.pip_mode = next;
+    state.live_playback.ontop = next;
+    state.config.auto_pip = next;
+    if next {
+        state.live_playback.fullscreen = false;
+        state.config.auto_fullscreen = false;
+    }
+    let _ = state.config.save();
+    state.send_player_cmd(PlayerCommand::SetPipMode(next));
+    spawn_linux_pip_task(
+        next,
+        state.live_playback.pip_corner_idx,
+        state.live_playback.player_pid,
+        false,
+        Some(tx.clone()),
+    );
+}
+
+fn cycle_live_pip_corner_action(
+    state: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let n = services::pip::PIP_PRESETS.len();
+    if !state.live_playback.pip_mode {
+        state.live_playback.pip_mode = true;
+        state.live_playback.ontop = true;
+        state.live_playback.fullscreen = false;
+        state.config.auto_pip = true;
+        state.config.auto_fullscreen = false;
+    } else {
+        state.live_playback.pip_corner_idx = (state.live_playback.pip_corner_idx + 1) % n;
+    }
+    let _ = state.config.save();
+    let idx = state.live_playback.pip_corner_idx;
+    state.send_player_cmd(PlayerCommand::ApplyPipCorner(idx));
+    spawn_linux_pip_task(
+        true,
+        idx,
+        state.live_playback.player_pid,
+        false,
+        Some(tx.clone()),
+    );
 }
 
 async fn refresh_continue_watching_state(state: &mut AppState, pool: &SqlitePool) {
@@ -3644,16 +3837,27 @@ async fn execute_hub_action(
                 state.config.auto_pip = false;
             }
             let _ = state.config.save();
+            if state.has_live_ipc() {
+                let on = state.config.auto_fullscreen;
+                state.live_playback.fullscreen = on;
+                if on {
+                    state.live_playback.pip_mode = false;
+                    state.live_playback.ontop = false;
+                }
+                state.send_player_cmd(PlayerCommand::SetFullscreen(on));
+                spawn_linux_fullscreen_task(
+                    on,
+                    state.live_playback.player_pid,
+                    false,
+                    Some(tx.clone()),
+                );
+            }
             let flag = if state.config.auto_fullscreen { "ON" } else { "OFF" };
             state.show_toast(format!("Auto-Fullscreen on Launch: {flag}"));
         }
         HubActionId::PipMode => {
             if state.has_live_ipc() {
-                state.live_playback.pip_mode = !state.live_playback.pip_mode;
-                if state.live_playback.pip_mode {
-                    state.live_playback.fullscreen = false;
-                }
-                state.send_player_cmd(PlayerCommand::SetPipMode(state.live_playback.pip_mode));
+                toggle_live_pip_action(state, tx);
                 let flag = if state.live_playback.pip_mode { "ON" } else { "OFF" };
                 state.show_toast(format!("Floating Picture-in-Picture: {flag}"));
             } else {
@@ -5240,25 +5444,13 @@ async fn apply_play_options_hit(
             state.show_toast(format!("Sleep Timer: {}", next.label()));
         }
         PlayOptionsHit::ToggleFullscreen => {
-            state.live_playback.fullscreen = !state.live_playback.fullscreen;
-            if state.live_playback.fullscreen {
-                state.live_playback.pip_mode = false;
-            }
-            state.send_player_cmd(PlayerCommand::SetFullscreen(state.live_playback.fullscreen));
+            toggle_live_fullscreen_action(state, tx);
         }
         PlayOptionsHit::TogglePipMode => {
-            state.live_playback.pip_mode = !state.live_playback.pip_mode;
-            if state.live_playback.pip_mode {
-                state.live_playback.fullscreen = false;
-            }
-            state.send_player_cmd(PlayerCommand::SetPipMode(state.live_playback.pip_mode));
+            toggle_live_pip_action(state, tx);
         }
         PlayOptionsHit::CyclePipCorner => {
-            if !state.live_playback.pip_mode {
-                state.live_playback.pip_mode = true;
-                state.live_playback.fullscreen = false;
-            }
-            state.send_player_cmd(PlayerCommand::CyclePipCorner);
+            cycle_live_pip_corner_action(state, tx);
         }
         PlayOptionsHit::ToggleAutoFullscreen => {
             state.config.auto_fullscreen = !state.config.auto_fullscreen;
@@ -6926,6 +7118,21 @@ async fn handle_key_event(
                 KeyCode::Char('c') => {
                     if let Some(v) = state.detail_video.clone() {
                         open_channel_for_video(&v, state, tx, client);
+                    }
+                }
+                KeyCode::Char('f') => {
+                    if state.has_live_ipc() {
+                        toggle_live_fullscreen_action(state, tx);
+                        let flag = if state.live_playback.fullscreen { "ON" } else { "OFF" };
+                        state.show_toast(format!("Fullscreen: {flag}"));
+                    } else {
+                        state.config.auto_fullscreen = !state.config.auto_fullscreen;
+                        if state.config.auto_fullscreen && state.config.auto_pip {
+                            state.config.auto_pip = false;
+                        }
+                        let _ = state.config.save();
+                        let flag = if state.config.auto_fullscreen { "ON" } else { "OFF" };
+                        state.show_toast(format!("Auto-Fullscreen on Launch: {flag}"));
                     }
                 }
                 KeyCode::Char('p') => state.overlay = ActiveOverlay::PlayOptions,

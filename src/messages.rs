@@ -144,7 +144,19 @@ pub enum AppMessage {
         sock_path: String,
         stream_hint: Option<(u16, f32, f64)>,
         is_local: bool,
+        player_pid: Option<u32>,
     },
+    PipToggleFromPlayer {
+        enabled: bool,
+        corner_idx: Option<usize>,
+    },
+    PipCornerFromPlayer {
+        corner_idx: usize,
+    },
+    FullscreenToggleFromPlayer {
+        enabled: bool,
+    },
+    LinuxPipOutcome(crate::services::pip::PipApplyOutcome),
     PlaybackCommandReady {
         session_id: u64,
         cmd_tx: UnboundedSender<PlayerCommand>,
