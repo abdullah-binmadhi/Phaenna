@@ -70,10 +70,7 @@ vec4 hook() {
 "#;
 
 /// 1A. Fused Single-Pass Master De-Compression, Clamped Micro-Detail, RCAS & Organic Grain (`//!PARAM` live tunable).
-const SHADER_MASTER_FUSED_PARAM: &str = r#"//!DESC Phaenna-Master-Fused-Luma
-//!HOOK LUMA
-//!BIND HOOKED
-//!PARAM deblock_amt
+const SHADER_MASTER_FUSED_PARAM: &str = r#"//!PARAM deblock_amt
 //!TYPE float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -93,6 +90,9 @@ const SHADER_MASTER_FUSED_PARAM: &str = r#"//!DESC Phaenna-Master-Fused-Luma
 //!MINIMUM 0.0
 //!MAXIMUM 0.03
 0.008
+//!DESC Phaenna-Master-Fused-Luma
+//!HOOK LUMA
+//!BIND HOOKED
 
 vec4 hook() {
     vec2 pt = HOOKED_pt;
@@ -145,11 +145,11 @@ vec4 hook() {
         out_y = clamp((base + (n + s + e + w) * weight) / (1.0 + 4.0 * weight), mn, mx);
     }
 
-    // 4. PTS-seeded midtone-weighted organic micro-grain (breaks residual 8-bit contour flatness)
+    // 4. Frame-seeded midtone-weighted organic micro-grain (breaks residual 8-bit contour flatness)
     if (grain_amt > 0.0004) {
         float env = clamp(4.0 * out_y * (1.0 - out_y), 0.0, 1.0);
-        float t1 = fract(PTS * 1.131);
-        float t2 = fract(PTS * 1.719);
+        float t1 = fract(float(frame) * 0.131);
+        float t2 = fract(float(frame) * 0.719);
         float rnd = fract(sin(dot(pos * vec2(1291.7, 739.3) + vec2(t1 * 19.3, t2 * 37.7), vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
         out_y = clamp(out_y + rnd * grain_amt * env, 0.0, 1.0);
     }
@@ -677,7 +677,7 @@ pub fn mpv_mastering_flags_with_manual(
         flags.push("--hdr-peak-percentile=99.995".to_string());
     }
     if caps.has_libplacebo_opts {
-        flags.push("--libplacebo-opts=allow_delayed_peak_detect=yes".to_string());
+        flags.push("--libplacebo-opts=allow_delayed_peak=yes".to_string());
     }
     if caps.has_gpu_shader_cache_dir {
         flags.push("--gpu-shader-cache=yes".to_string());
@@ -729,7 +729,11 @@ mod tests {
 
         assert!(SHADER_MASTER_FUSED_PARAM.contains("//!HOOK LUMA"));
         assert!(SHADER_MASTER_FUSED_PARAM.contains("//!PARAM grain_amt"));
-        assert!(SHADER_MASTER_FUSED_PARAM.contains("PTS"));
+        assert!(
+            SHADER_MASTER_FUSED_PARAM.find("//!PARAM grain_amt").unwrap()
+                < SHADER_MASTER_FUSED_PARAM.find("//!HOOK LUMA").unwrap()
+        );
+        assert!(SHADER_MASTER_FUSED_PARAM.contains("float(frame)"));
         assert!(SHADER_CHROMA_444.contains("//!HOOK CHROMA"));
         assert!(SHADER_CHROMA_444.contains("//!WIDTH LUMA.w"));
         assert!(SHADER_CHROMA_444.contains("//!WHEN OUTPUT.w 960 >="));

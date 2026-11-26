@@ -102,7 +102,7 @@ pub fn compute_grid_metrics(area: Rect) -> GridMetrics {
     compute_grid_metrics_for_size(area, GridCardSize::default())
 }
 
-/// Compute edge-to-edge large grid card dimensions under the user-selected [`GridCardSize`] preset.
+/// Compute adaptive grid card dimensions targeting 3 rows and snug 16:9 thumbnail/frame proportions.
 pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> GridMetrics {
     let scrollbar_x = if area.width >= 40 {
         Some(area.x + area.width - 1)
@@ -110,27 +110,7 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
         None
     };
     let reserve_right: u16 = if scrollbar_x.is_some() { 2 } else { 1 };
-    let usable_w = area.width.saturating_sub(1 + reserve_right).max(MIN_CARD_WIDTH);
-
-    let cols = match size_mode {
-        GridCardSize::CinemaLarge => {
-            if usable_w >= 164 {
-                4
-            } else if usable_w >= 104 {
-                3
-            } else if usable_w >= 56 {
-                2
-            } else {
-                1
-            }
-        }
-        GridCardSize::AdaptiveLarge => ((usable_w + CARD_GAP) / (MIN_CARD_WIDTH + CARD_GAP))
-            .clamp(1, 4) as usize,
-    };
-    let total_gaps = (cols.saturating_sub(1) as u16) * CARD_GAP;
-    let avail_for_cards = usable_w.saturating_sub(total_gaps).max(cols as u16);
-    let base_card_width = (avail_for_cards / (cols as u16)).max(16);
-    let extra_width_cols = (avail_for_cards % (cols as u16)) as usize;
+    let usable_w = area.width.saturating_sub(1 + reserve_right).max(24);
 
     let status_row_y = if area.height >= 12 {
         Some(area.y + area.height - 1)
@@ -142,26 +122,48 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
     } else {
         area.height
     }
-    .max(9);
+    .max(7);
 
-    let (visible_rows, card_height, best_gap) = match size_mode {
+    let (visible_rows, card_height, best_gap, cols) = match size_mode {
         GridCardSize::CinemaLarge => {
-            let rows: usize = if avail_h >= 42 {
+            let rows: usize = if avail_h >= 21 {
                 3
-            } else if avail_h >= 25 {
+            } else if avail_h >= 14 {
                 2
             } else {
                 1
             };
-            let rgap: u16 = if rows > 1 && avail_h >= 20 { 1 } else { 0 };
+            let rgap: u16 = if (rows == 3 && avail_h >= 29) || (rows == 2 && avail_h >= 20) {
+                1
+            } else {
+                0
+            };
             let total_rgap = (rows.saturating_sub(1) as u16) * rgap;
-            let ch = (avail_h.saturating_sub(total_rgap) / (rows as u16))
-                .clamp(8, 20);
-            (rows, ch, rgap)
+            let ch = (avail_h.saturating_sub(total_rgap) / (rows as u16)).clamp(7, 16);
+
+            // Adapt card column count so frame width matches the uncropped 16:9 thumbnail height cleanly.
+            let inner_h = ch.saturating_sub(2);
+            let meta_est: u16 = if inner_h >= 10 {
+                4
+            } else if inner_h >= 7 {
+                3
+            } else {
+                2
+            };
+            let thumb_est = inner_h.saturating_sub(meta_est).max(3);
+            let ideal_thumb_w = ((thumb_est as f32) * 3.85).round() as u16;
+            let ideal_card_w = (ideal_thumb_w + 2).clamp(24, 40);
+            let cols = ((usable_w + CARD_GAP) / (ideal_card_w + CARD_GAP)).clamp(1, 5) as usize;
+            (rows, ch, rgap, cols)
         }
         GridCardSize::AdaptiveLarge => {
+            let cols = ((usable_w + CARD_GAP) / (MIN_CARD_WIDTH + CARD_GAP)).clamp(1, 4) as usize;
+            let total_gaps = (cols.saturating_sub(1) as u16) * CARD_GAP;
+            let avail_for_cards = usable_w.saturating_sub(total_gaps).max(cols as u16);
+            let base_w_est = (avail_for_cards / (cols as u16)).max(16);
+
             // Search taller 16:9 card proportions (12..=18 rows) minimizing empty horizontal/vertical voids.
-            let ideal_h = (((base_card_width as f32) * 0.28).round() as i32 + 6).clamp(13, 18);
+            let ideal_h = (((base_w_est as f32) * 0.28).round() as i32 + 6).clamp(13, 18);
             let mut best_score = i32::MIN;
             let mut best_rows = 1usize;
             let mut best_h = CARD_HEIGHT.min(avail_h);
@@ -200,9 +202,14 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
                 0
             };
             let card_height = (best_h + extra_per_row).min(20);
-            (best_rows, card_height, best_gap)
+            (best_rows, card_height, best_gap, cols)
         }
     };
+
+    let total_gaps = (cols.saturating_sub(1) as u16) * CARD_GAP;
+    let avail_for_cards = usable_w.saturating_sub(total_gaps).max(cols as u16);
+    let base_card_width = (avail_for_cards / (cols as u16)).max(16);
+    let extra_width_cols = (avail_for_cards % (cols as u16)) as usize;
 
     GridMetrics {
         area,
@@ -245,6 +252,7 @@ pub fn grid_columns(width: u16) -> usize {
     grid_columns_for_size(width, GridCardSize::default())
 }
 
+#[allow(dead_code)]
 pub fn grid_columns_for_size(width: u16, size_mode: GridCardSize) -> usize {
     compute_grid_metrics_for_size(Rect::new(0, 0, width, 40), size_mode).cols
 }
@@ -383,8 +391,10 @@ pub fn footer_action_at(footer_area: Rect, col: u16, row: u16) -> Option<HomeFoo
 }
 
 pub fn home_layout(frame_area: Rect) -> [Rect; 4] {
-    let hero_h = if frame_area.height <= 36 {
-        8
+    let hero_h = if frame_area.height <= 32 {
+        6
+    } else if frame_area.height <= 42 {
+        7
     } else {
         HERO_HEIGHT
     };
@@ -1358,12 +1368,12 @@ fn render_video_grid(
 
         let meta_h: u16 = if card_inner.height >= 10 {
             4
-        } else if card_inner.height >= 8 {
+        } else if card_inner.height >= 7 {
             3
         } else {
             2
         };
-        let thumb_h = card_inner.height.saturating_sub(meta_h).max(4);
+        let thumb_h = card_inner.height.saturating_sub(meta_h).max(3);
         let card_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(thumb_h), Constraint::Min(meta_h)])
@@ -1376,6 +1386,9 @@ fn render_video_grid(
 
         let now_unix = now_unix_home();
         let inner_w = card_chunks[1].width as usize;
+        let is_new = v.is_new_release(now_unix);
+        let inline_new = meta_h == 2 && is_new && inner_w >= 18;
+        let inline_new_w = if inline_new { 4 } else { 0 }; // "NEW "
         let wrapped_title = crate::ui::detail::wrap_words(&v.title, inner_w.max(8));
         let single_title = if focused {
             marquee_window(&v.title, inner_w, state.ticker_step)
@@ -1385,14 +1398,16 @@ fn render_video_grid(
 
         let dur_badge = v.display_duration();
         let is_live_card = v.is_live == Some(true) || dur_badge == "LIVE";
-        let uploader_w = inner_w.saturating_sub(dur_badge.chars().count() + 2).max(6);
+        let uploader_w = inner_w
+            .saturating_sub(inline_new_w + dur_badge.chars().count() + 2)
+            .max(6);
         let uploader_str: String = format!("{} >", v.display_uploader())
             .chars()
             .take(uploader_w)
             .collect();
         let uploader_actual_w = uploader_str.chars().count();
         let pad_between = inner_w
-            .saturating_sub(uploader_actual_w + dur_badge.chars().count())
+            .saturating_sub(inline_new_w + uploader_actual_w + dur_badge.chars().count())
             .max(1);
 
         let (status_badge, status_color) = if let Some((pos, dur)) = state.progress_map.get(&v.id) {
@@ -1451,29 +1466,39 @@ fn render_video_grid(
         };
 
         let uploader_row_offset: u16 = if meta_h >= 4 { 2 } else { 1 };
-        meta_lines.push(Line::from(vec![
-            Span::styled(
-                uploader_str,
+        let mut uploader_spans = Vec::new();
+        if inline_new {
+            uploader_spans.push(Span::styled(
+                "NEW",
                 Style::default()
-                    .fg(card_pal.secondary)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::raw(" ".repeat(pad_between)),
-            Span::styled(
-                dur_badge.clone(),
-                Style::default()
-                    .fg(if is_live_card {
-                        Color::Rgb(248, 113, 113)
-                    } else {
-                        card_pal.accent
-                    })
-                    .add_modifier(if is_live_card {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-        ]));
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(52, 211, 153))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            uploader_spans.push(Span::raw(" "));
+        }
+        uploader_spans.push(Span::styled(
+            uploader_str,
+            Style::default()
+                .fg(card_pal.secondary)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+        uploader_spans.push(Span::raw(" ".repeat(pad_between)));
+        uploader_spans.push(Span::styled(
+            dur_badge.clone(),
+            Style::default()
+                .fg(if is_live_card {
+                    Color::Rgb(248, 113, 113)
+                } else {
+                    card_pal.accent
+                })
+                .add_modifier(if is_live_card {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+        meta_lines.push(Line::from(uploader_spans));
 
         if meta_h >= 3 {
             let is_new = v.is_new_release(now_unix);
@@ -1534,11 +1559,12 @@ fn render_video_grid(
 
         frame.render_widget(Paragraph::new(meta_lines), card_chunks[1]);
         if card_chunks[1].height > uploader_row_offset && uploader_actual_w > 0 {
+            let hitbox_x = card_chunks[1].x + inline_new_w as u16;
             state.home_channel_hitboxes.push((
                 Rect::new(
-                    card_chunks[1].x,
+                    hitbox_x,
                     card_chunks[1].y + uploader_row_offset,
-                    (uploader_actual_w as u16).min(card_chunks[1].width),
+                    (uploader_actual_w as u16).min(card_chunks[1].width.saturating_sub(inline_new_w as u16)),
                     1,
                 ),
                 v.clone(),
@@ -1832,13 +1858,18 @@ mod tests {
             for (w, h) in [(100u16, 30u16), (152, 34), (175, 46), (240, 65)] {
                 let [_, _, grid, _] = home_layout(Rect::new(0, 0, w, h));
                 let m = compute_grid_metrics_for_size(grid, mode);
-                assert!(m.cols >= 2 && m.cols <= 4);
+                assert!(m.cols >= 2 && m.cols <= 5);
                 assert!(m.visible_rows >= 1);
-                assert!(
-                    m.card_height >= 12,
-                    "card_height too short for full-width 16:9 thumbs & [NEW] row at {w}x{h} ({mode:?}): {}",
-                    m.card_height
-                );
+                if mode == GridCardSize::CinemaLarge && h >= 34 {
+                    assert_eq!(m.visible_rows, 3, "expected 3 rows at {w}x{h}");
+                }
+                if mode == GridCardSize::AdaptiveLarge {
+                    assert!(
+                        m.card_height >= 12,
+                        "card_height too short at {w}x{h} ({mode:?}): {}",
+                        m.card_height
+                    );
+                }
 
                 let (last_x, last_w) = m.col_x_and_width(m.cols - 1);
                 let right_edge = last_x + last_w;

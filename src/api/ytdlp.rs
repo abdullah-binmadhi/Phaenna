@@ -104,6 +104,10 @@ fn ytdlp_bin() -> String {
 
 fn apply_cookies(cmd: &mut Command, cookies_path: Option<&Path>) {
     cmd.arg("--ignore-config");
+    if let Some(deno_path) = find_binary("deno") {
+        cmd.arg("--js-runtimes")
+            .arg(format!("deno:{}", deno_path.to_string_lossy()));
+    }
     if let Some(p) = cookies_path {
         if p.exists() && std::fs::metadata(p).map(|m| m.len() > 20).unwrap_or(false) {
             cmd.arg("--cookies").arg(p);

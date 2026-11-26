@@ -87,8 +87,7 @@ use crate::ui::components::cover::{is_yt_grey_placeholder, prepare_16_9_thumbnai
 use crate::ui::help::confirm_quit_button_rects;
 use crate::ui::home::{
     compute_grid_metrics_for_size, continue_watching_row_at, effective_grid_area, footer_action_at,
-    grid_card_index_at_for_size, grid_columns_for_size, home_layout, shorts_source_at,
-    top_bar_shelf_at, HomeFooterAction,
+    grid_card_index_at_for_size, home_layout, shorts_source_at, top_bar_shelf_at, HomeFooterAction,
 };
 use crate::ui::settings::{filtered_hub_items, HubActionId};
 use clap::{Parser, Subcommand};
@@ -6555,7 +6554,8 @@ async fn handle_mouse_event(
                     return true;
                 }
             } else {
-                let cols = grid_columns_for_size(grid_area.width, state.config.grid_card_size);
+                let card_grid = effective_grid_area(grid_area, active_cat);
+                let cols = compute_grid_metrics_for_size(card_grid, state.config.grid_card_size).cols;
                 scroll_down_grid_and_prefetch(state, pool, tx, client, cols, 1, len);
                 return true;
             }
@@ -6565,7 +6565,8 @@ async fn handle_mouse_event(
                 let cur = &mut state.category_cursors[state.active_category];
                 *cur = cur.saturating_sub(1);
             } else {
-                let cols = grid_columns_for_size(grid_area.width, state.config.grid_card_size);
+                let card_grid = effective_grid_area(grid_area, active_cat);
+                let cols = compute_grid_metrics_for_size(card_grid, state.config.grid_card_size).cols;
                 let cur = &mut state.category_cursors[state.active_category];
                 *cur = cur.saturating_sub(cols);
             }

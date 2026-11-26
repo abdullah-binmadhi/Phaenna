@@ -657,13 +657,97 @@ mp.observe_property("demuxer-cache-duration", "number", function(_, val) cache_d
 -- =============================================================================
 local pip_idx = 1
 local pip_presets = {
-    { label = "Bottom-Right 30%", scale = 0.30, geom = "30%x30%-24-24" },
-    { label = "Top-Right 30%",    scale = 0.30, geom = "30%x30%-24+24" },
-    { label = "Bottom-Left 30%",  scale = 0.30, geom = "30%x30%+24-24" },
-    { label = "Top-Left 30%",     scale = 0.30, geom = "30%x30%+24+24" },
-    { label = "Compact 22%",      scale = 0.22, geom = "22%x22%-20-20" },
-    { label = "Theater 38%",      scale = 0.38, geom = "38%x38%-28-28" },
+    { label = "Bottom-Right 30%", scale = 0.30, geom = "30%x30%-24-24", corner = "br", pad = 24 },
+    { label = "Top-Right 30%",    scale = 0.30, geom = "30%x30%-24+24", corner = "tr", pad = 24 },
+    { label = "Bottom-Left 30%",  scale = 0.30, geom = "30%x30%+24-24", corner = "bl", pad = 24 },
+    { label = "Top-Left 30%",     scale = 0.30, geom = "30%x30%+24+24", corner = "tl", pad = 24 },
+    { label = "Compact 22%",      scale = 0.22, geom = "22%x22%-20-20", corner = "br", pad = 20 },
+    { label = "Theater 38%",      scale = 0.38, geom = "38%x38%-28-28", corner = "br", pad = 28 },
 }
+
+local function hyprland_sync_pip(enable, pr)
+    local sig = os.getenv("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig or sig == "" then return end
+    local utils = require("mp.utils")
+    local pid = utils.getpid and utils.getpid() or nil
+    if not pid or pid <= 0 then return end
+
+    local lua_code
+    if enable then
+        lua_code = string.format([[
+local ws = hl.get_windows({ pid = %d })
+local w = ws and ws[1]
+if not w then return end
+local m = w.monitor or (hl.get_monitors() and hl.get_monitors()[1])
+if not m then return end
+local sc = (m.scale and m.scale > 0) and m.scale or 1
+local mw = math.floor(m.width / sc)
+local mh = math.floor(m.height / sc)
+local mx = m.x or 0
+local my = m.y or 0
+local res = m.reserved or {}
+local r_left = res[1] or 0
+local r_top = res[2] or 0
+local r_right = res[3] or 0
+local r_bot = res[4] or 0
+local tw = math.max(240, math.floor(mw * %.2f))
+local th = math.max(135, math.floor(tw * 9 / 16))
+local pad = %d
+local corner = %q
+local px = mx + mw - r_right - tw - pad
+local py = my + mh - r_bot - th - pad
+if corner == "tr" then
+    py = my + r_top + pad
+elseif corner == "bl" then
+    px = mx + r_left + pad
+elseif corner == "tl" then
+    px = mx + r_left + pad
+    py = my + r_top + pad
+end
+hl.dispatch(hl.dsp.window.float({ action = "set", window = w }))
+hl.dispatch(hl.dsp.window.pin({ action = "set", window = w }))
+hl.dispatch(hl.dsp.window.resize({ x = tw, y = th, exact = true, window = w }))
+hl.dispatch(hl.dsp.window.move({ x = px, y = py, window = w }))
+]], pid, pr.scale, pr.pad, pr.corner)
+    else
+        lua_code = string.format([[
+local ws = hl.get_windows({ pid = %d })
+local w = ws and ws[1]
+if not w then return end
+hl.dispatch(hl.dsp.window.pin({ action = "unset", window = w }))
+hl.dispatch(hl.dsp.window.float({ action = "unset", window = w }))
+]], pid)
+    end
+
+    mp.command_native_async({
+        name = "subprocess",
+        playback_only = false,
+        detach = false,
+        capture_stdout = true,
+        capture_stderr = true,
+        args = { "hyprctl", "eval", lua_code },
+    }, function(ok, res)
+        if not ok or (res and res.status ~= 0) then
+            -- Fallback for classic Hyprland (<0.55) keyword dispatchers
+            local sel = "pid:" .. tostring(pid)
+            local batch
+            if enable then
+                batch = string.format(
+                    "dispatch setfloating %s ; dispatch pin %s ; dispatch resizewindowpixel exact %d%% %d%%,%s",
+                    sel, sel, math.floor(pr.scale * 100), math.floor(pr.scale * 100), sel
+                )
+            else
+                batch = string.format("dispatch pin %s ; dispatch settiled %s", sel, sel)
+            end
+            mp.command_native_async({
+                name = "subprocess",
+                playback_only = false,
+                detach = false,
+                args = { "hyprctl", "--batch", batch },
+            }, function() end)
+        end
+    end)
+end
 
 local function apply_pip_preset()
     local pr = pip_presets[pip_idx]
@@ -673,6 +757,7 @@ local function apply_pip_preset()
     mp.set_property_bool("keepaspect-window", true)
     mp.set_property_number("window-scale", pr.scale)
     mp.set_property("geometry", pr.geom)
+    hyprland_sync_pip(true, pr)
     mp.osd_message("◈ PiP Floating: " .. pr.label .. " ([P] corner, [p] exit)", 2.2)
 end
 
@@ -685,8 +770,15 @@ local function toggle_pip()
         mp.set_property_bool("border", true)
         mp.set_property_number("window-scale", 1.0)
         mp.set_property("geometry", "50%:50%")
+        hyprland_sync_pip(false, pip_presets[pip_idx])
         mp.osd_message("◈ PiP Floating: OFF (Standard Window)", 2.0)
     end
+end
+
+if pip_active then
+    mp.add_timeout(0.35, function()
+        if pip_active then hyprland_sync_pip(true, pip_presets[pip_idx]) end
+    end)
 end
 
 local function cycle_pip_corner()
@@ -1198,8 +1290,21 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         flags.push("keepaspect-window=yes".to_string());
         flags.push("window-scale=0.30".to_string());
         flags.push("geometry=30%x30%-24-24".to_string());
-    } else if opts.auto_fullscreen {
-        flags.push("fullscreen=yes".to_string());
+        #[cfg(target_os = "linux")]
+        {
+            flags.push("wayland-app-id=phaenna-pip".to_string());
+            flags.push("x11-name=phaenna-pip".to_string());
+            flags.push("autofit=30%x30%".to_string());
+        }
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            flags.push("wayland-app-id=phaenna-mpv".to_string());
+            flags.push("x11-name=phaenna-mpv".to_string());
+        }
+        if opts.auto_fullscreen {
+            flags.push("fullscreen=yes".to_string());
+        }
     }
 
     if let Some(conf_path) = prepare_youtube_input_conf() {
@@ -1207,6 +1312,12 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     }
 
     let mut script_opt_parts: Vec<String> = Vec::new();
+    if let Some(ytdlp_path) = find_binary("yt-dlp") {
+        script_opt_parts.push(format!(
+            "ytdl_hook-ytdl_path={}",
+            sanitize_script_opt(&ytdlp_path.to_string_lossy())
+        ));
+    }
     if let Some(lua_path) = prepare_loading_overlay_script() {
         flags.push(format!("script={}", lua_path.to_string_lossy()));
         let safe_title = sanitize_script_opt(&opts.title);
@@ -1409,6 +1520,12 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
             flags.push("ytdl-raw-options-append=ignore-config=".to_string());
             flags.push("ytdl-raw-options-append=no-playlist=".to_string());
+            if let Some(deno_path) = find_binary("deno") {
+                flags.push(format!(
+                    "ytdl-raw-options-append=js-runtimes=deno:{}",
+                    deno_path.to_string_lossy()
+                ));
+            }
             if opts.force_ipv4 {
                 flags.push("ytdl-raw-options-append=force-ipv4=".to_string());
             }
@@ -1659,11 +1776,12 @@ pub fn classify_player_crash_stderr(stderr_text: &str, exit_code: Option<i32>) -
     if stderr_text.contains("addOnDisposeCallback")
         || stderr_text.contains("Signature solving failed")
         || stderr_text.contains("n challenge solving failed")
+        || stderr_text.contains("The page needs to be reloaded")
         || stderr_text.contains("Requested format is not available")
         || stderr_text.contains("Only images are available")
     {
         return Some(
-            "Playback failed: yt-dlp YouTube extractor outdated — run `brew upgrade yt-dlp` (or `yt-dlp -U`)"
+            "Playback failed: yt-dlp YouTube extractor outdated — update `yt-dlp` and ensure `deno` is installed"
                 .to_string(),
         );
     }

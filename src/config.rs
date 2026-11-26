@@ -2059,14 +2059,14 @@ impl GridCardSize {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::CinemaLarge => "Cinema Large (3–4 Cols × 2 Tall Rows)",
-            Self::AdaptiveLarge => "Adaptive Large (Wide 16:9 · Zero Slack)",
+            Self::CinemaLarge => "Cinema 3-Row (Adaptive 16:9)",
+            Self::AdaptiveLarge => "Adaptive Tall (Wide 16:9 · Zero Slack)",
         }
     }
 
     pub const fn short_badge(self) -> &'static str {
         match self {
-            Self::CinemaLarge => "Cinema 4×2",
+            Self::CinemaLarge => "Cinema 3-Row",
             Self::AdaptiveLarge => "Adaptive Tall",
         }
     }
