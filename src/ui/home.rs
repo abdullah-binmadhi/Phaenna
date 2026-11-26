@@ -41,10 +41,12 @@ pub fn marquee_window(text: &str, width: usize, step: usize) -> String {
 }
 
 pub const TOP_BAR_HEIGHT: u16 = 1;
-pub const HERO_HEIGHT: u16 = 10;
-pub const FOOTER_HEIGHT: u16 = 3;
-pub const MIN_CARD_WIDTH: u16 = 36;
-pub const CARD_HEIGHT: u16 = 14;
+pub const HERO_HEIGHT: u16 = 8;
+pub const FOOTER_HEIGHT: u16 = 0;
+#[allow(dead_code)]
+pub const MIN_CARD_WIDTH: u16 = 34;
+#[allow(dead_code)]
+pub const CARD_HEIGHT: u16 = 13;
 pub const CARD_GAP: u16 = 2;
 
 const CW_ROW_HEIGHT: u16 = 3;
@@ -102,7 +104,7 @@ pub fn compute_grid_metrics(area: Rect) -> GridMetrics {
     compute_grid_metrics_for_size(area, GridCardSize::default())
 }
 
-/// Compute adaptive grid card dimensions targeting 3 rows and snug 16:9 thumbnail/frame proportions.
+/// Compute YouTube-style borderless grid dimensions adapting thumbnail height and card width cleanly to terminal size.
 pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> GridMetrics {
     let scrollbar_x = if area.width >= 40 {
         Some(area.x + area.width - 1)
@@ -122,13 +124,40 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
     } else {
         area.height
     }
-    .max(7);
+    .max(8);
 
     let (visible_rows, card_height, best_gap, cols) = match size_mode {
         GridCardSize::CinemaLarge => {
-            let rows: usize = if avail_h >= 21 {
+            // YouTube.com style: 2 big 16:9 rows on compact/Hyprland windows, 3 rows on tall monitors.
+            let rows: usize = if avail_h >= 35 {
                 3
-            } else if avail_h >= 14 {
+            } else if avail_h >= 18 {
+                2
+            } else {
+                1
+            };
+            let rgap: u16 = if rows > 1 && avail_h >= 20 { 1 } else { 0 };
+            let total_rgap = (rows.saturating_sub(1) as u16) * rgap;
+            let ch = (avail_h.saturating_sub(total_rgap) / (rows as u16)).clamp(8, 20);
+
+            // Borderless card: all `ch` rows go directly to thumbnail + metadata (`meta_h = 2..3`).
+            let meta_est: u16 = if ch >= 14 {
+                4
+            } else if ch >= 10 {
+                3
+            } else {
+                2
+            };
+            let thumb_est = ch.saturating_sub(meta_est).max(5);
+            let ideal_card_w = ((thumb_est as f32) * 3.85).round().clamp(30.0, 48.0) as u16;
+            let cols = ((usable_w + CARD_GAP) / (ideal_card_w + CARD_GAP)).clamp(1, 4) as usize;
+            (rows, ch, rgap, cols)
+        }
+        GridCardSize::AdaptiveLarge => {
+            // Compact 3-Row preset when height allows (`>= 22`), adapting width to thumbnail height.
+            let rows: usize = if avail_h >= 22 {
+                3
+            } else if avail_h >= 15 {
                 2
             } else {
                 1
@@ -139,70 +168,12 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
                 0
             };
             let total_rgap = (rows.saturating_sub(1) as u16) * rgap;
-            let ch = (avail_h.saturating_sub(total_rgap) / (rows as u16)).clamp(7, 16);
-
-            // Adapt card column count so frame width matches the uncropped 16:9 thumbnail height cleanly.
-            let inner_h = ch.saturating_sub(2);
-            let meta_est: u16 = if inner_h >= 10 {
-                4
-            } else if inner_h >= 7 {
-                3
-            } else {
-                2
-            };
-            let thumb_est = inner_h.saturating_sub(meta_est).max(3);
-            let ideal_thumb_w = ((thumb_est as f32) * 3.85).round() as u16;
-            let ideal_card_w = (ideal_thumb_w + 2).clamp(24, 40);
+            let ch = (avail_h.saturating_sub(total_rgap) / (rows as u16)).clamp(7, 20);
+            let meta_est: u16 = if ch >= 10 { 3 } else { 2 };
+            let thumb_est = ch.saturating_sub(meta_est).max(4);
+            let ideal_card_w = ((thumb_est as f32) * 3.85).round().clamp(24.0, 42.0) as u16;
             let cols = ((usable_w + CARD_GAP) / (ideal_card_w + CARD_GAP)).clamp(1, 5) as usize;
             (rows, ch, rgap, cols)
-        }
-        GridCardSize::AdaptiveLarge => {
-            let cols = ((usable_w + CARD_GAP) / (MIN_CARD_WIDTH + CARD_GAP)).clamp(1, 4) as usize;
-            let total_gaps = (cols.saturating_sub(1) as u16) * CARD_GAP;
-            let avail_for_cards = usable_w.saturating_sub(total_gaps).max(cols as u16);
-            let base_w_est = (avail_for_cards / (cols as u16)).max(16);
-
-            // Search taller 16:9 card proportions (12..=18 rows) minimizing empty horizontal/vertical voids.
-            let ideal_h = (((base_w_est as f32) * 0.28).round() as i32 + 6).clamp(13, 18);
-            let mut best_score = i32::MIN;
-            let mut best_rows = 1usize;
-            let mut best_h = CARD_HEIGHT.min(avail_h);
-            let mut best_gap = 1u16;
-
-            for row_gap in [1u16, 0u16] {
-                for cand_h in (12u16..=18u16).rev() {
-                    let step = cand_h + row_gap;
-                    let rows = ((avail_h + row_gap) / step).max(1) as usize;
-                    let used_h =
-                        (rows as u16) * cand_h + ((rows.saturating_sub(1)) as u16) * row_gap;
-                    if used_h > avail_h {
-                        continue;
-                    }
-                    let slack = (avail_h - used_h) as i32;
-                    let prop_bonus = 16 - ((cand_h as i32) - ideal_h).abs() * 4;
-                    let gap_bonus = if row_gap == 1 { 4 } else { 0 };
-                    let row_bonus = (rows as i32) * 14;
-                    let score =
-                        (used_h as i32) * 12 + row_bonus + prop_bonus + gap_bonus - slack * 10;
-                    if score > best_score {
-                        best_score = score;
-                        best_rows = rows;
-                        best_h = cand_h;
-                        best_gap = row_gap;
-                    }
-                }
-            }
-
-            let base_used =
-                (best_rows as u16) * best_h + ((best_rows.saturating_sub(1)) as u16) * best_gap;
-            let slack = avail_h.saturating_sub(base_used);
-            let extra_per_row = if best_rows > 0 {
-                slack / (best_rows as u16)
-            } else {
-                0
-            };
-            let card_height = (best_h + extra_per_row).min(20);
-            (best_rows, card_height, best_gap, cols)
         }
     };
 
@@ -357,8 +328,9 @@ pub fn continue_watching_row_at(
     }
 }
 
+#[allow(dead_code)]
 pub fn footer_action_at(footer_area: Rect, col: u16, row: u16) -> Option<HomeFooterAction> {
-    if row < footer_area.y || row >= footer_area.y + footer_area.height {
+    if footer_area.height == 0 || row < footer_area.y || row >= footer_area.y + footer_area.height {
         return None;
     }
     let rel_row = row - footer_area.y;
@@ -391,9 +363,9 @@ pub fn footer_action_at(footer_area: Rect, col: u16, row: u16) -> Option<HomeFoo
 }
 
 pub fn home_layout(frame_area: Rect) -> [Rect; 4] {
-    let hero_h = if frame_area.height <= 32 {
+    let hero_h = if frame_area.height <= 38 {
         6
-    } else if frame_area.height <= 42 {
+    } else if frame_area.height <= 46 {
         7
     } else {
         HERO_HEIGHT
@@ -494,7 +466,7 @@ fn render_shorts_filter_bar(frame: &mut Frame, bar_area: Rect, state: &AppState)
 
 pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: Option<Rect>) {
     state.home_channel_hitboxes.clear();
-    let [top_area, hero_area, mut grid_area, footer_area] = home_layout(frame.area());
+    let [top_area, hero_area, mut grid_area, _footer_area] = home_layout(frame.area());
     render_top_bar(frame, top_area, state);
     render_hero_stage(frame, hero_area, state, modal_rect);
 
@@ -531,7 +503,6 @@ pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: O
     if let Some(bar_rect) = now_playing_area {
         crate::ui::play_options::render_now_playing_bar(frame, bar_rect, state);
     }
-    render_footer_dock(frame, footer_area, state);
 }
 
 fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -1353,27 +1324,16 @@ fn render_video_grid(
             *base_theme
         };
 
-        let border_col = if focused {
-            card_pal.border_focus
-        } else {
-            card_pal.border_idle
-        };
+        let card_inner = card_rect;
 
-        let card_blk = Block::default()
-            .borders(Borders::ALL)
-            .border_type(if focused { BorderType::Thick } else { BorderType::Rounded })
-            .border_style(Style::default().fg(border_col));
-        let card_inner = card_blk.inner(card_rect);
-        frame.render_widget(card_blk, card_rect);
-
-        let meta_h: u16 = if card_inner.height >= 10 {
+        let meta_h: u16 = if card_inner.height >= 14 {
             4
-        } else if card_inner.height >= 7 {
+        } else if card_inner.height >= 10 {
             3
         } else {
             2
         };
-        let thumb_h = card_inner.height.saturating_sub(meta_h).max(3);
+        let thumb_h = card_inner.height.saturating_sub(meta_h).max(4);
         let card_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(thumb_h), Constraint::Min(meta_h)])
@@ -1384,8 +1344,9 @@ fn render_video_grid(
             render_thumbnail_cover(frame, card_chunks[0], &vid_id, state, "...");
         }
 
+        let focus_bar_w = if focused { 2 } else { 0 };
         let now_unix = now_unix_home();
-        let inner_w = card_chunks[1].width as usize;
+        let inner_w = (card_chunks[1].width as usize).saturating_sub(focus_bar_w);
         let is_new = v.is_new_release(now_unix);
         let inline_new = meta_h == 2 && is_new && inner_w >= 18;
         let inline_new_w = if inline_new { 4 } else { 0 }; // "NEW "
@@ -1430,6 +1391,27 @@ fn render_video_grid(
             (String::new(), card_pal.text_dim)
         };
 
+        let meta_bg = if focused {
+            Color::Rgb(24, 28, 42)
+        } else {
+            Color::Reset
+        };
+        let focus_prefix = |line_spans: Vec<Span<'static>>| -> Line<'static> {
+            if focused {
+                let mut out = vec![Span::styled(
+                    "▌ ",
+                    Style::default()
+                        .fg(card_pal.primary)
+                        .bg(meta_bg)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                out.extend(line_spans);
+                Line::from(out)
+            } else {
+                Line::from(line_spans)
+            }
+        };
+
         let mut meta_lines = if meta_h >= 4 {
             let line0 = wrapped_title.first().cloned().unwrap_or_default();
             let line1 = if wrapped_title.len() > 2 {
@@ -1445,24 +1427,28 @@ fn render_video_grid(
                 wrapped_title.get(1).cloned().unwrap_or_default()
             };
             vec![
-                Line::from(Span::styled(
+                focus_prefix(vec![Span::styled(
                     line0,
                     Style::default()
                         .fg(if focused { card_pal.primary } else { card_pal.text })
+                        .bg(meta_bg)
                         .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
-                )),
-                Line::from(Span::styled(
+                )]),
+                focus_prefix(vec![Span::styled(
                     line1,
-                    Style::default().fg(if focused { card_pal.primary } else { card_pal.text }),
-                )),
+                    Style::default()
+                        .fg(if focused { card_pal.primary } else { card_pal.text })
+                        .bg(meta_bg),
+                )]),
             ]
         } else {
-            vec![Line::from(Span::styled(
+            vec![focus_prefix(vec![Span::styled(
                 single_title,
                 Style::default()
                     .fg(if focused { card_pal.primary } else { card_pal.text })
+                    .bg(meta_bg)
                     .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
-            ))]
+            )])]
         };
 
         let uploader_row_offset: u16 = if meta_h >= 4 { 2 } else { 1 };
@@ -1475,15 +1461,16 @@ fn render_video_grid(
                     .bg(Color::Rgb(52, 211, 153))
                     .add_modifier(Modifier::BOLD),
             ));
-            uploader_spans.push(Span::raw(" "));
+            uploader_spans.push(Span::styled(" ", Style::default().bg(meta_bg)));
         }
         uploader_spans.push(Span::styled(
             uploader_str,
             Style::default()
                 .fg(card_pal.secondary)
+                .bg(meta_bg)
                 .add_modifier(Modifier::UNDERLINED),
         ));
-        uploader_spans.push(Span::raw(" ".repeat(pad_between)));
+        uploader_spans.push(Span::styled(" ".repeat(pad_between), Style::default().bg(meta_bg)));
         uploader_spans.push(Span::styled(
             dur_badge.clone(),
             Style::default()
@@ -1492,16 +1479,16 @@ fn render_video_grid(
                 } else {
                     card_pal.accent
                 })
+                .bg(meta_bg)
                 .add_modifier(if is_live_card {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 }),
         ));
-        meta_lines.push(Line::from(uploader_spans));
+        meta_lines.push(focus_prefix(uploader_spans));
 
         if meta_h >= 3 {
-            let is_new = v.is_new_release(now_unix);
             let new_prefix_len = if is_new { 6 } else { 0 }; // "[NEW] "
             let right_len = status_badge.chars().count();
             let left_budget = inner_w.saturating_sub(new_prefix_len + right_len + if right_len > 0 { 1 } else { 0 });
@@ -1537,34 +1524,39 @@ fn render_video_grid(
                         .bg(Color::Rgb(52, 211, 153))
                         .add_modifier(Modifier::BOLD),
                 ));
-                row3.push(Span::raw(" "));
+                row3.push(Span::styled(" ", Style::default().bg(meta_bg)));
             }
             row3.push(Span::styled(
                 stats_trunc,
-                Style::default().fg(card_pal.text_dim),
+                Style::default().fg(card_pal.text_dim).bg(meta_bg),
             ));
             if pad_w > 0 && right_len > 0 {
-                row3.push(Span::raw(" ".repeat(pad_w)));
+                row3.push(Span::styled(" ".repeat(pad_w), Style::default().bg(meta_bg)));
             }
             if right_len > 0 {
                 row3.push(Span::styled(
                     status_badge,
                     Style::default()
                         .fg(status_color)
+                        .bg(meta_bg)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            meta_lines.push(Line::from(row3));
+            meta_lines.push(focus_prefix(row3));
         }
 
-        frame.render_widget(Paragraph::new(meta_lines), card_chunks[1]);
+        frame.render_widget(
+            Paragraph::new(meta_lines).style(Style::default().bg(meta_bg)),
+            card_chunks[1],
+        );
         if card_chunks[1].height > uploader_row_offset && uploader_actual_w > 0 {
-            let hitbox_x = card_chunks[1].x + inline_new_w as u16;
+            let hitbox_x = card_chunks[1].x + (focus_bar_w + inline_new_w) as u16;
             state.home_channel_hitboxes.push((
                 Rect::new(
                     hitbox_x,
                     card_chunks[1].y + uploader_row_offset,
-                    (uploader_actual_w as u16).min(card_chunks[1].width.saturating_sub(inline_new_w as u16)),
+                    (uploader_actual_w as u16)
+                        .min(card_chunks[1].width.saturating_sub((focus_bar_w + inline_new_w) as u16)),
                     1,
                 ),
                 v.clone(),
@@ -1643,46 +1635,6 @@ fn render_video_grid(
             Rect::new(area.x + 1, sy, area.width.saturating_sub(2), 1),
         );
     }
-}
-
-fn render_footer_dock(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = state.base_theme();
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-
-    frame.render_widget(
-        Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(theme.divider)),
-        rows[0],
-    );
-
-    let key = Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD);
-    let sec = Style::default().fg(Color::Black).bg(theme.secondary).add_modifier(Modifier::BOLD);
-    let txt = Style::default().fg(theme.text);
-
-    let row1 = Line::from(vec![
-        Span::styled(" / ", key), Span::styled(" Search   ", txt),
-        Span::styled(" c ", sec), Span::styled(" Calendar   ", txt),
-        Span::styled(" A ", sec), Span::styled(" Analysis  ", txt),
-        Span::styled(" m ", key), Span::styled(" Remote   ", txt),
-        Span::styled(" C ", sec), Span::styled(" TV Cast ", txt),
-        Span::styled("  ·  ", Style::default().fg(theme.divider)),
-        Span::styled(" a ", key), Span::styled(" +Continue Watching", txt),
-    ]);
-    let row2 = Line::from(vec![
-        Span::styled(" f ", sec), Span::styled(format!(" {} ", state.content_filter.label()), txt),
-        Span::styled(" s ", key), Span::styled(" Fuzzy Hub  ", txt),
-        Span::styled(" ? ", key), Span::styled(" Matrix   ", txt),
-        Span::styled(" q ", sec), Span::styled(" Quit     ", txt),
-        Span::styled("  ·  ", Style::default().fg(theme.divider)),
-        Span::styled(" Tab/1-6 ", sec), Span::styled(" Switch Shelf  ", txt),
-        Span::styled(" S ", key), Span::styled(" Shorts Src  ", txt),
-        Span::styled(" PgDn/n ", sec), Span::styled(" Load More", txt),
-    ]);
-
-    frame.render_widget(Paragraph::new(row1), rows[1]);
-    frame.render_widget(Paragraph::new(row2), rows[2]);
 }
 
 pub fn render_filter_modal(frame: &mut Frame, state: &AppState) {
@@ -1842,8 +1794,9 @@ mod tests {
 
         let area = Rect::new(0, 0, 120, 40);
         let [_, _, grid, footer] = home_layout(area);
+        assert_eq!(footer.height, 0);
         assert_eq!(grid_card_index_at(grid, grid.x + 3, grid.y + 2, 0, 1), Some(0));
-        assert_eq!(footer_action_at(footer, 2, footer.y + 1), Some(HomeFooterAction::Search));
+        assert_eq!(footer_action_at(footer, 2, footer.y), None);
         assert!(top_bar_shelf_at(&st.categories, 16).is_some());
 
         let backend = TestBackend::new(120, 40);
@@ -1860,15 +1813,17 @@ mod tests {
                 let m = compute_grid_metrics_for_size(grid, mode);
                 assert!(m.cols >= 2 && m.cols <= 5);
                 assert!(m.visible_rows >= 1);
-                if mode == GridCardSize::CinemaLarge && h >= 34 {
-                    assert_eq!(m.visible_rows, 3, "expected 3 rows at {w}x{h}");
+                if mode == GridCardSize::CinemaLarge {
+                    if h <= 34 {
+                        assert_eq!(m.visible_rows, 2, "expected 2 YouTube-sized rows at {w}x{h}");
+                        let min_h = if h >= 34 { 12 } else { 10 };
+                        assert!(m.card_height >= min_h, "expected tall 16:9 cards at {w}x{h}: {}", m.card_height);
+                    } else if h >= 46 {
+                        assert_eq!(m.visible_rows, 3, "expected 3 rows on tall monitor at {w}x{h}");
+                    }
                 }
-                if mode == GridCardSize::AdaptiveLarge {
-                    assert!(
-                        m.card_height >= 12,
-                        "card_height too short at {w}x{h} ({mode:?}): {}",
-                        m.card_height
-                    );
+                if mode == GridCardSize::AdaptiveLarge && h >= 34 {
+                    assert_eq!(m.visible_rows, 3, "expected 3 dense rows at {w}x{h}");
                 }
 
                 let (last_x, last_w) = m.col_x_and_width(m.cols - 1);
