@@ -19,8 +19,8 @@ use crate::api::innertube::{
     VideoComment, VideoVote,
 };
 use crate::api::player::{
-    build_mpv_audio_filter_chain, classify_player_crash_stderr, detect_dependencies,
-    ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
+    build_mpv_audio_filter_chain, build_music_audio_filter_chain, classify_player_crash_stderr,
+    detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
 };
 use crate::api::translate::{
     next_preset_lang, normalize_target_lang, prev_preset_lang, translate_text,
@@ -85,10 +85,10 @@ use crate::services::updater::{
 use crate::state::{
     parse_search_query, ActiveOverlay, AnalysisHit, AppState, CaptionsTab, Category,
     CommentTranslation, ContentFilter, ContentProfile, DetailHit, DetailViewMode, DownloadJobState,
-    FailedThumbEntry, HelpHit, ManualToggle, MusicHit, NowPlayingHit, PlayOptionsHit, ReplyTarget,
-    Screen, SearchFocus, SearchHit, SearchScope, SearchSortOrder, SearchTypeFilter,
-    SearchViewMode, ShortsSource, SleepTimerMode, SortOrder, StudioPage, ThumbPriority,
-    YtmRightPaneTab, YtmSection,
+    FailedThumbEntry, HelpHit, ManualToggle, MusicHit, MusicSettingsHit, NowPlayingHit,
+    PlayOptionsHit, ReplyTarget, Screen, SearchFocus, SearchHit, SearchScope, SearchSortOrder,
+    SearchTypeFilter, SearchViewMode, ShortsSource, SleepTimerMode, SortOrder, StudioPage,
+    ThumbPriority, YtmAlbumPopupHit, YtmRightPaneTab, YtmSection,
 };
 use crate::ui::components::cover::{is_yt_grey_placeholder, prepare_16_9_thumbnail};
 use crate::ui::help::confirm_quit_button_rects;
@@ -2664,7 +2664,7 @@ async fn handle_app_message(
                 .current_track()
                 .is_some_and(|t| t.video_id == video_id);
             if cur_matches {
-                if !queue.tracks.is_empty() {
+                if !queue.tracks.is_empty() && state.config.music.autoplay_mix {
                     // Preserve already-built prefix up to queue_index; append unique radio/playlist tracks
                     let mut existing_ids: HashSet<String> =
                         state.music.queue.iter().map(|t| t.video_id.clone()).collect();
@@ -2711,6 +2711,33 @@ async fn handle_app_message(
                 state.music.lyrics = Some(lyrics);
                 state.music.lyrics_loading = false;
             }
+        }
+        AppMessage::MusicAlbumPopupLoaded {
+            browse_id,
+            title,
+            page,
+        } => {
+            if state.music.album_popup.browse_id == browse_id {
+                state.music.album_popup.loading = false;
+                state.music.album_popup.error = None;
+                if let Some(ref ht) = page.header_title {
+                    if !ht.trim().is_empty() {
+                        state.music.album_popup.title = ht.clone();
+                    }
+                } else if !title.trim().is_empty() {
+                    state.music.album_popup.title = title;
+                }
+                state.music.album_popup.cursor = 0;
+                state.music.album_popup.scroll = 0;
+                state.music.album_popup.page = Some(page);
+            }
+        }
+        AppMessage::MusicAlbumPopupFailed { browse_id, error } => {
+            if state.music.album_popup.browse_id == browse_id {
+                state.music.album_popup.loading = false;
+                state.music.album_popup.error = Some(error.clone());
+            }
+            state.show_toast(format!("✕ Album load failed: {error}"));
         }
         AppMessage::MusicTrackEof { session_id } => {
             if session_id == state.active_session_id && state.music.current_track().is_some() {
@@ -3388,7 +3415,9 @@ async fn start_nonblocking_playback_with_live_opts(
     }
 
     let eff_master = state.config.effective_mastering();
-    let ytdl_format = if is_live {
+    let ytdl_format = if force_audio_headless {
+        state.config.music.audio_quality.ytdl_format().to_string()
+    } else if is_live {
         eff_quality.ytdl_format_for_live_with_network(
             state.config.live_mode,
             state.config.dub_preference,
@@ -3417,7 +3446,7 @@ async fn start_nonblocking_playback_with_live_opts(
         .or_else(|| state.stream_ladder_cache.get(&clean_id))
         .filter(|l| l.is_fresh(now_ts))
         .cloned();
-    let direct_stream = if !is_live && local_file.is_none() {
+    let direct_stream = if !is_live && !force_audio_headless && local_file.is_none() {
         fresh_ladder.as_ref().and_then(|l| {
             l.select_best_pair(
                 eff_quality,
@@ -3432,6 +3461,7 @@ async fn start_nonblocking_playback_with_live_opts(
     };
 
     if !is_live
+        && !force_audio_headless
         && local_file.is_none()
         && direct_stream.is_none()
         && state.config.auto_abr_downshift
@@ -3477,15 +3507,23 @@ async fn start_nonblocking_playback_with_live_opts(
         dub_preference: state.config.dub_preference,
         dub_lang: state.config.dub_lang.clone(),
         audio_multistreams: state.config.audio_multistreams,
-        audio_loudnorm: state.config.audio_loudnorm,
-        audio_filter_chain: build_mpv_audio_filter_chain(
-            state.config.active_audio_eq_bands(),
-            state.config.audio_eq_preamp_db,
-            false,
-            state.config.audio_channel_mode,
-            state.config.audio_voice_highpass,
-            state.config.audio_loudnorm,
-        ),
+        audio_loudnorm: if force_audio_headless {
+            false
+        } else {
+            state.config.audio_loudnorm
+        },
+        audio_filter_chain: if force_audio_headless {
+            build_music_audio_filter_chain(&state.config.music)
+        } else {
+            build_mpv_audio_filter_chain(
+                state.config.active_audio_eq_bands(),
+                state.config.audio_eq_preamp_db,
+                false,
+                state.config.audio_channel_mode,
+                state.config.audio_voice_highpass,
+                state.config.audio_loudnorm,
+            )
+        },
         is_live,
         live_mode: state.config.live_mode,
         live_from_start: force_from_start,
@@ -3790,33 +3828,68 @@ fn ensure_music_section_loaded(
     });
 }
 
-fn open_music_browse(
-    title: String,
-    browse_id: String,
-    params: Option<String>,
+fn ensure_music_tab_loaded(
     state: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
 ) {
-    if let Some(prev_page) = state.music.current_page().cloned() {
-        let prev_title = if state.music.section == YtmSection::Browse {
-            state.music.browse_title.clone()
-        } else {
-            state.music.section.label().to_string()
-        };
-        state
-            .music
-            .browse_stack
-            .push((state.music.section, prev_title, prev_page));
+    ensure_music_section_loaded(state.music.section, false, state, tx, client);
+    if state.music.library_page.is_none()
+        && state.music.section != YtmSection::Library
+        && state.auth_vault.active_account().is_some()
+    {
+        let c = client.clone();
+        let sess = state.auth_vault.active_account().cloned();
+        let tx_m = tx.clone();
+        tokio::spawn(async move {
+            if let Ok(page) =
+                fetch_ytm_browse(&c, sess.as_ref(), "FEmusic_library_landing", None, None).await
+            {
+                let _ = tx_m
+                    .send(AppMessage::MusicPageLoaded {
+                        section: YtmSection::Library,
+                        append: false,
+                        page,
+                        title: None,
+                    })
+                    .await;
+            }
+        });
     }
-    state.music.section = YtmSection::Browse;
-    state.music.browse_title = title.clone();
-    state.music.browse_page = None;
-    state.music.cursor = 0;
-    state.music.scroll = 0;
-    state.music.loading = true;
-    state.music.loading_label = title.clone();
-    state.music.error = None;
+}
+
+fn open_music_album_popup(
+    title: String,
+    browse_id: String,
+    params: Option<String>,
+    push_history: bool,
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    if push_history {
+        if let Some(prev_page) = state.music.album_popup.page.clone() {
+            state.music.album_popup.history.push((
+                state.music.album_popup.title.clone(),
+                state.music.album_popup.browse_id.clone(),
+                state.music.album_popup.params.clone(),
+                prev_page,
+            ));
+        }
+    } else {
+        state.music.album_popup.history.clear();
+    }
+
+    state.music.album_popup.title = title.clone();
+    state.music.album_popup.browse_id = browse_id.clone();
+    state.music.album_popup.params = params.clone();
+    state.music.album_popup.page = None;
+    state.music.album_popup.loading = true;
+    state.music.album_popup.error = None;
+    state.music.album_popup.cursor = 0;
+    state.music.album_popup.scroll = 0;
+    state.overlay = ActiveOverlay::MusicAlbum;
+    state.kitty_flush_needed = true;
 
     let c = client.clone();
     let sess = state.auth_vault.active_account().cloned();
@@ -3825,24 +3898,51 @@ fn open_music_browse(
         match fetch_ytm_browse(&c, sess.as_ref(), &browse_id, params.as_deref(), None).await {
             Ok(page) => {
                 let _ = tx_m
-                    .send(AppMessage::MusicPageLoaded {
-                        section: YtmSection::Browse,
-                        append: false,
+                    .send(AppMessage::MusicAlbumPopupLoaded {
+                        browse_id,
+                        title,
                         page,
-                        title: Some(title),
                     })
                     .await;
             }
             Err(e) => {
                 let _ = tx_m
-                    .send(AppMessage::MusicPageFailed {
-                        section: YtmSection::Browse,
+                    .send(AppMessage::MusicAlbumPopupFailed {
+                        browse_id,
                         error: e.to_string(),
                     })
                     .await;
             }
         }
     });
+}
+
+fn prepare_album_queue(tracks: &[YtmTrack], header_playlist_id: Option<&str>) -> Vec<YtmTrack> {
+    let mut q = tracks.to_vec();
+    if let Some(pid) = header_playlist_id {
+        for tr in &mut q {
+            if tr.playlist_id.is_none() {
+                tr.playlist_id = Some(pid.to_string());
+            }
+        }
+    }
+    q
+}
+
+fn music_grid_cols(state: &AppState) -> usize {
+    let total_w = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
+    let sidebar_w = if total_w >= 68 {
+        if total_w >= 120 { 24 } else { 19 }
+    } else {
+        0
+    };
+    let drawer_w = if state.music.right_drawer_open && total_w >= 104 {
+        if total_w >= 136 { 35 } else { 29 }
+    } else {
+        0
+    };
+    let stage_w = total_w.saturating_sub(sidebar_w + drawer_w).max(32);
+    ui::music::spotify_grid_cols(stage_w)
 }
 
 fn go_back_music(state: &mut AppState) {
@@ -3914,6 +4014,7 @@ async fn play_music_track_at(
 
     let want_headless = !state.music.video_mode;
     let can_gapless_ipc = want_headless
+        && state.config.music.gapless_audio
         && start_pos_override.is_none()
         && state.has_live_ipc()
         && state.music.active_audio_session_id == Some(state.active_session_id);
@@ -3979,7 +4080,7 @@ async fn play_music_track_at(
     let sess = state.auth_vault.active_account().cloned();
     let tx_u = tx.clone();
     let vid = track.video_id.clone();
-    let pl_id = if fetch_mix {
+    let pl_id = if fetch_mix && state.config.music.autoplay_mix {
         track.playlist_id.clone()
     } else {
         None
@@ -4015,17 +4116,7 @@ async fn activate_music_item(
             .music
             .current_page()
             .filter(|p| !p.tracks.is_empty())
-            .map(|p| {
-                let mut v = p.tracks.clone();
-                if let Some(ref pid) = p.header_playlist_id {
-                    for tr in &mut v {
-                        if tr.playlist_id.is_none() {
-                            tr.playlist_id = Some(pid.clone());
-                        }
-                    }
-                }
-                v
-            })
+            .map(|p| prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref()))
             .unwrap_or_default();
 
         if let Some(pos) = tracks_on_page
@@ -4039,14 +4130,32 @@ async fn activate_music_item(
             play_music_track_at(0, None, true, state, pool, tx, client).await;
         }
     } else if let Some(browse_id) = item.browse_id.clone() {
-        open_music_browse(
+        open_music_album_popup(
             item.title.clone(),
             browse_id,
             item.params.clone(),
+            false,
             state,
             tx,
             client,
         );
+    }
+}
+
+fn toggle_music_track_like(vid: String, state: &mut AppState, client: &reqwest::Client) {
+    let like_now = !state.music.liked_ids.contains(&vid);
+    if like_now {
+        state.music.liked_ids.insert(vid.clone());
+        state.show_toast("♥ Added to Liked Music");
+    } else {
+        state.music.liked_ids.remove(&vid);
+        state.show_toast("♡ Removed from Liked Music");
+    }
+    if let Some(sess) = state.auth_vault.active_account().cloned() {
+        let c = client.clone();
+        tokio::spawn(async move {
+            let _ = submit_ytm_like(&c, &sess, &vid, like_now).await;
+        });
     }
 }
 
@@ -4066,19 +4175,252 @@ fn toggle_music_like(state: &mut AppState, client: &reqwest::Client) {
         state.show_toast("Select or play a song first");
         return;
     };
-    let like_now = !state.music.liked_ids.contains(&vid);
-    if like_now {
-        state.music.liked_ids.insert(vid.clone());
-        state.show_toast("♥ Added to Liked Music");
-    } else {
-        state.music.liked_ids.remove(&vid);
-        state.show_toast("♡ Removed from Liked Music");
+    toggle_music_track_like(vid, state, client);
+}
+
+fn apply_music_settings_action(row: usize, dir: i8, state: &mut AppState) {
+    let mut audio_dirty = false;
+    let msg: String = match row {
+        0 => {
+            state.config.music.audio_quality = state.config.music.audio_quality.next();
+            format!(
+                "Music Quality (next track): {}",
+                state.config.music.audio_quality.label()
+            )
+        }
+        1 => {
+            state.config.music.normalization = state.config.music.normalization.next();
+            audio_dirty = true;
+            format!(
+                "Normalization: {}",
+                state.config.music.normalization.label()
+            )
+        }
+        2 => {
+            state.config.music.anti_clip_limiter = !state.config.music.anti_clip_limiter;
+            audio_dirty = true;
+            if state.config.music.anti_clip_limiter {
+                "Anti-Clipping Limiter: ON (-2 dB + Peak Limiter)".to_string()
+            } else {
+                "Anti-Clipping Limiter: OFF (Raw Gain)".to_string()
+            }
+        }
+        3 => {
+            state.config.music.eq_preset = state.config.music.eq_preset.next();
+            audio_dirty = true;
+            format!("Music EQ: {}", state.config.music.eq_preset.label())
+        }
+        4 => {
+            if dir < 0 {
+                state.config.music.preamp_db = (state.config.music.preamp_db - 1).clamp(-12, 2);
+            } else if dir > 0 {
+                state.config.music.preamp_db = (state.config.music.preamp_db + 1).clamp(-12, 2);
+            } else {
+                state.config.music.preamp_db = match state.config.music.preamp_db {
+                    0 => -2,
+                    -2 => -4,
+                    -4 => -6,
+                    _ => 0,
+                };
+            }
+            audio_dirty = true;
+            format!("Music Preamp Trim: {:+} dB", state.config.music.preamp_db)
+        }
+        5 => {
+            state.config.music.channel_mode = state.config.music.channel_mode.next();
+            audio_dirty = true;
+            format!(
+                "Spatial Stage: {}",
+                state.config.music.channel_mode.label()
+            )
+        }
+        6 => {
+            state.config.music.show_right_drawer = !state.config.music.show_right_drawer;
+            state.music.right_drawer_open = state.config.music.show_right_drawer;
+            state.kitty_flush_needed = true;
+            if state.music.right_drawer_open {
+                "Right Now Playing Drawer: Expanded".to_string()
+            } else {
+                "Right Now Playing Drawer: Collapsed".to_string()
+            }
+        }
+        7 => {
+            state.config.music.default_video_mode = !state.config.music.default_video_mode;
+            state.music.video_mode = state.config.music.default_video_mode;
+            if state.music.video_mode {
+                "Default Mode: Music Video Window".to_string()
+            } else {
+                "Default Mode: Windowless Background Audio".to_string()
+            }
+        }
+        8 => {
+            state.config.music.gapless_audio = !state.config.music.gapless_audio;
+            if state.config.music.gapless_audio {
+                "Gapless Single-Player: ON".to_string()
+            } else {
+                "Gapless Single-Player: OFF".to_string()
+            }
+        }
+        _ => {
+            state.config.music.autoplay_mix = !state.config.music.autoplay_mix;
+            if state.config.music.autoplay_mix {
+                "Autoplay Mix Radio: ON".to_string()
+            } else {
+                "Autoplay Mix Radio: OFF".to_string()
+            }
+        }
+    };
+    let _ = state.config.save();
+    if audio_dirty {
+        apply_music_audio_filter_chain(state);
     }
-    if let Some(sess) = state.auth_vault.active_account().cloned() {
-        let c = client.clone();
-        tokio::spawn(async move {
-            let _ = submit_ytm_like(&c, &sess, &vid, like_now).await;
-        });
+    state.show_toast(msg);
+}
+
+async fn apply_album_popup_hit(
+    hit: YtmAlbumPopupHit,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    match hit {
+        YtmAlbumPopupHit::Close => {
+            state.overlay = ActiveOverlay::None;
+            state.kitty_flush_needed = true;
+        }
+        YtmAlbumPopupHit::Back => {
+            if let Some((pt, pb, pp, ppage)) = state.music.album_popup.history.pop() {
+                state.music.album_popup.title = pt;
+                state.music.album_popup.browse_id = pb;
+                state.music.album_popup.params = pp;
+                state.music.album_popup.page = Some(ppage);
+                state.music.album_popup.loading = false;
+                state.music.album_popup.error = None;
+                state.music.album_popup.cursor = 0;
+                state.music.album_popup.scroll = 0;
+            } else {
+                state.overlay = ActiveOverlay::None;
+                state.kitty_flush_needed = true;
+            }
+        }
+        YtmAlbumPopupHit::PlayAll => {
+            if let Some(p) = state.music.album_popup.page.as_ref() {
+                let q = prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref());
+                if !q.is_empty() {
+                    state.music.shuffle = false;
+                    state.music.queue = q;
+                    play_music_track_at(0, None, false, state, pool, tx, client).await;
+                }
+            }
+        }
+        YtmAlbumPopupHit::ShuffleAll => {
+            if let Some(p) = state.music.album_popup.page.as_ref() {
+                let q = prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref());
+                if !q.is_empty() {
+                    let start = (now_unix() as usize) % q.len();
+                    state.music.shuffle = true;
+                    state.music.queue = q;
+                    play_music_track_at(start, None, false, state, pool, tx, client).await;
+                    state.show_toast("🔀 Shuffling album");
+                }
+            }
+        }
+        YtmAlbumPopupHit::OpenArtist => {
+            if let Some(aid) = state
+                .music
+                .album_popup
+                .page
+                .as_ref()
+                .and_then(|p| p.header_artist_browse_id.clone())
+            {
+                let name = state
+                    .music
+                    .album_popup
+                    .page
+                    .as_ref()
+                    .and_then(|p| p.header_artist.clone())
+                    .unwrap_or_else(|| "Artist".to_string());
+                open_music_album_popup(name, aid, None, true, state, tx, client);
+            }
+        }
+        YtmAlbumPopupHit::PlayTrack(t_idx) => {
+            state.music.album_popup.cursor = t_idx;
+            if let Some(p) = state.music.album_popup.page.as_ref() {
+                let q = prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref());
+                if t_idx < q.len() {
+                    state.music.queue = q;
+                    play_music_track_at(t_idx, None, false, state, pool, tx, client).await;
+                }
+            }
+        }
+        YtmAlbumPopupHit::QueueTrack(t_idx) => {
+            if let Some(mut tr) = state
+                .music
+                .album_popup
+                .page
+                .as_ref()
+                .and_then(|p| {
+                    let pid = p.header_playlist_id.clone();
+                    p.tracks.get(t_idx).cloned().map(|mut t| {
+                        if t.playlist_id.is_none() {
+                            t.playlist_id = pid;
+                        }
+                        t
+                    })
+                })
+            {
+                if tr.playlist_id.is_none() {
+                    tr.playlist_id = state
+                        .music
+                        .album_popup
+                        .page
+                        .as_ref()
+                        .and_then(|p| p.header_playlist_id.clone());
+                }
+                let title = tr.title.clone();
+                if state.music.queue.is_empty() {
+                    state.music.queue.push(tr);
+                } else {
+                    let ins = (state.music.queue_index + 1).min(state.music.queue.len());
+                    state.music.queue.insert(ins, tr);
+                }
+                state.show_toast(format!("➕ Queued next: {title}"));
+            }
+        }
+        YtmAlbumPopupHit::LikeTrack(t_idx) => {
+            if let Some(vid) = state
+                .music
+                .album_popup
+                .page
+                .as_ref()
+                .and_then(|p| p.tracks.get(t_idx).map(|t| t.video_id.clone()))
+            {
+                toggle_music_track_like(vid, state, client);
+            }
+        }
+        YtmAlbumPopupHit::OpenItem(i_idx) => {
+            let item = state
+                .music
+                .album_popup
+                .page
+                .as_ref()
+                .and_then(|p| {
+                    p.shelves
+                        .iter()
+                        .flat_map(|s| s.items.iter())
+                        .nth(i_idx)
+                        .cloned()
+                });
+            if let Some(it) = item {
+                if let Some(tr) = it.to_track() {
+                    state.music.queue = vec![tr];
+                    play_music_track_at(0, None, true, state, pool, tx, client).await;
+                } else if let Some(bid) = it.browse_id {
+                    open_music_album_popup(it.title, bid, it.params, true, state, tx, client);
+                }
+            }
+        }
     }
 }
 
@@ -4116,6 +4458,31 @@ async fn handle_music_mouse_event(
                         state.music.scroll = 0;
                         ensure_music_section_loaded(sec, false, state, tx, client);
                     }
+                    MusicHit::OpenSidebarPlaylist(idx) => {
+                        let lib_item = state.music.library_page.as_ref().and_then(|p| {
+                            p.shelves
+                                .iter()
+                                .flat_map(|s| s.items.iter())
+                                .nth(idx)
+                                .cloned()
+                        });
+                        if let Some(it) = lib_item {
+                            if let Some(bid) = it.browse_id {
+                                open_music_album_popup(
+                                    it.title,
+                                    bid,
+                                    it.params,
+                                    false,
+                                    state,
+                                    tx,
+                                    client,
+                                );
+                            } else if let Some(tr) = it.to_track() {
+                                state.music.queue = vec![tr];
+                                play_music_track_at(0, None, true, state, pool, tx, client).await;
+                            }
+                        }
+                    }
                     MusicHit::GoBack => {
                         go_back_music(state);
                     }
@@ -4131,20 +4498,9 @@ async fn handle_music_mouse_event(
                     }
                     MusicHit::SelectItem(idx) => {
                         state.music.search_editing = false;
-                        let now = Instant::now();
-                        let dbl_click = state
-                            .music
-                            .last_click
-                            .is_some_and(|(prev, ts)| {
-                                prev == idx && now.duration_since(ts) < Duration::from_millis(550)
-                            });
-                        if state.music.cursor == idx || dbl_click {
-                            activate_music_item(idx, state, pool, tx, client).await;
-                            state.music.last_click = None;
-                        } else {
-                            state.music.cursor = idx;
-                            state.music.last_click = Some((idx, now));
-                        }
+                        state.music.cursor = idx;
+                        state.music.last_click = None;
+                        activate_music_item(idx, state, pool, tx, client).await;
                     }
                     MusicHit::TogglePlayPause => {
                         if state.has_live_ipc() {
@@ -4217,8 +4573,43 @@ async fn handle_music_mouse_event(
                     MusicHit::ToggleLike => {
                         toggle_music_like(state, client);
                     }
+                    MusicHit::ToggleRightDrawer => {
+                        state.music.right_drawer_open = !state.music.right_drawer_open;
+                        state.kitty_flush_needed = true;
+                    }
+                    MusicHit::OpenMusicSettings => {
+                        state.music.settings_cursor = 0;
+                        state.overlay = ActiveOverlay::MusicSettings;
+                        state.kitty_flush_needed = true;
+                    }
+                    MusicHit::OpenCurrentAlbum => {
+                        if let Some((bid, alb_title)) = state.music.current_track().and_then(|t| {
+                            t.album_browse_id.clone().map(|id| {
+                                let name = t.album.clone().unwrap_or_else(|| t.title.clone());
+                                (id, name)
+                            })
+                        }) {
+                            open_music_album_popup(alb_title, bid, None, false, state, tx, client);
+                        }
+                    }
+                    MusicHit::VolumeDelta(delta) => {
+                        state.live_playback.volume =
+                            (state.live_playback.volume + delta).clamp(0, 100);
+                        if state.has_live_ipc() {
+                            state.send_player_cmd(PlayerCommand::SetVolume(
+                                state.live_playback.volume,
+                            ));
+                        }
+                    }
+                    MusicHit::ToggleMute => {
+                        state.live_playback.muted = !state.live_playback.muted;
+                        if state.has_live_ipc() {
+                            state.send_player_cmd(PlayerCommand::ToggleMute);
+                        }
+                    }
                     MusicHit::SelectRightTab(tab) => {
                         state.music.right_tab = tab;
+                        state.music.right_drawer_open = true;
                     }
                     MusicHit::SelectQueueTrack(q_idx) => {
                         play_music_track_at(q_idx, None, false, state, pool, tx, client).await;
@@ -4298,9 +4689,19 @@ async fn handle_music_key_event(
         KeyCode::Char('q') => open_confirm_quit(state),
         KeyCode::Char('?') => state.overlay = ActiveOverlay::Help,
         KeyCode::Char('s') | KeyCode::Char(',') => {
-            state.settings_query.clear();
-            state.settings_cursor = 0;
-            state.overlay = ActiveOverlay::Settings;
+            state.music.settings_cursor = 0;
+            state.overlay = ActiveOverlay::MusicSettings;
+            state.kitty_flush_needed = true;
+        }
+        KeyCode::Char('d') => {
+            state.music.right_drawer_open = !state.music.right_drawer_open;
+            state.kitty_flush_needed = true;
+        }
+        KeyCode::Char('m') => {
+            state.live_playback.muted = !state.live_playback.muted;
+            if state.has_live_ipc() {
+                state.send_player_cmd(PlayerCommand::ToggleMute);
+            }
         }
         KeyCode::Char('L') => {
             state.login_ui.step = LoginStep::Hub;
@@ -4317,20 +4718,20 @@ async fn handle_music_key_event(
             let idx = (d as usize) - ('1' as usize);
             state.active_category = idx.min(state.categories.len() - 1);
             if state.categories[state.active_category].0 == Category::Music {
-                ensure_music_section_loaded(state.music.section, false, state, tx, client);
+                ensure_music_tab_loaded(state, tx, client);
             }
         }
         KeyCode::Tab => {
             state.active_category = (state.active_category + 1) % state.categories.len();
             if state.categories[state.active_category].0 == Category::Music {
-                ensure_music_section_loaded(state.music.section, false, state, tx, client);
+                ensure_music_tab_loaded(state, tx, client);
             }
         }
         KeyCode::BackTab => {
             state.active_category =
                 (state.active_category + state.categories.len() - 1) % state.categories.len();
             if state.categories[state.active_category].0 == Category::Music {
-                ensure_music_section_loaded(state.music.section, false, state, tx, client);
+                ensure_music_tab_loaded(state, tx, client);
             }
         }
         KeyCode::Char('/') => {
@@ -4340,16 +4741,37 @@ async fn handle_music_key_event(
         KeyCode::Char('r') => {
             ensure_music_section_loaded(state.music.section, true, state, tx, client);
         }
-        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => {
             go_back_music(state);
+        }
+        KeyCode::Left => {
+            let is_grid = state
+                .music
+                .current_page()
+                .is_some_and(|p| p.tracks.is_empty() && !p.shelves.is_empty());
+            if is_grid && state.music.cursor > 0 {
+                state.music.cursor -= 1;
+            } else {
+                go_back_music(state);
+            }
         }
         KeyCode::Char('j') | KeyCode::Down => {
             if items_len > 0 {
-                state.music.cursor = (state.music.cursor + 1).min(items_len - 1);
+                let is_grid = state
+                    .music
+                    .current_page()
+                    .is_some_and(|p| p.tracks.is_empty() && !p.shelves.is_empty());
+                let step = if is_grid { music_grid_cols(state) } else { 1 };
+                state.music.cursor = (state.music.cursor + step).min(items_len - 1);
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            state.music.cursor = state.music.cursor.saturating_sub(1);
+            let is_grid = state
+                .music
+                .current_page()
+                .is_some_and(|p| p.tracks.is_empty() && !p.shelves.is_empty());
+            let step = if is_grid { music_grid_cols(state) } else { 1 };
+            state.music.cursor = state.music.cursor.saturating_sub(step);
         }
         KeyCode::PageDown => {
             if items_len > 0 {
@@ -4386,7 +4808,20 @@ async fn handle_music_key_event(
                 play_music_track_at(prev_idx, None, false, state, pool, tx, client).await;
             }
         }
-        KeyCode::Char(']') | KeyCode::Right => {
+        KeyCode::Right => {
+            let is_grid = state
+                .music
+                .current_page()
+                .is_some_and(|p| p.tracks.is_empty() && !p.shelves.is_empty());
+            if is_grid {
+                if items_len > 0 {
+                    state.music.cursor = (state.music.cursor + 1).min(items_len - 1);
+                }
+            } else if state.has_live_ipc() {
+                state.send_player_cmd(PlayerCommand::SeekRelative(10.0));
+            }
+        }
+        KeyCode::Char(']') => {
             if state.has_live_ipc() {
                 state.send_player_cmd(PlayerCommand::SeekRelative(10.0));
             }
@@ -4397,14 +4832,14 @@ async fn handle_music_key_event(
             }
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
+            state.live_playback.volume = (state.live_playback.volume + 5).clamp(0, 100);
             if state.has_live_ipc() {
-                state.live_playback.volume = (state.live_playback.volume + 5).clamp(0, 150);
                 state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
             }
         }
         KeyCode::Char('-') | KeyCode::Char('_') => {
+            state.live_playback.volume = (state.live_playback.volume - 5).clamp(0, 100);
             if state.has_live_ipc() {
-                state.live_playback.volume = (state.live_playback.volume - 5).clamp(0, 150);
                 state.send_player_cmd(PlayerCommand::SetVolume(state.live_playback.volume));
             }
         }
@@ -5825,6 +6260,16 @@ fn apply_audio_filter_chain(state: &mut AppState) {
         state.config.audio_loudnorm,
     );
     if state.has_live_ipc() {
+        state.send_player_cmd(PlayerCommand::SetAudioFilterChain(chain.unwrap_or_default()));
+    }
+}
+
+/// Apply dedicated YouTube Music DSP chain (`preamp` + EQ + normalization + `alimiter`) live to headless mpv.
+fn apply_music_audio_filter_chain(state: &mut AppState) {
+    let chain = build_music_audio_filter_chain(&state.config.music);
+    if state.has_live_ipc()
+        && state.music.active_audio_session_id == Some(state.active_session_id)
+    {
         state.send_player_cmd(PlayerCommand::SetAudioFilterChain(chain.unwrap_or_default()));
     }
 }
@@ -7715,6 +8160,126 @@ async fn handle_mouse_event(
             }
             return false;
         }
+        if state.overlay == ActiveOverlay::MusicAlbum {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some((_, hit)) = state
+                    .music
+                    .album_popup
+                    .hitboxes
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| in_rect(*r))
+                    .copied()
+                {
+                    apply_album_popup_hit(hit, state, pool, tx, client).await;
+                    return true;
+                }
+                if let Some(modal) =
+                    crate::state::active_modal_rect(frame_area, ActiveOverlay::MusicAlbum)
+                {
+                    if !in_rect(modal) {
+                        state.overlay = ActiveOverlay::None;
+                        state.kitty_flush_needed = true;
+                        return true;
+                    }
+                }
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.overlay = ActiveOverlay::None;
+                state.kitty_flush_needed = true;
+                return true;
+            }
+            if matches!(mouse.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+                let total = state
+                    .music
+                    .album_popup
+                    .page
+                    .as_ref()
+                    .map(|p| {
+                        if !p.tracks.is_empty() {
+                            p.tracks.len()
+                        } else {
+                            p.shelves.iter().map(|s| s.items.len()).sum()
+                        }
+                    })
+                    .unwrap_or(0);
+                if total > 0 {
+                    if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                        state.music.album_popup.cursor =
+                            (state.music.album_popup.cursor + 3).min(total - 1);
+                    } else {
+                        state.music.album_popup.cursor =
+                            state.music.album_popup.cursor.saturating_sub(3);
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+        if state.overlay == ActiveOverlay::MusicSettings {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some((_, hit)) = state
+                    .music
+                    .settings_hitboxes
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| in_rect(*r))
+                    .copied()
+                {
+                    match hit {
+                        MusicSettingsHit::Close => {
+                            state.overlay = ActiveOverlay::None;
+                            state.kitty_flush_needed = true;
+                        }
+                        MusicSettingsHit::ActivateRow(idx) => {
+                            state.music.settings_cursor = idx;
+                            apply_music_settings_action(idx, 1, state);
+                        }
+                    }
+                    return true;
+                }
+                if let Some(modal) =
+                    crate::state::active_modal_rect(frame_area, ActiveOverlay::MusicSettings)
+                {
+                    if !in_rect(modal) {
+                        state.overlay = ActiveOverlay::None;
+                        state.kitty_flush_needed = true;
+                        return true;
+                    }
+                }
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.overlay = ActiveOverlay::None;
+                state.kitty_flush_needed = true;
+                return true;
+            }
+            if matches!(mouse.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+                if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                    state.music.settings_cursor =
+                        (state.music.settings_cursor + 1).min(ui::music::MUSIC_SETTINGS_ROW_COUNT - 1);
+                } else {
+                    state.music.settings_cursor = state.music.settings_cursor.saturating_sub(1);
+                }
+                return true;
+            }
+            return false;
+        }
         if state.overlay == ActiveOverlay::Help {
             let in_rect = |r: ratatui::layout::Rect| -> bool {
                 r.width > 0
@@ -8018,7 +8583,7 @@ async fn handle_mouse_event(
                 if let Some(idx) = top_bar_shelf_at(&state.categories, mouse.column) {
                     state.active_category = idx;
                     if state.categories[idx].0 == Category::Music {
-                        ensure_music_section_loaded(state.music.section, false, state, tx, client);
+                        ensure_music_tab_loaded(state, tx, client);
                     }
                     return true;
                 }
@@ -8752,20 +9317,20 @@ async fn handle_key_event(
         KeyCode::Char('7') => {
             state.active_category = 6.min(state.categories.len() - 1);
             if state.categories[state.active_category].0 == Category::Music {
-                ensure_music_section_loaded(state.music.section, false, state, tx, client);
+                ensure_music_tab_loaded(state, tx, client);
             }
         }
         KeyCode::Tab => {
             state.active_category = (state.active_category + 1) % state.categories.len();
             if state.categories[state.active_category].0 == Category::Music {
-                ensure_music_section_loaded(state.music.section, false, state, tx, client);
+                ensure_music_tab_loaded(state, tx, client);
             }
         }
         KeyCode::BackTab => {
             state.active_category =
                 (state.active_category + state.categories.len() - 1) % state.categories.len();
             if state.categories[state.active_category].0 == Category::Music {
-                ensure_music_section_loaded(state.music.section, false, state, tx, client);
+                ensure_music_tab_loaded(state, tx, client);
             }
         }
         KeyCode::Char('l') | KeyCode::Right => {
@@ -9673,6 +10238,132 @@ async fn handle_overlay_key(
             }
             _ => {}
         },
+        ActiveOverlay::MusicSettings => match code {
+            KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char(',') | KeyCode::Char('q') => {
+                state.overlay = ActiveOverlay::None;
+                state.kitty_flush_needed = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.music.settings_cursor = state.music.settings_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.music.settings_cursor = (state.music.settings_cursor + 1)
+                    .min(ui::music::MUSIC_SETTINGS_ROW_COUNT - 1);
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                apply_music_settings_action(state.music.settings_cursor, -1, state);
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                apply_music_settings_action(state.music.settings_cursor, 1, state);
+            }
+            _ => {}
+        },
+        ActiveOverlay::MusicAlbum => {
+            let total = state
+                .music
+                .album_popup
+                .page
+                .as_ref()
+                .map(|p| {
+                    if !p.tracks.is_empty() {
+                        p.tracks.len()
+                    } else {
+                        p.shelves.iter().map(|s| s.items.len()).sum()
+                    }
+                })
+                .unwrap_or(0);
+            let has_tracks = state
+                .music
+                .album_popup
+                .page
+                .as_ref()
+                .is_some_and(|p| !p.tracks.is_empty());
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    apply_album_popup_hit(YtmAlbumPopupHit::Close, state, pool, tx, client).await;
+                }
+                KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+                    apply_album_popup_hit(YtmAlbumPopupHit::Back, state, pool, tx, client).await;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.music.album_popup.cursor =
+                        state.music.album_popup.cursor.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if total > 0 {
+                        state.music.album_popup.cursor =
+                            (state.music.album_popup.cursor + 1).min(total - 1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    state.music.album_popup.cursor =
+                        state.music.album_popup.cursor.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    if total > 0 {
+                        state.music.album_popup.cursor =
+                            (state.music.album_popup.cursor + 10).min(total - 1);
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    state.music.album_popup.cursor = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    if total > 0 {
+                        state.music.album_popup.cursor = total - 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let cur = state.music.album_popup.cursor;
+                    let hit = if has_tracks {
+                        YtmAlbumPopupHit::PlayTrack(cur)
+                    } else {
+                        YtmAlbumPopupHit::OpenItem(cur)
+                    };
+                    apply_album_popup_hit(hit, state, pool, tx, client).await;
+                }
+                KeyCode::Char(' ') => {
+                    if state.has_live_ipc() {
+                        state.live_playback.paused = !state.live_playback.paused;
+                        state.send_player_cmd(PlayerCommand::TogglePause);
+                    } else {
+                        apply_album_popup_hit(YtmAlbumPopupHit::PlayAll, state, pool, tx, client)
+                            .await;
+                    }
+                }
+                KeyCode::Char('p') => {
+                    apply_album_popup_hit(YtmAlbumPopupHit::PlayAll, state, pool, tx, client)
+                        .await;
+                }
+                KeyCode::Char('z') | KeyCode::Char('r') => {
+                    apply_album_popup_hit(YtmAlbumPopupHit::ShuffleAll, state, pool, tx, client)
+                        .await;
+                }
+                KeyCode::Char('a') if has_tracks => {
+                    let cur = state.music.album_popup.cursor;
+                    apply_album_popup_hit(
+                        YtmAlbumPopupHit::QueueTrack(cur),
+                        state,
+                        pool,
+                        tx,
+                        client,
+                    )
+                    .await;
+                }
+                KeyCode::Char('l') if has_tracks => {
+                    let cur = state.music.album_popup.cursor;
+                    apply_album_popup_hit(
+                        YtmAlbumPopupHit::LikeTrack(cur),
+                        state,
+                        pool,
+                        tx,
+                        client,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
         ActiveOverlay::Analytics => match code {
             KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') => {
                 state.overlay = ActiveOverlay::None;

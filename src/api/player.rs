@@ -212,6 +212,45 @@ pub fn build_mpv_audio_filter_chain(
     }
 }
 
+/// Build an anti-clipping FFmpeg `af` chain for YouTube Music playback:
+/// automatically applies negative headroom matching peak EQ boost (`-2 dB` margin)
+/// and finishes with a transparent lookahead brickwall limiter (`alimiter`) so
+/// inter-sample Opus/AAC peaks and EQ boosts never crackle or clip.
+pub fn build_music_audio_filter_chain(cfg: &crate::config::MusicSettingsConfig) -> Option<String> {
+    let mut nodes: Vec<String> = Vec::new();
+    let bands = cfg.eq_preset.band_gains_db();
+    let max_boost = bands.iter().copied().filter(|&b| b > 0).max().unwrap_or(0);
+    let safe_preamp = (cfg.preamp_db as i32 - max_boost as i32 - if cfg.anti_clip_limiter { 2 } else { 0 }).clamp(-18, 0);
+
+    if safe_preamp != 0 {
+        nodes.push(format!("volume={safe_preamp}dB"));
+    }
+    for (freq, gain) in EQ_BAND_FREQS_HZ.into_iter().zip(bands) {
+        let g = gain.clamp(-12, 12);
+        if g != 0 {
+            nodes.push(format!("equalizer=f={freq}:t=q:w=1.4:g={g}"));
+        }
+    }
+    if cfg.normalization == crate::config::MusicNormMode::DynamicSoft {
+        nodes.push("dynaudnorm=f=200:g=21:p=0.88:m=10".to_string());
+    }
+    match cfg.channel_mode {
+        AudioChannelMode::Stereo => {}
+        AudioChannelMode::Mono => nodes.push("pan=mono|c0=0.5*c0+0.5*c1".to_string()),
+        AudioChannelMode::Crossfeed => nodes.push("crossfeed=strength=0.45:range=0.5".to_string()),
+        AudioChannelMode::WideStage => nodes.push("extrastereo=m=1.35".to_string()),
+    }
+    if cfg.anti_clip_limiter {
+        // Transparent brickwall peak guard at -0.7 dBFS so no digital clipping hits PipeWire/DAC.
+        nodes.push("alimiter=limit=0.92:attack=5:release=60:level=disabled".to_string());
+    }
+    if nodes.is_empty() {
+        None
+    } else {
+        Some(format!("lavfi=[{}]", nodes.join(",")))
+    }
+}
+
 const YOUTUBE_INPUT_CONF: &str = r#"# Phaenna YouTube-Parity Player Keybindings (works windowed & fullscreen)
 k cycle pause
 SPACE cycle pause
@@ -2161,22 +2200,38 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     let hwdec_val = eff_master.hwdec.effective_mpv_value();
     let dev = crate::services::platform::detect_device_profile();
     let caps = crate::services::platform::detect_player_capabilities();
-    let mut flags = vec![
-        format!("hwdec={hwdec_val}"),
-        format!("vo={}", caps.effective_vo()),
-        format!("gpu-api={}", caps.effective_gpu_api(dev)),
-        "cache=yes".to_string(),
-        format!("demuxer-max-bytes={max_buf}"),
-        format!("demuxer-max-back-bytes={back_buf}"),
-        format!("force-media-title={}", opts.title),
-    ];
-
-    if opts.quality_format.starts_with("bestaudio") || opts.audio_headless {
-        flags.push("vid=no".to_string());
-    }
-    if opts.audio_headless {
-        flags.push("audio-display=no".to_string());
-    }
+    let mut flags = if opts.audio_headless {
+        vec![
+            "cache=yes".to_string(),
+            format!("demuxer-max-bytes={max_buf}"),
+            format!("demuxer-max-back-bytes={back_buf}"),
+            format!("force-media-title={}", opts.title),
+            "vid=no".to_string(),
+            "audio-display=no".to_string(),
+            "video-sync=audio".to_string(),
+            "interpolation=no".to_string(),
+            "gapless-audio=yes".to_string(),
+            "audio-buffer=0.5".to_string(),
+            "replaygain=track".to_string(),
+            "replaygain-preamp=-2".to_string(),
+            "volume-max=100".to_string(),
+            "audio-pitch-correction=yes".to_string(),
+        ]
+    } else {
+        let mut f = vec![
+            format!("hwdec={hwdec_val}"),
+            format!("vo={}", caps.effective_vo()),
+            format!("gpu-api={}", caps.effective_gpu_api(dev)),
+            "cache=yes".to_string(),
+            format!("demuxer-max-bytes={max_buf}"),
+            format!("demuxer-max-back-bytes={back_buf}"),
+            format!("force-media-title={}", opts.title),
+        ];
+        if opts.quality_format.starts_with("bestaudio") {
+            f.push("vid=no".to_string());
+        }
+        f
+    };
 
     if !opts.audio_headless {
         #[cfg(target_os = "linux")]
@@ -2320,7 +2375,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             script_opt_parts.push(format!("phaenna_live_target={tgt:.1}"));
             script_opt_parts.push(format!("phaenna_live_speed={spd:.2}"));
         }
-    } else if opts.performance_mode == PerformanceMode::Efficient {
+    } else if opts.audio_headless || opts.performance_mode == PerformanceMode::Efficient {
         flags.push("video-sync=audio".to_string());
         flags.push("interpolation=no".to_string());
         if opts.local_file.is_none() {
@@ -2404,14 +2459,18 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         } else {
             flags.push(format!("ytdl-format={}", opts.quality_format));
             let vcodec_order = eff_master.codec_priority.format_sort_vcodec();
-            let sort_spec = match opts.dub_preference {
-                // Keep `lang` ahead of `abr` so YouTube's `language_preference=10` (Original)
-                // never loses to slightly higher-bitrate AI-dubbed audio tracks.
-                DubPreference::OriginalOnly => {
-                    format!("lang,res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr")
-                }
-                DubPreference::PreferDubbed => {
-                    format!("res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr")
+            let sort_spec = if opts.audio_headless {
+                "lang,abr,asr".to_string()
+            } else {
+                match opts.dub_preference {
+                    // Keep `lang` ahead of `abr` so YouTube's `language_preference=10` (Original)
+                    // never loses to slightly higher-bitrate AI-dubbed audio tracks.
+                    DubPreference::OriginalOnly => {
+                        format!("lang,res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr")
+                    }
+                    DubPreference::PreferDubbed => {
+                        format!("res:2160,fps,hdr,vcodec:{vcodec_order},vbr,abr")
+                    }
                 }
             };
             flags.push(format!("ytdl-raw-options-append=format-sort={sort_spec}"));
@@ -3086,7 +3145,51 @@ mod tests {
         assert!(args.iter().any(|a| a == "--force-window=no"));
         assert!(args.iter().any(|a| a == "--vid=no"));
         assert!(args.iter().any(|a| a == "--audio-display=no"));
+        assert!(args.iter().any(|a| a == "--gapless-audio=yes"));
+        assert!(args.iter().any(|a| a == "--audio-buffer=0.5"));
+        assert!(args.iter().any(|a| a == "--replaygain=track"));
+        assert!(args.iter().any(|a| a == "--replaygain-preamp=-2"));
+        assert!(args.iter().any(|a| a == "--volume-max=100"));
+        assert!(args.iter().any(|a| a == "--video-sync=audio"));
         assert!(!args.iter().any(|a| a.starts_with("--glsl-shaders=")));
         assert!(!args.iter().any(|a| a.starts_with("--wayland-app-id=")));
+        assert!(!args.iter().any(|a| a.starts_with("--vo=")));
+        assert!(!args.iter().any(|a| a.starts_with("--hwdec=")));
+        assert!(!args.iter().any(|a| a.starts_with("--tscale=")));
+        assert!(!args.iter().any(|a| a == "--interpolation"));
+        assert!(!args.iter().any(|a| a == "--video-sync=display-resample"));
+    }
+
+    #[test]
+    fn test_music_audio_filter_chain_prevents_clipping() {
+        use crate::config::{AudioChannelMode, AudioEqPreset, MusicNormMode, MusicSettingsConfig};
+
+        let def_chain = build_music_audio_filter_chain(&MusicSettingsConfig::default()).unwrap();
+        assert!(def_chain.contains("volume=-2dB"));
+        assert!(def_chain.contains("alimiter=limit=0.92:attack=5:release=60:level=disabled"));
+
+        let bass_cfg = MusicSettingsConfig {
+            eq_preset: AudioEqPreset::BassBoost,
+            normalization: MusicNormMode::DynamicSoft,
+            channel_mode: AudioChannelMode::Crossfeed,
+            ..Default::default()
+        };
+        let bass_chain = build_music_audio_filter_chain(&bass_cfg).unwrap();
+        // BassBoost max peak (+6 dB) + default -2 dB safety headroom => volume=-8dB
+        assert!(bass_chain.contains("volume=-8dB"), "got {bass_chain}");
+        assert!(bass_chain.contains("equalizer=f=31:"));
+        assert!(bass_chain.contains("dynaudnorm="));
+        assert!(bass_chain.contains("crossfeed="));
+        assert!(bass_chain.contains("alimiter="));
+
+        let raw_cfg = MusicSettingsConfig {
+            anti_clip_limiter: false,
+            normalization: MusicNormMode::Off,
+            eq_preset: AudioEqPreset::Flat,
+            preamp_db: 0,
+            channel_mode: AudioChannelMode::Stereo,
+            ..Default::default()
+        };
+        assert!(build_music_audio_filter_chain(&raw_cfg).is_none());
     }
 }

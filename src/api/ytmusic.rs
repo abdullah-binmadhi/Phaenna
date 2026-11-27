@@ -148,6 +148,10 @@ pub struct YtmShelf {
 pub struct YtmPage {
     pub header_title: Option<String>,
     pub header_subtitle: Option<String>,
+    pub header_artist: Option<String>,
+    pub header_artist_browse_id: Option<String>,
+    pub header_year: Option<String>,
+    pub header_track_summary: Option<String>,
     pub header_thumb: Option<String>,
     pub header_playlist_id: Option<String>,
     pub shelves: Vec<YtmShelf>,
@@ -754,7 +758,40 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
             }
             let sub = runs_text(hdr.get("subtitle").or_else(|| hdr.get("straplineTextOne")));
             if !sub.is_empty() {
-                page.header_subtitle = Some(sub);
+                page.header_subtitle = Some(sub.clone());
+                for part in sub.split("•").map(str::trim) {
+                    if part.len() == 4 && part.chars().all(|c| c.is_ascii_digit()) {
+                        page.header_year = Some(part.to_string());
+                    }
+                }
+            }
+            if let Some(runs) = hdr
+                .pointer("/straplineTextOne/runs")
+                .or_else(|| hdr.pointer("/subtitle/runs"))
+                .and_then(Value::as_array)
+            {
+                for r in runs {
+                    let rt = r.get("text").and_then(Value::as_str).unwrap_or("").trim();
+                    let (bid, _, pt) = extract_browse_endpoint(r.get("navigationEndpoint"));
+                    if bid.is_some()
+                        && (pt.unwrap_or("").contains("ARTIST")
+                            || bid.as_deref().unwrap_or("").starts_with("UC"))
+                    {
+                        page.header_artist = (!rt.is_empty()).then(|| rt.to_string());
+                        page.header_artist_browse_id = bid;
+                        break;
+                    }
+                }
+            }
+            if page.header_artist.is_none() {
+                let strap = runs_text(hdr.get("straplineTextOne"));
+                if !strap.is_empty() {
+                    page.header_artist = Some(strap);
+                }
+            }
+            let summary = runs_text(hdr.get("secondSubtitle").or_else(|| hdr.get("description")));
+            if !summary.is_empty() {
+                page.header_track_summary = Some(summary);
             }
             let th = best_thumb(hdr.get("thumbnail"));
             if !th.is_empty() {
@@ -1491,5 +1528,49 @@ mod tests {
         assert_eq!(lyrics.lines.len(), 1);
         assert_eq!(lyrics.lines[0].start_ms, Some(12000));
         assert_eq!(lyrics.source.as_deref(), Some("Source: LyricFind"));
+    }
+
+    #[test]
+    fn test_parse_ytm_album_popup_metadata() {
+        let album_json = serde_json::json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicResponsiveHeaderRenderer": {
+                                            "title": { "runs": [{ "text": "Black Holes and Revelations" }] },
+                                            "subtitle": { "runs": [
+                                                { "text": "Album" },
+                                                { "text": " • " },
+                                                { "text": "Muse", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCmuse", "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" } } } } },
+                                                { "text": " • " },
+                                                { "text": "2006" }
+                                            ] },
+                                            "secondSubtitle": { "runs": [{ "text": "11 songs · 45 minutes" }] },
+                                            "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [{ "url": "https://lh3.googleusercontent.com/bh=w544-h544", "width": 544, "height": 544 }] } } }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let page = parse_ytm_browse_json(&album_json);
+        assert_eq!(
+            page.header_title.as_deref(),
+            Some("Black Holes and Revelations")
+        );
+        assert_eq!(page.header_artist.as_deref(), Some("Muse"));
+        assert_eq!(page.header_artist_browse_id.as_deref(), Some("UCmuse"));
+        assert_eq!(page.header_year.as_deref(), Some("2006"));
+        assert_eq!(
+            page.header_track_summary.as_deref(),
+            Some("11 songs · 45 minutes")
+        );
     }
 }

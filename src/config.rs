@@ -2039,6 +2039,110 @@ impl GridCardSize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicAudioQuality {
+    #[default]
+    HiFiOpus,
+    AacHigh,
+    DataSaver,
+}
+
+impl MusicAudioQuality {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::HiFiOpus => Self::AacHigh,
+            Self::AacHigh => Self::DataSaver,
+            Self::DataSaver => Self::HiFiOpus,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HiFiOpus => "Hi-Fi Opus (Best 48 kHz)",
+            Self::AacHigh => "AAC High Compatibility",
+            Self::DataSaver => "Data Saver (<= 96 kbps)",
+        }
+    }
+
+    pub const fn ytdl_format(self) -> &'static str {
+        match self {
+            Self::HiFiOpus => "bestaudio[acodec^=opus]/bestaudio/best",
+            Self::AacHigh => "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+            Self::DataSaver => "bestaudio[abr<=?96]/bestaudio/best",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicNormMode {
+    #[default]
+    ReplayGain,
+    DynamicSoft,
+    Off,
+}
+
+impl MusicNormMode {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::ReplayGain => Self::DynamicSoft,
+            Self::DynamicSoft => Self::Off,
+            Self::Off => Self::ReplayGain,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReplayGain => "ReplayGain (-14 LUFS Match)",
+            Self::DynamicSoft => "Soft Dynamic Leveling",
+            Self::Off => "Off (Headroom + Limiter Only)",
+        }
+    }
+}
+
+/// Separate configuration profile for the YouTube Music Spotify-style workspace & audio engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MusicSettingsConfig {
+    #[serde(default)]
+    pub audio_quality: MusicAudioQuality,
+    #[serde(default)]
+    pub normalization: MusicNormMode,
+    #[serde(default = "default_true")]
+    pub anti_clip_limiter: bool,
+    #[serde(default)]
+    pub eq_preset: AudioEqPreset,
+    #[serde(default)]
+    pub preamp_db: i8,
+    #[serde(default)]
+    pub channel_mode: AudioChannelMode,
+    #[serde(default = "default_true")]
+    pub show_right_drawer: bool,
+    #[serde(default = "default_true")]
+    pub gapless_audio: bool,
+    #[serde(default = "default_true")]
+    pub autoplay_mix: bool,
+    #[serde(default)]
+    pub default_video_mode: bool,
+}
+
+impl Default for MusicSettingsConfig {
+    fn default() -> Self {
+        Self {
+            audio_quality: MusicAudioQuality::default(),
+            normalization: MusicNormMode::default(),
+            anti_clip_limiter: true,
+            eq_preset: AudioEqPreset::Flat,
+            preamp_db: 0,
+            channel_mode: AudioChannelMode::Stereo,
+            show_right_drawer: true,
+            gapless_audio: true,
+            autoplay_mix: true,
+            default_video_mode: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -2127,6 +2231,8 @@ pub struct Config {
     pub subtitle_style: crate::services::substyler::SubtitleStyleConfig,
     #[serde(default)]
     pub picture: PictureConfig,
+    #[serde(default)]
+    pub music: MusicSettingsConfig,
 }
 
 impl Default for Config {
@@ -2175,6 +2281,7 @@ impl Default for Config {
             analysis: AnalysisConfig::default(),
             subtitle_style: crate::services::substyler::SubtitleStyleConfig::default(),
             picture: PictureConfig::default(),
+            music: MusicSettingsConfig::default(),
         }
     }
 }
@@ -2621,5 +2728,34 @@ mod tests {
             Some(30),
         );
         assert!(fps_sel.contains("fps<=?30"));
+
+        let music_path = dir.path().join("music_settings_config.toml");
+        let music_cfg = Config {
+            music: MusicSettingsConfig {
+                audio_quality: MusicAudioQuality::AacHigh,
+                normalization: MusicNormMode::DynamicSoft,
+                anti_clip_limiter: false,
+                eq_preset: AudioEqPreset::Jazz,
+                preamp_db: -4,
+                channel_mode: AudioChannelMode::WideStage,
+                show_right_drawer: false,
+                gapless_audio: false,
+                autoplay_mix: false,
+                default_video_mode: true,
+            },
+            ..Default::default()
+        };
+        music_cfg.save_to_path(&music_path).unwrap();
+        let loaded_music = Config::load_from_path(&music_path).unwrap();
+        assert_eq!(loaded_music.music.audio_quality, MusicAudioQuality::AacHigh);
+        assert_eq!(loaded_music.music.normalization, MusicNormMode::DynamicSoft);
+        assert!(!loaded_music.music.anti_clip_limiter);
+        assert_eq!(loaded_music.music.eq_preset, AudioEqPreset::Jazz);
+        assert_eq!(loaded_music.music.preamp_db, -4);
+        assert_eq!(loaded_music.music.channel_mode, AudioChannelMode::WideStage);
+        assert!(!loaded_music.music.show_right_drawer);
+        assert!(!loaded_music.music.gapless_audio);
+        assert!(!loaded_music.music.autoplay_mix);
+        assert!(loaded_music.music.default_video_mode);
     }
 }

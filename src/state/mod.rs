@@ -210,6 +210,8 @@ pub enum ActiveOverlay {
     Filter,
     PlayOptions,
     Settings,
+    MusicSettings,
+    MusicAlbum,
     Help,
     Analytics,
     Calendar,
@@ -293,6 +295,7 @@ pub enum YtmSection {
 }
 
 impl YtmSection {
+    #[allow(dead_code)]
     pub const NAV_TABS: [Self; 5] = [
         Self::Home,
         Self::Library,
@@ -347,6 +350,7 @@ pub enum YtmRightPaneTab {
 }
 
 /// Flattened display row rendered in the Music browse list.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum YtmBrowseRow {
     ShelfHeader {
@@ -363,6 +367,7 @@ pub enum YtmBrowseRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MusicHit {
     SelectSection(YtmSection),
+    OpenSidebarPlaylist(usize),
     GoBack,
     FocusSearch,
     SelectSearchFilter(YtmSearchFilter),
@@ -374,9 +379,50 @@ pub enum MusicHit {
     CycleRepeat,
     ToggleVideoMode,
     ToggleLike,
+    ToggleRightDrawer,
+    OpenMusicSettings,
+    OpenCurrentAlbum,
+    VolumeDelta(i64),
+    ToggleMute,
     SelectRightTab(YtmRightPaneTab),
     SelectQueueTrack(usize),
     SeekBar,
+}
+
+/// Mouse click target inside the Spotify-style Album / Playlist / Artist popup modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YtmAlbumPopupHit {
+    Close,
+    Back,
+    PlayAll,
+    ShuffleAll,
+    OpenArtist,
+    PlayTrack(usize),
+    QueueTrack(usize),
+    LikeTrack(usize),
+    OpenItem(usize),
+}
+
+/// Interactive state for the centered Spotify-style Album / Playlist / Artist detail popup.
+#[derive(Debug, Clone, Default)]
+pub struct YtmAlbumPopupState {
+    pub title: String,
+    pub browse_id: String,
+    pub params: Option<String>,
+    pub page: Option<YtmPage>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub cursor: usize,
+    pub scroll: usize,
+    pub history: Vec<(String, String, Option<String>, YtmPage)>,
+    pub hitboxes: Vec<(Rect, YtmAlbumPopupHit)>,
+}
+
+/// Mouse click target inside the dedicated YouTube Music Settings modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MusicSettingsHit {
+    Close,
+    ActivateRow(usize),
 }
 
 /// Full interactive state for the YouTube Music tab and background audio player.
@@ -405,6 +451,7 @@ pub struct YtmMusicState {
     pub shuffle: bool,
     pub repeat: YtmRepeatMode,
     pub video_mode: bool,
+    pub right_drawer_open: bool,
     pub active_audio_session_id: Option<u64>,
     pub liked_ids: HashSet<String>,
     pub right_tab: YtmRightPaneTab,
@@ -413,6 +460,9 @@ pub struct YtmMusicState {
     pub related_browse_id: Option<String>,
     pub lyrics: Option<YtmLyrics>,
     pub lyrics_loading: bool,
+    pub album_popup: YtmAlbumPopupState,
+    pub settings_cursor: usize,
+    pub settings_hitboxes: Vec<(Rect, MusicSettingsHit)>,
     pub last_click: Option<(usize, Instant)>,
     pub hitboxes: Vec<(Rect, MusicHit)>,
     pub progress_bar_rect: Rect,
@@ -444,6 +494,7 @@ impl Default for YtmMusicState {
             shuffle: false,
             repeat: YtmRepeatMode::Off,
             video_mode: false,
+            right_drawer_open: true,
             active_audio_session_id: None,
             liked_ids: HashSet::new(),
             right_tab: YtmRightPaneTab::UpNext,
@@ -452,6 +503,9 @@ impl Default for YtmMusicState {
             related_browse_id: None,
             lyrics: None,
             lyrics_loading: false,
+            album_popup: YtmAlbumPopupState::default(),
+            settings_cursor: 0,
+            settings_hitboxes: Vec::new(),
             last_click: None,
             hitboxes: Vec::new(),
             progress_bar_rect: Rect::default(),
@@ -931,6 +985,10 @@ impl AppState {
             ..Default::default()
         };
 
+        let mut music = YtmMusicState::default();
+        music.right_drawer_open = config.music.show_right_drawer;
+        music.video_mode = config.music.default_video_mode;
+
         Self {
             screen: Screen::Home,
             overlay: ActiveOverlay::None,
@@ -1041,7 +1099,7 @@ impl AppState {
                 .map(|p| AuthVault::load_or_default(&p))
                 .unwrap_or_default(),
             login_ui: LoginUiState::default(),
-            music: YtmMusicState::default(),
+            music,
 
             loading_feeds: HashSet::new(),
             is_fetching_more: false,
@@ -3140,6 +3198,8 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::Filter => (64, 66),
         ActiveOverlay::PlayOptions => return Some(play_options_modal_rect(frame_area)),
         ActiveOverlay::Settings => (82, 74),
+        ActiveOverlay::MusicSettings => (72, 72),
+        ActiveOverlay::MusicAlbum => (84, 84),
         ActiveOverlay::Help => return Some(help_modal_rect(frame_area)),
         ActiveOverlay::Analytics => (94, 90),
         ActiveOverlay::Calendar => (90, 84),

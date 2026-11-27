@@ -242,6 +242,15 @@ pub enum AppMessage {
         page: YtmPage,
         title: Option<String>,
     },
+    MusicAlbumPopupLoaded {
+        browse_id: String,
+        title: String,
+        page: YtmPage,
+    },
+    MusicAlbumPopupFailed {
+        browse_id: String,
+        error: String,
+    },
     MusicPageFailed {
         section: crate::state::YtmSection,
         error: String,
