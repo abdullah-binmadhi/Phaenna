@@ -1663,7 +1663,11 @@ async fn handle_app_message(
                 state.detail_metadata_loading = false;
                 state.detail_video = Some(item.clone());
                 state.detail_subtitles = subtitles;
-                state.detail_selected_sub_idx = 0;
+                state.detail_selected_sub_idx =
+                    crate::api::subtitles::select_preferred_subtitle_index(
+                        &state.detail_subtitles,
+                        &state.config.default_sub_lang,
+                    );
             }
             let _ = upsert_video(pool, &item, now_unix()).await;
             let _ = backfill_session_video_metadata(
@@ -2588,6 +2592,7 @@ fn open_detail_for_video(
     state.detail_related_cursor = 0;
     state.detail_scroll = 0;
     state.detail_subtitles.clear();
+    state.detail_selected_sub_idx = 0;
     state.detail_sponsor_segments.clear();
     state.detail_dislikes = None;
     state.detail_video_vote = VideoVote::None;
@@ -2798,7 +2803,12 @@ async fn start_nonblocking_playback_with_live_opts(
             .filter(|p| p.exists())
     };
 
-    let sub_url = if state.config.subtitles_enabled {
+    let matches_detail_video = state
+        .detail_video
+        .as_ref()
+        .map(|v| v.id == video.id)
+        .unwrap_or(false);
+    let sub_url = if state.config.subtitles_enabled && matches_detail_video {
         state
             .detail_subtitles
             .get(state.detail_selected_sub_idx)
@@ -6992,10 +7002,16 @@ async fn handle_key_event(
                         open_detail_for_video(prev, state, pool, tx, client);
                     } else if state.return_to_search {
                         state.return_to_search = false;
+                        state.detail_video = None;
+                        state.detail_subtitles.clear();
+                        state.detail_selected_sub_idx = 0;
                         state.screen = Screen::Home;
                         state.overlay = ActiveOverlay::Search;
                         state.kitty_flush_needed = true;
                     } else {
+                        state.detail_video = None;
+                        state.detail_subtitles.clear();
+                        state.detail_selected_sub_idx = 0;
                         state.screen = Screen::Home;
                     }
                 }

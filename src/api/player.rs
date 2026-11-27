@@ -1516,7 +1516,11 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     }
 
     if opts.subtitles_enabled {
-        let lang = opts.sub_lang.as_deref().unwrap_or("en,eng");
+        let lang = opts
+            .sub_lang
+            .as_deref()
+            .map(crate::api::subtitles::subtitle_slang_arg)
+            .unwrap_or_else(|| "en,eng,en-US,en-GB,en-orig".to_string());
         flags.push(format!("slang={}", lang));
         flags.push("sub-auto=fuzzy".to_string());
         let effective_sub_url = opts.sub_url.as_deref().or_else(|| {
