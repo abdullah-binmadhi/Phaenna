@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod karaoke;
 pub mod sync;
 pub mod user;
 
@@ -111,6 +112,64 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS thumb_blobs (
             video_id TEXT PRIMARY KEY,
             blob BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS karaoke_playlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS karaoke_playlist_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id INTEGER NOT NULL,
+            video_id TEXT NOT NULL,
+            ytm_playlist_id TEXT,
+            title TEXT NOT NULL,
+            artist TEXT NOT NULL,
+            album TEXT,
+            thumb_url TEXT NOT NULL DEFAULT '',
+            duration_secs INTEGER,
+            singer_name TEXT,
+            pitch_semitones INTEGER NOT NULL DEFAULT 0,
+            lyric_offset_ms INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            sung_count INTEGER NOT NULL DEFAULT 0,
+            added_at INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS karaoke_lyrics_cache (
+            video_id TEXT PRIMARY KEY,
+            source TEXT,
+            is_timed INTEGER NOT NULL DEFAULT 0,
+            has_word_timings INTEGER NOT NULL DEFAULT 0,
+            lyrics_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS karaoke_track_prefs (
+            video_id TEXT PRIMARY KEY,
+            pitch_semitones INTEGER NOT NULL DEFAULT 0,
+            lyric_offset_ms INTEGER NOT NULL DEFAULT 0,
+            vocal_mode INTEGER NOT NULL DEFAULT 0,
+            speed_pct INTEGER NOT NULL DEFAULT 100,
+            loop_start_ms INTEGER,
+            loop_end_ms INTEGER,
             updated_at INTEGER NOT NULL
         )",
     )
@@ -236,6 +295,10 @@ mod tests {
             "channels",
             "continue_watching",
             "feed_entries",
+            "karaoke_lyrics_cache",
+            "karaoke_playlist_items",
+            "karaoke_playlists",
+            "karaoke_track_prefs",
             "offline_videos",
             "playback_prefs",
             "playback_progress",

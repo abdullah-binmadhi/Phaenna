@@ -30,7 +30,7 @@ fn rect_intersects_optional(r: Rect, modal: Option<Rect>) -> bool {
     })
 }
 
-fn truncate_str(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_str(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
@@ -169,14 +169,14 @@ fn wrap_words_bounded(text: &str, width: usize, max_lines: usize) -> Vec<String>
     lines
 }
 
-fn truncate_words_clean(text: &str, width: usize) -> String {
+pub(crate) fn truncate_words_clean(text: &str, width: usize) -> String {
     wrap_words_bounded(text, width, 1)
         .into_iter()
         .next()
         .unwrap_or_default()
 }
 
-fn render_vertical_scrollbar(
+pub(crate) fn render_vertical_scrollbar(
     frame: &mut Frame,
     col_rect: Rect,
     scroll: usize,
@@ -216,6 +216,7 @@ pub fn render_music_workspace(
     modal_rect: Option<Rect>,
 ) {
     state.music.hitboxes.clear();
+    state.music.karaoke.hitboxes.clear();
     state.music.progress_bar_rect = Rect::default();
     state.music.sidebar_rect = Rect::default();
     state.music.right_drawer_rect = Rect::default();
@@ -234,6 +235,22 @@ pub fn render_music_workspace(
     let bar_area = root_chunks[1];
 
     let dims = music_layout_dims(body_area.width, state.music.right_drawer_open);
+
+    if state.music.section == YtmSection::Karaoke {
+        let hide_sidebar = state.music.karaoke.stage_focus || !dims.show_sidebar;
+        if hide_sidebar {
+            crate::ui::karaoke::render_karaoke_workspace(frame, body_area, state, modal_rect);
+        } else {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(dims.sidebar_w), Constraint::Min(32)])
+                .split(body_area);
+            render_spotify_sidebar(frame, cols[0], state);
+            crate::ui::karaoke::render_karaoke_workspace(frame, cols[1], state, modal_rect);
+        }
+        render_bottom_player_bar(frame, bar_area, state, modal_rect);
+        return;
+    }
 
     match (dims.show_sidebar, dims.show_drawer) {
         (true, true) => {
@@ -296,6 +313,7 @@ fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         (YtmSection::Charts, "Charts"),
         (YtmSection::Liked, "Liked Music"),
         (YtmSection::Library, "Your Library"),
+        (YtmSection::Karaoke, "Karaoke"),
     ];
 
     let mut y = inner.y;
@@ -310,6 +328,7 @@ fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
             YtmSection::Charts => "★",
             YtmSection::Liked => "♥",
             YtmSection::Library => "▤",
+            YtmSection::Karaoke => "♫",
             YtmSection::Browse => "▸",
         };
         let row_rect = Rect::new(inner.x, y, inner.width, 1);
@@ -573,7 +592,7 @@ fn render_main_stage(
     }
 }
 
-fn fit_joined_parts(parts: &[&str], sep: &str, max_w: usize) -> String {
+pub(crate) fn fit_joined_parts(parts: &[&str], sep: &str, max_w: usize) -> String {
     if max_w == 0 {
         return String::new();
     }
@@ -653,6 +672,7 @@ fn render_stage_header(frame: &mut Frame, area: Rect, state: &mut AppState, show
             &[
                 "[Click] Preview",
                 "[2x Click] Play/Open",
+                "[K] Send Karaoke",
                 "[e] EQ",
                 "[s] Settings",
                 "[d] Drawer",
@@ -1528,7 +1548,11 @@ fn render_info_tab(
         )
     };
 
-    let action_h: u16 = 1;
+    let action_h: u16 = if (is_preview || cur_track.is_some()) && area.height >= 16 {
+        2
+    } else {
+        1
+    };
     let meta_h: u16 = (meta_rows.len() as u16) + 2; // kind+title + metadata rows + gap
     let max_cov_h = area.height.saturating_sub(meta_h + action_h + 1).max(4);
     let cov_h = (area.width / 2).saturating_sub(1).clamp(5, 13).min(max_cov_h);
@@ -1615,6 +1639,13 @@ fn render_info_tab(
                 if liked { Color::Black } else { Color::White },
                 if liked { Color::Rgb(255, 110, 150) } else { Color::Rgb(46, 52, 68) },
             );
+            push_pill(
+                &mut pills,
+                " + Karaoke ",
+                MusicHit::SendPreviewToKaraoke,
+                Color::Black,
+                pal.accent,
+            );
         }
         if cur_track.is_some() {
             push_pill(
@@ -1643,6 +1674,13 @@ fn render_info_tab(
                 pal.accent,
             );
         }
+        push_pill(
+            &mut pills,
+            " + Karaoke ",
+            MusicHit::SendCurrentToKaraoke,
+            Color::Black,
+            spotify_green,
+        );
     }
     render_info_action_pills(frame, act_rect, state, pills);
 }
@@ -2641,12 +2679,7 @@ fn render_lyrics_view(
         let chunks = wrap_lyric_line_with_offsets(&line.text, text_w);
         let total_chars = line.text.chars().count();
         let sung_chars = if is_active {
-            if let Some(t0) = line.start_ms {
-                let p = karaoke_progress(pos_ms, t0, line.end_ms, next_start);
-                ((p * total_chars as f64).round() as usize).min(total_chars)
-            } else {
-                total_chars
-            }
+            crate::ui::karaoke::compute_lyric_sung_chars(line, pos_ms, next_start)
         } else {
             0
         };
@@ -3325,6 +3358,14 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                 pal.accent,
             ));
         }
+        if !p.tracks.is_empty() {
+            actions.push((
+                " + Karaoke All ",
+                YtmAlbumPopupHit::SendAllToKaraoke,
+                Color::Black,
+                Color::Rgb(245, 195, 80),
+            ));
+        }
         for (lbl, hit, fg, bg) in actions {
             let w = lbl.chars().count() as u16;
             if bx + w <= info_rect.x + info_rect.width {
@@ -3532,18 +3573,20 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                         .or_else(|| tr.duration_secs.map(format_duration_secs))
                         .unwrap_or_default();
                     let w = r.width as usize;
-                    let t_w = (w.saturating_sub(26) * 58) / 100;
-                    let a_w = w.saturating_sub(26 + t_w);
+                    let t_w = (w.saturating_sub(30) * 58) / 100;
+                    let a_w = w.saturating_sub(30 + t_w);
                     let artist_plays = tr
                         .plays_text
                         .as_deref()
                         .map(|pl| format!("{} · {pl}", tr.artist))
                         .unwrap_or_else(|| tr.artist.clone());
 
+                    let pill_k = " +K ";
                     let pill_q = " +Q ";
                     let pill_h = if liked { " ♥ " } else { " ♡ " };
-                    let hx = r.x + r.width.saturating_sub(14);
-                    let qx = r.x + r.width.saturating_sub(10);
+                    let hx = r.x + r.width.saturating_sub(18);
+                    let qx = r.x + r.width.saturating_sub(14);
+                    let kx = r.x + r.width.saturating_sub(10);
                     // Push row SelectRow first, then specific pill hitboxes so .rev() prioritizes pills!
                     state
                         .music
@@ -3560,6 +3603,11 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                         .album_popup
                         .hitboxes
                         .push((Rect::new(qx, row_y, 4, 1), YtmAlbumPopupHit::QueueTrack(*track_idx)));
+                    state
+                        .music
+                        .album_popup
+                        .hitboxes
+                        .push((Rect::new(kx, row_y, 4, 1), YtmAlbumPopupHit::KaraokeTrack(*track_idx)));
 
                     let title_col = if is_playing {
                         spotify_green
@@ -3614,6 +3662,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                                     .bg(bg),
                             ),
                             Span::styled(pill_q, Style::default().fg(pal.accent).bg(bg)),
+                            Span::styled(pill_k, Style::default().fg(Color::Rgb(245, 195, 80)).bg(bg)),
                             Span::styled(format!(" {dur:>5}"), Style::default().fg(pal.text_dim).bg(bg)),
                         ]))
                         .style(Style::default().bg(bg)),
@@ -3874,6 +3923,23 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                         ));
                         ax += qw + 1;
                     }
+                    let klbl = " +K ";
+                    let kw = klbl.chars().count() as u16;
+                    if ax + kw <= act_r.x + act_r.width {
+                        state
+                            .music
+                            .album_popup
+                            .hitboxes
+                            .push((Rect::new(ax, act_r.y, kw, 1), YtmAlbumPopupHit::PreviewKaraoke));
+                        r0_spans.push(Span::raw(" "));
+                        r0_spans.push(Span::styled(
+                            klbl,
+                            Style::default()
+                                .fg(Color::Rgb(245, 195, 80))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        ax += kw + 1;
+                    }
                     let liked = vid_opt
                         .as_deref()
                         .is_some_and(|v| state.music.liked_ids.contains(v));
@@ -3923,7 +3989,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
         Paragraph::new(if is_artist {
             "[1x Click] Preview Cover · [2x Click/Enter] Play, Watch Video or Open · [d] Drawer · [<- Back] · [Esc] Close"
         } else {
-            "[1x Click] Inspect Song · [2x Click/Enter] Play or Watch Video · [+Q/a] Queue · [♥/l] Like · [d] Drawer · [Esc] Close"
+            "[1x Click] Inspect · [2x Click/Enter] Play · [+Q/a] Queue · [+K/K] Karaoke · [♥/l] Like · [Esc] Close"
         })
         .alignment(Alignment::Center)
         .style(Style::default().fg(pal.text_dim)),
@@ -4754,11 +4820,13 @@ mod tests {
                     text: "Far away".to_string(),
                     start_ms: Some(1_000),
                     end_ms: Some(5_000),
+                    words: None,
                 },
                 YtmLyricLine {
                     text: "Hold you in my arms".to_string(),
                     start_ms: Some(10_000),
                     end_ms: Some(15_000),
+                    words: None,
                 },
             ],
             source: Some("Source: Musixmatch".to_string()),
@@ -5035,11 +5103,13 @@ mod tests {
                     text: "Line one of the song".to_string(),
                     start_ms: Some(1_000),
                     end_ms: Some(4_000),
+                    words: None,
                 },
                 YtmLyricLine {
                     text: "Line two wraps cleanly inside the wider drawer".to_string(),
                     start_ms: Some(5_000),
                     end_ms: Some(9_000),
+                    words: None,
                 },
             ],
             source: Some("Source: Musixmatch".to_string()),

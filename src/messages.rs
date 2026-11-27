@@ -5,8 +5,9 @@ use crate::api::innertube::{SearchChannelCard, VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
-use crate::api::ytmusic::{YtmLyrics, YtmPage, YtmUpNextQueue};
+use crate::api::ytmusic::{YtmLyrics, YtmPage, YtmTrack, YtmUpNextQueue};
 use crate::db::cache::{VideoItem, VideoStatsUpdate};
+use crate::db::karaoke::{KaraokePlaylistEntry, KaraokePlaylistSummary};
 use crate::services::auth::GoogleAccountSession;
 use crate::services::cast::CastDevice;
 use crate::services::ipc::{LiveIpcEvent, PlayerCommand};
@@ -269,5 +270,26 @@ pub enum AppMessage {
     },
     MusicTrackEof {
         session_id: u64,
+    },
+
+    // Dedicated Karaoke Stage & Playlist Management
+    KaraokePlaylistsLoaded {
+        playlists: Vec<KaraokePlaylistSummary>,
+        active_playlist_id: i64,
+        items: Vec<KaraokePlaylistEntry>,
+    },
+    KaraokeLyricsPrefetched {
+        video_id: String,
+        lyrics: YtmLyrics,
+    },
+    KaraokeInlineSearchLoaded {
+        query: String,
+        tracks: Vec<YtmTrack>,
+    },
+    KaraokeVersionCandidatesLoaded {
+        item_id: i64,
+        video_id: String,
+        audio_candidates: Vec<YtmTrack>,
+        lrc_candidates: Vec<(String, YtmLyrics)>,
     },
 }

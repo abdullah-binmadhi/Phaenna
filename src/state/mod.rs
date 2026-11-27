@@ -2,6 +2,7 @@
 
 use crate::api::dislike::DislikeInfo;
 use crate::api::innertube::{SearchChannelCard, VideoComment, VideoVote};
+pub use crate::api::player::KaraokeVocalMode;
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
@@ -12,6 +13,9 @@ use crate::config::{
     Config, PerformanceMode, PicturePreset, Player, Quality, SponsorBlockMode, VideoShaderMode,
 };
 use crate::db::cache::VideoItem;
+pub use crate::db::karaoke::{
+    KaraokeLyricsReadiness, KaraokePlaylistEntry, KaraokePlaylistSummary, KaraokeTrackPref,
+};
 use crate::db::sync::{
     HISTORY, RECOMMENDED, SHORTS_SUBSCRIBED, SHORTS_SUGGESTED, SUBSCRIPTIONS, WATCH_LATER,
 };
@@ -292,17 +296,19 @@ pub enum YtmSection {
     Liked,
     Charts,
     Search,
+    Karaoke,
     Browse,
 }
 
 impl YtmSection {
     #[allow(dead_code)]
-    pub const NAV_TABS: [Self; 5] = [
+    pub const NAV_TABS: [Self; 6] = [
         Self::Home,
         Self::Library,
         Self::Liked,
         Self::Charts,
         Self::Search,
+        Self::Karaoke,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -312,6 +318,7 @@ impl YtmSection {
             Self::Liked => "Liked",
             Self::Charts => "Charts",
             Self::Search => "Search",
+            Self::Karaoke => "Karaoke",
             Self::Browse => "Browse",
         }
     }
@@ -395,7 +402,179 @@ pub enum MusicHit {
     TogglePreviewLike,
     PreviewPlay,
     ShowNowPlaying,
+    SendPreviewToKaraoke,
+    SendCurrentToKaraoke,
     SeekBar,
+}
+
+/// Behavioral mode on the dedicated Karaoke page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KaraokeMode {
+    #[default]
+    Practice,
+    Party,
+}
+
+impl KaraokeMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Practice => Self::Party,
+            Self::Party => Self::Practice,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Practice => "Practice",
+            Self::Party => "Party",
+        }
+    }
+}
+
+/// Interactive hit targets inside the dedicated Karaoke Stage and Setlist Companion panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KaraokeHit {
+    ToggleMode,
+    ToggleFocus,
+    ToggleCompactSetlist,
+    CyclePlaylistNext,
+    DeleteCurrentPlaylist,
+    StartNewPlaylist,
+    SaveQueueAsPlaylist,
+    ToggleInlineSearch,
+    FocusInlineSearch,
+    AddSearchTrack(usize),
+    SelectItem(usize),
+    PlayItem(usize),
+    MoveItemUp(usize),
+    MoveItemDown(usize),
+    RemoveItem(usize),
+    StartSingerPrompt(usize),
+    OpenVersionPicker(usize),
+    CloseVersionPicker,
+    PickAudioVersion(usize),
+    PickLrcCandidate(usize),
+    CycleVocalMode,
+    PitchDelta(i8),
+    SpeedDelta(i16),
+    OffsetDelta(i64),
+    SetLoopA,
+    SetLoopB,
+    ClearLoop,
+    ToggleTapSync,
+    StampTapSync,
+    CommitTapSync,
+    CancelTapSync,
+    SeekLyricMs(u64),
+    ResumeLiveLyrics,
+    IntermissionStartNow,
+    IntermissionHoldToggle,
+    IntermissionSkip,
+}
+
+/// Track-level version & synced-lyrics candidate chooser inside the Karaoke page.
+#[derive(Debug, Clone)]
+pub struct KaraokeVersionPickerState {
+    pub item_id: i64,
+    pub video_id: String,
+    pub track_title: String,
+    pub loading: bool,
+    pub audio_candidates: Vec<YtmTrack>,
+    pub lrc_candidates: Vec<(String, YtmLyrics)>,
+    pub tab_is_lrc: bool,
+    pub cursor: usize,
+}
+
+/// Full interactive state for the dedicated Karaoke Stage, Setlist playlists, Practice & Party modes.
+#[derive(Debug, Clone)]
+pub struct KaraokeStageState {
+    pub mode: KaraokeMode,
+    pub session_active: bool,
+    pub stage_focus: bool,
+    pub show_compact_setlist: bool,
+    pub playlists: Vec<KaraokePlaylistSummary>,
+    pub active_playlist_id: i64,
+    pub items: Vec<KaraokePlaylistEntry>,
+    pub sung_history: Vec<KaraokePlaylistEntry>,
+    pub active_item_id: Option<i64>,
+    pub cursor: usize,
+    pub scroll: usize,
+    pub last_click: Option<(usize, Instant)>,
+    pub lyrics_scroll: usize,
+    pub lyrics_max_scroll: usize,
+    pub lyrics_manual_scroll: bool,
+    pub vocal_mode: KaraokeVocalMode,
+    pub pitch_semitones: i8,
+    pub speed_pct: u16,
+    pub lyric_offset_ms: i64,
+    pub loop_start_ms: Option<u64>,
+    pub loop_end_ms: Option<u64>,
+    pub inline_search_open: bool,
+    pub inline_search_editing: bool,
+    pub inline_search_query: String,
+    pub inline_search_loading: bool,
+    pub inline_search_results: Vec<YtmTrack>,
+    pub playlist_prompt_open: bool,
+    pub playlist_prompt_input: String,
+    pub singer_prompt_item_id: Option<i64>,
+    pub singer_prompt_input: String,
+    pub tap_sync_active: bool,
+    pub tap_sync_stamps: Vec<u64>,
+    pub intermission_next_idx: Option<usize>,
+    pub intermission_deadline: Option<Instant>,
+    pub intermission_paused: bool,
+    pub version_picker: Option<KaraokeVersionPickerState>,
+    pub track_prefs: HashMap<String, KaraokeTrackPref>,
+    pub stage_rect: Rect,
+    pub setlist_rect: Rect,
+    pub hitboxes: Vec<(Rect, KaraokeHit)>,
+}
+
+impl Default for KaraokeStageState {
+    fn default() -> Self {
+        Self {
+            mode: KaraokeMode::Practice,
+            session_active: false,
+            stage_focus: false,
+            show_compact_setlist: false,
+            playlists: Vec::new(),
+            active_playlist_id: 0,
+            items: Vec::new(),
+            sung_history: Vec::new(),
+            active_item_id: None,
+            cursor: 0,
+            scroll: 0,
+            last_click: None,
+            lyrics_scroll: 0,
+            lyrics_max_scroll: 0,
+            lyrics_manual_scroll: false,
+            vocal_mode: KaraokeVocalMode::Original,
+            pitch_semitones: 0,
+            speed_pct: 100,
+            lyric_offset_ms: 0,
+            loop_start_ms: None,
+            loop_end_ms: None,
+            inline_search_open: false,
+            inline_search_editing: false,
+            inline_search_query: String::new(),
+            inline_search_loading: false,
+            inline_search_results: Vec::new(),
+            playlist_prompt_open: false,
+            playlist_prompt_input: String::new(),
+            singer_prompt_item_id: None,
+            singer_prompt_input: String::new(),
+            tap_sync_active: false,
+            tap_sync_stamps: Vec::new(),
+            intermission_next_idx: None,
+            intermission_deadline: None,
+            intermission_paused: false,
+            version_picker: None,
+            track_prefs: HashMap::new(),
+            stage_rect: Rect::default(),
+            setlist_rect: Rect::default(),
+            hitboxes: Vec::new(),
+        }
+    }
 }
 
 /// Filter tabs inside a YouTube Music Artist Profile popup.
@@ -464,6 +643,9 @@ pub enum YtmAlbumPopupHit {
     PreviewOpenAlbum,
     PreviewQueue,
     PreviewLike,
+    KaraokeTrack(usize),
+    PreviewKaraoke,
+    SendAllToKaraoke,
 }
 
 /// Interactive state for the centered Spotify-style Album / Playlist / Artist detail popup.
@@ -591,6 +773,7 @@ pub struct YtmMusicState {
     pub album_popup: YtmAlbumPopupState,
     pub last_opened_collection: Option<(String, String, Option<String>)>,
     pub preview_item: Option<YtmShelfItem>,
+    pub karaoke: KaraokeStageState,
     pub eq: YtmMusicEqState,
     pub settings_cursor: usize,
     pub settings_hitboxes: Vec<(Rect, MusicSettingsHit)>,
@@ -649,6 +832,7 @@ impl Default for YtmMusicState {
             album_popup: YtmAlbumPopupState::default(),
             last_opened_collection: None,
             preview_item: None,
+            karaoke: KaraokeStageState::default(),
             eq: YtmMusicEqState::default(),
             settings_cursor: 0,
             settings_hitboxes: Vec::new(),
@@ -669,7 +853,7 @@ impl YtmMusicState {
             YtmSection::Liked => self.liked_page.as_ref(),
             YtmSection::Charts => self.charts_page.as_ref(),
             YtmSection::Search => self.search_page.as_ref(),
-            YtmSection::Browse => self.browse_page.as_ref(),
+            YtmSection::Karaoke | YtmSection::Browse => self.browse_page.as_ref(),
         }
     }
 
@@ -681,7 +865,7 @@ impl YtmMusicState {
             YtmSection::Liked => &mut self.liked_page,
             YtmSection::Charts => &mut self.charts_page,
             YtmSection::Search => &mut self.search_page,
-            YtmSection::Browse => &mut self.browse_page,
+            YtmSection::Karaoke | YtmSection::Browse => &mut self.browse_page,
         }
     }
 
@@ -819,7 +1003,12 @@ impl YtmMusicState {
         if !lyrics.is_timed || lyrics.lines.is_empty() {
             return None;
         }
-        let pos_ms = (pos_secs.max(0.0) * 1000.0) as u64;
+        let offset = if self.karaoke.session_active || self.section == YtmSection::Karaoke {
+            self.karaoke.lyric_offset_ms
+        } else {
+            0
+        };
+        let pos_ms = ((pos_secs.max(0.0) * 1000.0) as i64 + offset).max(0) as u64;
         let mut active = None;
         for (idx, line) in lyrics.lines.iter().enumerate() {
             if let Some(start) = line.start_ms {
@@ -831,6 +1020,16 @@ impl YtmMusicState {
             }
         }
         active
+    }
+
+    /// Effective lyric position in milliseconds honoring per-track Karaoke sync offset.
+    pub fn effective_lyric_pos_ms(&self, pos_secs: f64) -> u64 {
+        let offset = if self.karaoke.session_active || self.section == YtmSection::Karaoke {
+            self.karaoke.lyric_offset_ms
+        } else {
+            0
+        };
+        ((pos_secs.max(0.0) * 1000.0) as i64 + offset).max(0) as u64
     }
 }
 

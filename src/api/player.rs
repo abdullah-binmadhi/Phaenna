@@ -11,10 +11,100 @@ use crate::services::shaders::{
 };
 use crate::services::substyler::SubtitleStyleConfig;
 use std::env;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tokio::process::{Child, Command};
+
+type OwnedPlayerList = Mutex<Vec<(u32, Option<String>)>>;
+static OWNED_PLAYER_PROCS: OnceLock<OwnedPlayerList> = OnceLock::new();
+
+fn owned_player_procs() -> &'static OwnedPlayerList {
+    OWNED_PLAYER_PROCS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a Phaenna-managed player process (e.g. headless YouTube Music / Karaoke `mpv`)
+/// so closing Phaenna via quit, Ctrl+C, SIGHUP, or SIGTERM never leaves audio orphaned.
+pub fn register_owned_player_process(pid: u32, sock_path: Option<String>) {
+    if pid == 0 {
+        return;
+    }
+    if let Ok(mut list) = owned_player_procs().lock() {
+        list.retain(|(existing, _)| *existing != pid);
+        list.push((pid, sock_path));
+    }
+}
+
+/// Unregister a tracked player process once it has exited normally.
+pub fn unregister_owned_player_process(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    if let Ok(mut list) = owned_player_procs().lock() {
+        list.retain(|(existing, _)| *existing != pid);
+    }
+}
+
+/// Gracefully quit (via mpv IPC) and terminate any still-running Phaenna-owned Music/Karaoke players.
+pub fn terminate_owned_player_processes() {
+    let entries: Vec<(u32, Option<String>)> = match owned_player_procs().lock() {
+        Ok(mut list) => std::mem::take(&mut *list),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut sent_ipc = false;
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        for (_, sock_opt) in &entries {
+            if let Some(sock) = sock_opt {
+                if let Ok(mut stream) = UnixStream::connect(sock) {
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(40)));
+                    if stream.write_all(b"{\"command\":[\"quit\"]}\n").is_ok() {
+                        sent_ipc = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if sent_ipc {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+
+    for (pid, sock_opt) in entries {
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if let Some(sock) = sock_opt {
+                let _ = std::fs::remove_file(sock);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = sock_opt;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (pid, sock_opt);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct DependencyStatus {
@@ -227,6 +317,114 @@ pub fn effective_music_preamp_db(cfg: &crate::config::MusicSettingsConfig) -> i8
 /// DynamicSoft leveling / spatial crossfeed, and finishes with an ultra-transparent high-ceiling
 /// lookahead true-peak limiter (`limit=0.985`, `asc=true`, `latency=true`).
 pub fn build_music_audio_filter_chain(cfg: &crate::config::MusicSettingsConfig) -> Option<String> {
+    build_music_or_karaoke_filter_chain(cfg, None, false, false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KaraokeVocalMode {
+    #[default]
+    Original,
+    ReducedGuide,
+    InstrumentalCut,
+}
+
+impl KaraokeVocalMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Original => Self::ReducedGuide,
+            Self::ReducedGuide => Self::InstrumentalCut,
+            Self::InstrumentalCut => Self::Original,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::ReducedGuide => "Half Guide",
+            Self::InstrumentalCut => "Vocal Cut",
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Original => 0,
+            Self::ReducedGuide => 1,
+            Self::InstrumentalCut => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ReducedGuide,
+            2 => Self::InstrumentalCut,
+            _ => Self::Original,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KaraokeAudioDsp {
+    pub vocal_mode: KaraokeVocalMode,
+    pub pitch_semitones: i8,
+    pub speed_pct: u16,
+}
+
+impl Default for KaraokeAudioDsp {
+    fn default() -> Self {
+        Self {
+            vocal_mode: KaraokeVocalMode::Original,
+            pitch_semitones: 0,
+            speed_pct: 100,
+        }
+    }
+}
+
+static FFMPEG_KARAOKE_FILTER_CAPS: OnceLock<(bool, bool)> = OnceLock::new();
+
+pub fn detect_ffmpeg_karaoke_filters() -> (bool, bool) {
+    *FFMPEG_KARAOKE_FILTER_CAPS.get_or_init(|| {
+        let Some(ffmpeg_bin) = find_binary("ffmpeg") else {
+            return (false, false);
+        };
+        let Ok(out) = std::process::Command::new(ffmpeg_bin)
+            .args(["-hide_banner", "-filters"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return (false, false);
+        };
+        let txt = String::from_utf8_lossy(&out.stdout);
+        (txt.contains(" rubberband "), txt.contains(" stereotools "))
+    })
+}
+
+/// Build an isolated Karaoke FFmpeg `lavfi` chain on top of the active Music EQ profile:
+/// supports center-channel vocal attenuation (`stereotools`) and formant-preserving key/tempo shifts (`rubberband`).
+pub fn build_karaoke_audio_filter_chain(
+    cfg: &crate::config::MusicSettingsConfig,
+    dsp: &KaraokeAudioDsp,
+) -> Option<String> {
+    let (has_rb, has_st) = detect_ffmpeg_karaoke_filters();
+    build_music_or_karaoke_filter_chain(cfg, Some(dsp), has_rb, has_st)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn build_karaoke_audio_filter_chain_with_caps(
+    cfg: &crate::config::MusicSettingsConfig,
+    dsp: &KaraokeAudioDsp,
+    has_rubberband: bool,
+    has_stereotools: bool,
+) -> Option<String> {
+    build_music_or_karaoke_filter_chain(cfg, Some(dsp), has_rubberband, has_stereotools)
+}
+
+fn build_music_or_karaoke_filter_chain(
+    cfg: &crate::config::MusicSettingsConfig,
+    karaoke: Option<&KaraokeAudioDsp>,
+    has_rubberband: bool,
+    has_stereotools: bool,
+) -> Option<String> {
     let mut nodes: Vec<String> = Vec::new();
     let bands = if cfg.eq_bypass {
         [0; 10]
@@ -236,17 +434,48 @@ pub fn build_music_audio_filter_chain(cfg: &crate::config::MusicSettingsConfig) 
     let max_boost = bands.iter().copied().filter(|&b| b > 0).max().unwrap_or(0);
     let safe_preamp = (cfg.preamp_db as i32 - max_boost as i32).clamp(-18, 6);
 
+    let want_vocal = karaoke.is_some_and(|k| k.vocal_mode != KaraokeVocalMode::Original && has_stereotools);
+    let want_pitch = karaoke.is_some_and(|k| k.pitch_semitones != 0 && has_rubberband);
+    let want_tempo = karaoke.is_some_and(|k| k.speed_pct != 100);
+
     let has_dsp = safe_preamp != 0
         || bands.iter().any(|&g| g != 0)
         || cfg.normalization == crate::config::MusicNormMode::DynamicSoft
         || cfg.channel_mode != AudioChannelMode::Stereo
-        || cfg.anti_clip_limiter;
+        || cfg.anti_clip_limiter
+        || want_vocal
+        || want_pitch
+        || want_tempo;
     if !has_dsp {
         return None;
     }
 
     // Keep all DSP arithmetic in 64-bit double float to prevent integer quantization haze.
     nodes.push("aformat=sample_fmts=dblp".to_string());
+
+    if let Some(k) = karaoke {
+        if has_stereotools {
+            match k.vocal_mode {
+                KaraokeVocalMode::Original => {}
+                KaraokeVocalMode::ReducedGuide => {
+                    nodes.push("stereotools=mlev=0.35:slev=1.15".to_string());
+                }
+                KaraokeVocalMode::InstrumentalCut => {
+                    nodes.push("stereotools=mlev=0.06:slev=1.35".to_string());
+                }
+            }
+        }
+        let pitch_st = k.pitch_semitones.clamp(-12, 12);
+        let tempo = (k.speed_pct.clamp(50, 150) as f64) / 100.0;
+        if (pitch_st != 0 || k.speed_pct != 100) && has_rubberband {
+            let pitch_factor = 2.0_f64.powf(pitch_st as f64 / 12.0);
+            nodes.push(format!(
+                "rubberband=pitch={pitch_factor:.6}:tempo={tempo:.4}:formant=preserved"
+            ));
+        } else if k.speed_pct != 100 {
+            nodes.push(format!("atempo={tempo:.4}"));
+        }
+    }
 
     if safe_preamp != 0 {
         nodes.push(format!("volume={safe_preamp}dB"));
@@ -3324,5 +3553,48 @@ mod tests {
             ..Default::default()
         };
         assert!(build_music_audio_filter_chain(&raw_cfg).is_none());
+    }
+
+    #[test]
+    fn test_owned_player_process_registry_and_cleanup() {
+        register_owned_player_process(0, None);
+        unregister_owned_player_process(0);
+
+        let mut child = std::process::Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sock_path = tmp.path().to_string_lossy().into_owned();
+        register_owned_player_process(pid, Some(sock_path.clone()));
+        unregister_owned_player_process(pid);
+        register_owned_player_process(pid, Some(sock_path));
+        // Double termination should be safe and idempotent once drained
+        terminate_owned_player_processes();
+        terminate_owned_player_processes();
+    }
+
+    #[test]
+    fn test_karaoke_audio_filter_chain_builds_stereotools_and_rubberband() {
+        let cfg = crate::config::MusicSettingsConfig::default();
+        let dsp = KaraokeAudioDsp {
+            vocal_mode: KaraokeVocalMode::InstrumentalCut,
+            pitch_semitones: -2,
+            speed_pct: 90,
+        };
+        let chain = build_karaoke_audio_filter_chain_with_caps(&cfg, &dsp, true, true).unwrap();
+        assert!(chain.contains("stereotools=mlev=0.06:slev=1.35"), "got {chain}");
+        assert!(chain.contains("rubberband=pitch="), "got {chain}");
+        assert!(chain.contains(":tempo=0.9000:formant=preserved"), "got {chain}");
+
+        let fallback = build_karaoke_audio_filter_chain_with_caps(&cfg, &dsp, false, true).unwrap();
+        assert!(fallback.contains("stereotools="));
+        assert!(fallback.contains("atempo=0.9000"), "got {fallback}");
+        assert!(!fallback.contains("rubberband"));
     }
 }

@@ -8,6 +8,7 @@ use crate::services::auth::{
     compute_sapisidhash, now_unix_secs, GoogleAccountSession, PHAENNA_USER_AGENT,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, USER_AGENT};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -239,18 +240,56 @@ pub struct YtmUpNextQueue {
     pub continuation: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YtmLyricWord {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YtmLyricLine {
     pub text: String,
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
+    #[serde(default)]
+    pub words: Option<Vec<YtmLyricWord>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct YtmLyrics {
     pub lines: Vec<YtmLyricLine>,
     pub source: Option<String>,
     pub is_timed: bool,
+}
+
+impl YtmLyrics {
+    pub fn has_word_timings(&self) -> bool {
+        self.lines
+            .iter()
+            .any(|l| l.words.as_ref().is_some_and(|w| !w.is_empty()))
+    }
+
+    /// Stamp millisecond timestamps onto plain or re-timed lyric lines from Tap-to-Sync capture.
+    pub fn apply_tap_sync_stamps(&mut self, stamps_ms: &[u64]) {
+        if self.lines.is_empty() || stamps_ms.is_empty() {
+            return;
+        }
+        let n = self.lines.len().min(stamps_ms.len());
+        for i in 0..n {
+            let start = stamps_ms[i];
+            let end = stamps_ms
+                .get(i + 1)
+                .copied()
+                .filter(|&e| e > start)
+                .unwrap_or_else(|| start.saturating_add(4500));
+            self.lines[i].start_ms = Some(start);
+            self.lines[i].end_ms = Some(end);
+            self.lines[i].words = None;
+        }
+        self.is_timed = true;
+        self.source = Some("Source: Local Tap-to-Sync".to_string());
+    }
 }
 
 fn ytm_context() -> Value {
@@ -1422,6 +1461,7 @@ pub fn parse_ytm_lyrics_json(root: &Value) -> YtmLyrics {
                                 text,
                                 start_ms,
                                 end_ms,
+                                words: None,
                             });
                         }
                     }
@@ -1443,6 +1483,7 @@ pub fn parse_ytm_lyrics_json(root: &Value) -> YtmLyrics {
                                 text: line.to_string(),
                                 start_ms: None,
                                 end_ms: None,
+                                words: None,
                             });
                         }
                     }
@@ -1582,7 +1623,100 @@ fn parse_lrc_timestamp_ms(tag: &str) -> Option<u64> {
     Some((mins * 60 + secs) * 1000 + ms)
 }
 
-/// Parse standard `[mm:ss.xx]` synced LRC text into millisecond-accurate `YtmLyrics`.
+/// Parse Enhanced LRC inline `<mm:ss.xx>` word timestamps inside a lyric line body.
+fn parse_inline_word_timings(
+    raw_text: &str,
+    line_start_ms: u64,
+    line_end_ms: u64,
+    offset_ms: i64,
+) -> (String, Option<Vec<YtmLyricWord>>) {
+    if !raw_text.contains('<') {
+        return (raw_text.to_string(), None);
+    }
+
+    let mut segments: Vec<(u64, String)> = Vec::new();
+    let mut clean = String::new();
+    let mut cur_ts = line_start_ms;
+    let mut has_tag = false;
+    let mut rest = raw_text;
+
+    while let Some(open) = rest.find('<') {
+        let before = &rest[..open];
+        if !before.is_empty() {
+            clean.push_str(before);
+            if has_tag {
+                if let Some(last) = segments.last_mut() {
+                    last.1.push_str(before);
+                }
+            } else {
+                segments.push((cur_ts, before.to_string()));
+            }
+        }
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('>') else {
+            clean.push_str(&rest[open..]);
+            if let Some(last) = segments.last_mut() {
+                last.1.push_str(&rest[open..]);
+            }
+            rest = "";
+            break;
+        };
+        let tag = &after_open[..close];
+        if let Some(ms) = parse_lrc_timestamp_ms(tag) {
+            has_tag = true;
+            cur_ts = (ms as i64 - offset_ms).max(0) as u64;
+            segments.push((cur_ts, String::new()));
+            rest = &after_open[close + 1..];
+        } else {
+            let literal = &rest[open..open + 1 + close + 1];
+            clean.push_str(literal);
+            if let Some(last) = segments.last_mut() {
+                last.1.push_str(literal);
+            } else {
+                segments.push((cur_ts, literal.to_string()));
+            }
+            rest = &after_open[close + 1..];
+        }
+    }
+    if !rest.is_empty() {
+        clean.push_str(rest);
+        if let Some(last) = segments.last_mut() {
+            last.1.push_str(rest);
+        } else {
+            segments.push((cur_ts, rest.to_string()));
+        }
+    }
+
+    if !has_tag {
+        return (raw_text.to_string(), None);
+    }
+
+    let words_raw: Vec<(u64, String)> = segments
+        .into_iter()
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+    if words_raw.is_empty() {
+        return (clean, None);
+    }
+
+    let mut words = Vec::with_capacity(words_raw.len());
+    for idx in 0..words_raw.len() {
+        let (ws, ref wtext) = words_raw[idx];
+        let we = words_raw
+            .get(idx + 1)
+            .map(|(ns, _)| *ns)
+            .filter(|&ns| ns > ws)
+            .unwrap_or_else(|| line_end_ms.max(ws + 150));
+        words.push(YtmLyricWord {
+            text: wtext.clone(),
+            start_ms: ws,
+            end_ms: we,
+        });
+    }
+    (clean, Some(words))
+}
+
+/// Parse standard `[mm:ss.xx]` synced LRC and Enhanced LRC `<mm:ss.xx>` word-tagged text into `YtmLyrics`.
 pub fn parse_lrc_lyrics(lrc_text: &str, source: Option<String>) -> YtmLyrics {
     let mut offset_ms: i64 = 0;
     let mut raw_entries: Vec<(u64, String)> = Vec::new();
@@ -1641,10 +1775,15 @@ pub fn parse_lrc_lyrics(lrc_text: &str, source: Option<String>) -> YtmLyrics {
         let end_ms = next_ts
             .filter(|&nt| nt > start_ms)
             .unwrap_or_else(|| start_ms.saturating_add(4500));
+        let (clean_text, words) = parse_inline_word_timings(text, start_ms, end_ms, offset_ms);
+        if clean_text.trim().is_empty() {
+            continue;
+        }
         lines.push(YtmLyricLine {
-            text: text.clone(),
+            text: clean_text,
             start_ms: Some(start_ms),
             end_ms: Some(end_ms),
+            words,
         });
     }
 
@@ -1785,6 +1924,117 @@ pub async fn fetch_lrclib_synced_lyrics(
     let (_, best_lrc) = best?;
     let parsed = parse_lrc_lyrics(best_lrc, Some("Source: LRCLIB (Synced)".to_string()));
     parsed.is_timed.then_some(parsed)
+}
+
+/// Fetch multiple LRCLIB synced candidates so a Karaoke host can pick an alternate timing version.
+pub async fn fetch_lrclib_candidates(
+    client: &reqwest::Client,
+    title: &str,
+    artist: &str,
+    duration_secs: Option<u64>,
+) -> Vec<(String, YtmLyrics)> {
+    let clean_title = clean_track_title_for_lyrics(title);
+    let clean_artist = artist
+        .split([',', '&', '•'])
+        .next()
+        .map(str::trim)
+        .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("YouTube Music"))
+        .unwrap_or("");
+    if clean_title.is_empty() {
+        return Vec::new();
+    }
+    let query: Vec<(&str, String)> = if !clean_artist.is_empty() {
+        vec![
+            ("track_name", clean_title),
+            ("artist_name", clean_artist.to_string()),
+        ]
+    } else {
+        vec![("q", clean_title)]
+    };
+    let Ok(resp) = client
+        .get("https://lrclib.net/api/search")
+        .header(USER_AGENT, "Phaenna/1.0")
+        .query(&query)
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(Value::Array(items)) = resp.json::<Value>().await else {
+        return Vec::new();
+    };
+    let mut ranked: Vec<(u64, String, YtmLyrics)> = Vec::new();
+    for entry in items {
+        let Some(synced) = entry
+            .get("syncedLyrics")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let track_n = entry.get("trackName").and_then(Value::as_str).unwrap_or(title);
+        let artist_n = entry.get("artistName").and_then(Value::as_str).unwrap_or(artist);
+        let entry_dur = entry.get("duration").and_then(Value::as_f64).map(|d| d.round() as u64);
+        let diff = match (duration_secs, entry_dur) {
+            (Some(target), Some(cand)) => target.abs_diff(cand),
+            _ => 10,
+        };
+        let dur_txt = entry_dur
+            .map(crate::db::cache::format_duration_secs)
+            .unwrap_or_else(|| "?:??".to_string());
+        let label = format!("{track_n} — {artist_n} ({dur_txt})");
+        let parsed = parse_lrc_lyrics(synced, Some(format!("Source: LRCLIB ({dur_txt})")));
+        if parsed.is_timed {
+            ranked.push((diff, label, parsed));
+        }
+    }
+    ranked.sort_by_key(|(d, _, _)| *d);
+    ranked
+        .into_iter()
+        .take(8)
+        .map(|(_, label, lyr)| (label, lyr))
+        .collect()
+}
+
+/// Search YouTube Music for karaoke / instrumental versions of a track.
+pub async fn search_ytm_karaoke_versions(
+    client: &reqwest::Client,
+    session_opt: Option<&GoogleAccountSession>,
+    title: &str,
+    artist: &str,
+) -> Result<Vec<YtmTrack>> {
+    let clean_title = clean_track_title_for_lyrics(title);
+    let clean_artist = artist
+        .split([',', '&', '•'])
+        .next()
+        .map(str::trim)
+        .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("YouTube Music"))
+        .unwrap_or("");
+    let q = if clean_artist.is_empty() {
+        format!("{clean_title} karaoke instrumental")
+    } else {
+        format!("{clean_title} {clean_artist} karaoke instrumental")
+    };
+    let page = fetch_ytm_search(client, session_opt, &q, YtmSearchFilter::Songs, None).await?;
+    let mut out = Vec::new();
+    for tr in page.tracks {
+        out.push(tr);
+    }
+    for shelf in page.shelves {
+        for item in shelf.items {
+            if let Some(tr) = item.to_track() {
+                if !out.iter().any(|e| e.video_id == tr.video_id) {
+                    out.push(tr);
+                }
+            }
+        }
+    }
+    out.truncate(10);
+    Ok(out)
 }
 
 pub async fn submit_ytm_like(
@@ -2196,5 +2446,46 @@ mod tests {
         assert!(art_page.header_description.as_deref().unwrap().contains("Teignmouth"));
         assert_eq!(art_page.tracks.len(), 1);
         assert!(art_page.shelves.iter().any(|s| s.title == "Albums"));
+    }
+
+    #[test]
+    fn test_enhanced_lrc_word_timings_and_tap_sync_stamps() {
+        let enhanced = "\
+[ar:Muse]
+[00:10.00]<00:10.00>Far <00:11.20>a<00:11.80>way
+[00:14.00]<00:14.00>This <00:14.50>ship <00:15.10>is taking me far away
+";
+        let lyr = parse_lrc_lyrics(enhanced, Some("Source: Enhanced LRC".to_string()));
+        assert!(lyr.is_timed);
+        assert!(lyr.has_word_timings());
+        assert_eq!(lyr.lines.len(), 2);
+        assert_eq!(lyr.lines[0].text, "Far away");
+        let w0 = lyr.lines[0].words.as_ref().unwrap();
+        assert_eq!(w0.len(), 3);
+        assert_eq!(w0[0].text, "Far ");
+        assert_eq!(w0[0].start_ms, 10_000);
+        assert_eq!(w0[0].end_ms, 11_200);
+        assert_eq!(w0[2].text, "way");
+        assert_eq!(w0[2].end_ms, 14_000);
+
+        let mut plain = YtmLyrics {
+            lines: vec![
+                YtmLyricLine {
+                    text: "Hold you in my arms".to_string(),
+                    ..Default::default()
+                },
+                YtmLyricLine {
+                    text: "I just wanted to hold you".to_string(),
+                    ..Default::default()
+                },
+            ],
+            source: Some("Source: Plain".to_string()),
+            is_timed: false,
+        };
+        plain.apply_tap_sync_stamps(&[3_000, 7_500]);
+        assert!(plain.is_timed);
+        assert_eq!(plain.lines[0].start_ms, Some(3_000));
+        assert_eq!(plain.lines[0].end_ms, Some(7_500));
+        assert_eq!(plain.lines[1].start_ms, Some(7_500));
     }
 }

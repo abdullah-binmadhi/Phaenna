@@ -4,6 +4,7 @@ mod api;
 mod config;
 mod db;
 mod error;
+mod karaoke_ops;
 mod messages;
 mod services;
 mod state;
@@ -19,8 +20,10 @@ use crate::api::innertube::{
     VideoComment, VideoVote,
 };
 use crate::api::player::{
-    build_mpv_audio_filter_chain, build_music_audio_filter_chain, classify_player_crash_stderr,
-    detect_dependencies, ipc_socket_path, spawn_player, youtube_watch_url, PlayOptions,
+    build_karaoke_audio_filter_chain, build_mpv_audio_filter_chain, build_music_audio_filter_chain,
+    classify_player_crash_stderr, detect_dependencies, ipc_socket_path,
+    register_owned_player_process, spawn_player, terminate_owned_player_processes,
+    unregister_owned_player_process, youtube_watch_url, KaraokeAudioDsp, PlayOptions,
 };
 use crate::api::translate::{
     next_preset_lang, normalize_target_lang, prev_preset_lang, translate_text,
@@ -116,9 +119,22 @@ use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Semaphore};
+
+static SIGNAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+struct OwnedPlayerCleanupGuard;
+
+impl Drop for OwnedPlayerCleanupGuard {
+    fn drop(&mut self) {
+        terminate_owned_player_processes();
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -154,7 +170,7 @@ enum Commands {
     Doctor,
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -237,6 +253,23 @@ async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _player_cleanup_guard = OwnedPlayerCleanupGuard;
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut hup = signal(SignalKind::hangup()).ok();
+            let mut term = signal(SignalKind::terminate()).ok();
+            let mut int = signal(SignalKind::interrupt()).ok();
+            tokio::select! {
+                _ = async { if let Some(ref mut s) = hup { s.recv().await; } else { std::future::pending::<()>().await; } } => {}
+                _ = async { if let Some(ref mut s) = term { s.recv().await; } else { std::future::pending::<()>().await; } } => {}
+                _ = async { if let Some(ref mut s) = int { s.recv().await; } else { std::future::pending::<()>().await; } } => {}
+            }
+            SIGNAL_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            terminate_owned_player_processes();
+        });
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -309,6 +342,9 @@ async fn main() -> anyhow::Result<()> {
     let mut needs_redraw = true;
     let mut last_suggest_gen: u64 = 0;
     loop {
+        if SIGNAL_EXIT_REQUESTED.load(Ordering::Relaxed) {
+            break;
+        }
         // Handle 120ms autocomplete suggestions & 350ms InnerTube remote search
         if state.search_pending_remote {
             if let Some(ts) = state.search_last_typed {
@@ -403,9 +439,47 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Advance karaoke lyric sweep smoothly when synced lyrics are visible during live playback
-        if state.overlay == ActiveOverlay::None
-            && state.categories.get(state.active_category).is_some_and(|(c, _)| *c == Category::Music)
+        // Advance karaoke lyric sweep smoothly when synced lyrics or Stage countdown are visible
+        let in_music_tab = state
+            .categories
+            .get(state.active_category)
+            .is_some_and(|(c, _)| *c == Category::Music);
+        if in_music_tab
+            && state.overlay == ActiveOverlay::None
+            && state.music.section == YtmSection::Karaoke
+        {
+            if let Some(dl) = state.music.karaoke.intermission_deadline {
+                if !state.music.karaoke.intermission_paused {
+                    if Instant::now() >= dl {
+                        if let Some(ni) = state.music.karaoke.intermission_next_idx.take() {
+                            state.music.karaoke.intermission_deadline = None;
+                            karaoke_ops::play_karaoke_entry_at(
+                                ni,
+                                &mut state,
+                                &pool,
+                                &tx,
+                                &client,
+                            )
+                            .await;
+                            needs_redraw = true;
+                        }
+                    } else if state.ticker_last_step_at.elapsed() >= Duration::from_millis(120) {
+                        state.ticker_last_step_at = Instant::now();
+                        needs_redraw = true;
+                    }
+                }
+            } else if ((state.music.lyrics.as_ref().is_some_and(|l| l.is_timed)
+                && state.has_live_ipc()
+                && !state.live_playback.paused
+                && !state.live_playback.paused_for_cache)
+                || state.music.karaoke.tap_sync_active)
+                && state.ticker_last_step_at.elapsed() >= Duration::from_millis(45)
+            {
+                state.ticker_last_step_at = Instant::now();
+                needs_redraw = true;
+            }
+        } else if state.overlay == ActiveOverlay::None
+            && in_music_tab
             && state.music.right_drawer_open
             && state.music.right_tab == YtmRightPaneTab::Lyrics
             && state.music.lyrics.as_ref().is_some_and(|l| l.is_timed)
@@ -561,6 +635,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if (state.music.active_audio_session_id == Some(state.active_session_id)
+        || state
+            .categories
+            .get(state.active_category)
+            .is_some_and(|(c, _)| *c == Category::Music))
+        && state.has_live_ipc()
+    {
+        state.send_player_cmd(PlayerCommand::Stop);
+    }
+    terminate_owned_player_processes();
+
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -617,6 +702,7 @@ async fn hydrate_state_from_db(state: &mut AppState, pool: &SqlitePool) {
         state.shorts_subscribed = cached_sub;
     }
     state.sync_active_shorts_list();
+    karaoke_ops::hydrate_karaoke_from_db(state, pool).await;
 
     if let Ok(local_hist) = get_local_watch_history_videos(pool, 200).await {
         if let Some((_, hist_list)) = state
@@ -1432,6 +1518,9 @@ async fn handle_app_message(
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
 ) {
+    let Some(msg) = karaoke_ops::handle_karaoke_message(msg, state) else {
+        return;
+    };
     match msg {
         AppMessage::FeedLoaded {
             feed_key,
@@ -2198,6 +2287,11 @@ async fn handle_app_message(
         AppMessage::PlaybackCommandReady { session_id, cmd_tx } => {
             if session_id == state.active_session_id {
                 state.live_playback.cmd_tx = Some(cmd_tx);
+                if state.music.karaoke.session_active
+                    && state.music.active_audio_session_id == Some(session_id)
+                {
+                    karaoke_ops::apply_karaoke_dsp_chain(state);
+                }
                 if state.music.active_audio_session_id != Some(session_id) {
                     if let Some(vid) = state.active_playback_video_id.clone() {
                         let matching_detail = state
@@ -2277,6 +2371,7 @@ async fn handle_app_message(
             state.active_playback_pos = pos;
             state.active_playback_dur = duration;
             state.active_playback_synced_at = Some(Instant::now());
+            karaoke_ops::check_karaoke_ab_loop(pos, state);
             state.record_telemetry_sample_if_due();
             state.progress_map.insert(video_id.clone(), (pos, duration));
             if let Some(meta) = state.continue_watching_meta.get_mut(video_id.trim_start_matches("RD")) {
@@ -2837,19 +2932,43 @@ async fn handle_app_message(
             }
         }
         AppMessage::MusicLyricsLoaded { video_id, lyrics } => {
+            let keep_cached = state.music.karaoke.session_active
+                && state.music.lyrics.as_ref().is_some_and(|l| l.is_timed)
+                && !lyrics.is_timed;
             if state
                 .music
                 .current_track()
                 .is_some_and(|t| t.video_id == video_id)
             {
-                state.music.lyrics = if lyrics.lines.is_empty() {
-                    None
-                } else {
-                    Some(lyrics)
-                };
+                if !keep_cached {
+                    state.music.lyrics = if lyrics.lines.is_empty() {
+                        None
+                    } else {
+                        Some(lyrics.clone())
+                    };
+                }
                 state.music.lyrics_loading = false;
                 state.music.lyrics_manual_scroll = false;
                 state.music.lyrics_scroll = 0;
+            }
+            if !lyrics.lines.is_empty() {
+                let status = crate::state::KaraokeLyricsReadiness::from_lyrics(&lyrics);
+                for e in &mut state.music.karaoke.items {
+                    if e.video_id == video_id {
+                        e.lyrics_status = status;
+                    }
+                }
+                let p_cache = pool.clone();
+                let v_cache = video_id;
+                tokio::spawn(async move {
+                    let _ = crate::db::karaoke::upsert_karaoke_lyrics_cache(
+                        &p_cache,
+                        &v_cache,
+                        &lyrics,
+                        crate::now_unix(),
+                    )
+                    .await;
+                });
             }
         }
         AppMessage::MusicAlbumPopupLoaded {
@@ -2879,13 +2998,15 @@ async fn handle_app_message(
             }
             state.show_toast(format!("✕ Album load failed: {error}"));
         }
-        AppMessage::MusicTrackEof { session_id } => {
-            if session_id == state.active_session_id && state.music.current_track().is_some() {
-                if let Some(next_idx) = state.music.next_queue_index(false) {
-                    play_music_track_at(next_idx, None, false, state, pool, tx, client).await;
-                } else {
-                    state.show_toast("Queue finished");
-                }
+        AppMessage::MusicTrackEof { session_id }
+            if session_id == state.active_session_id && state.music.current_track().is_some() =>
+        {
+            if state.music.karaoke.session_active {
+                karaoke_ops::advance_karaoke_on_eof(state, pool, tx, client).await;
+            } else if let Some(next_idx) = state.music.next_queue_index(false) {
+                play_music_track_at(next_idx, None, false, state, pool, tx, client).await;
+            } else {
+                state.show_toast("Queue finished");
             }
         }
         _ => {}
@@ -3675,7 +3796,16 @@ async fn start_nonblocking_playback_with_live_opts(
             state.config.audio_loudnorm
         },
         audio_filter_chain: if force_audio_headless {
-            build_music_audio_filter_chain(&state.config.music)
+            if state.music.karaoke.session_active {
+                let k_dsp = KaraokeAudioDsp {
+                    vocal_mode: state.music.karaoke.vocal_mode,
+                    pitch_semitones: state.music.karaoke.pitch_semitones,
+                    speed_pct: state.music.karaoke.speed_pct,
+                };
+                build_karaoke_audio_filter_chain(&state.config.music, &k_dsp)
+            } else {
+                build_music_audio_filter_chain(&state.config.music)
+            }
         } else {
             build_mpv_audio_filter_chain(
                 state.config.active_audio_eq_bands(),
@@ -3726,9 +3856,23 @@ async fn start_nonblocking_playback_with_live_opts(
         .to_string(),
     };
 
+    let is_music_category = state
+        .categories
+        .get(state.active_category)
+        .is_some_and(|(c, _)| *c == Category::Music);
+    let track_owned_lifetime = force_audio_headless || force_audio_radio || is_music_category;
+    if track_owned_lifetime {
+        terminate_owned_player_processes();
+    }
+
     match spawn_player(&opts) {
         Ok(Some(mut child)) => {
             let player_pid = child.id();
+            if track_owned_lifetime {
+                if let Some(pid) = player_pid {
+                    register_owned_player_process(pid, Some(sock_path.clone()));
+                }
+            }
             if !opts.audio_headless {
                 spawn_linux_front_task(
                     opts.auto_pip,
@@ -3741,10 +3885,14 @@ async fn start_nonblocking_playback_with_live_opts(
             let tx_watch = tx.clone();
             let stdout_pipe = child.stdout.take();
             let stderr_pipe = child.stderr.take();
+            let watch_pid = player_pid;
             tokio::spawn(async move {
                 let (out_ring, err_ring) =
                     tokio::join!(read_pipe_ring(stdout_pipe), read_pipe_ring(stderr_pipe));
                 if let Ok(status) = child.wait().await {
+                    if let Some(pid) = watch_pid {
+                        unregister_owned_player_process(pid);
+                    }
                     let mut combined = String::new();
                     if !out_ring.is_empty() {
                         combined.push_str(&String::from_utf8_lossy(&out_ring));
@@ -3925,7 +4073,7 @@ fn ensure_music_section_loaded(
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
 ) {
-    if section == YtmSection::Browse {
+    if section == YtmSection::Browse || section == YtmSection::Karaoke {
         return;
     }
     if !force && state.music.page_slot_mut(section).is_some() {
@@ -3958,7 +4106,7 @@ fn ensure_music_section_loaded(
                 fetch_ytm_browse(&c, sess.as_ref(), "FEmusic_charts", None, None).await
             }
             YtmSection::Search => fetch_ytm_search(&c, sess.as_ref(), &query, filter, None).await,
-            YtmSection::Browse => return,
+            YtmSection::Browse | YtmSection::Karaoke => return,
         };
         match res {
             Ok(page) => {
@@ -4189,9 +4337,51 @@ async fn play_music_track_at(
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
 ) {
+    play_music_track_at_inner(
+        queue_idx,
+        start_pos_override,
+        fetch_mix,
+        false,
+        state,
+        pool,
+        tx,
+        client,
+    )
+    .await;
+}
+
+pub(crate) async fn play_music_track_for_karaoke(
+    queue_idx: usize,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
+    play_music_track_at_inner(queue_idx, None, false, true, state, pool, tx, client).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn play_music_track_at_inner(
+    queue_idx: usize,
+    start_pos_override: Option<f64>,
+    fetch_mix: bool,
+    from_karaoke: bool,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
     let Some(track) = state.music.queue.get(queue_idx).cloned() else {
         return;
     };
+    if !from_karaoke {
+        state.music.karaoke.session_active = false;
+        state.music.karaoke.active_item_id = None;
+        state.music.karaoke.tap_sync_active = false;
+        state.music.karaoke.intermission_next_idx = None;
+        state.music.karaoke.intermission_deadline = None;
+        state.music.karaoke.intermission_paused = false;
+    }
     state.music.queue_index = queue_idx;
     state.music.queue_cursor = queue_idx;
     state.music.preview_item = None;
@@ -4236,6 +4426,9 @@ async fn play_music_track_at(
             state.live_playback.is_live_stream = false;
             let vid_item = shelf_item_to_video_item(&track);
             let _ = touch_watch_history(pool, Some(&vid_item), &vid_item.id, now_unix()).await;
+            if !from_karaoke {
+                apply_music_audio_filter_chain(state);
+            }
             state.show_toast(format!("▸ Now Playing: {}", track.title));
         } else {
             let vid_item = shelf_item_to_video_item(&track);
@@ -4257,6 +4450,7 @@ async fn play_music_track_at(
         if state.has_live_ipc() {
             state.send_player_cmd(PlayerCommand::Stop);
         }
+        terminate_owned_player_processes();
         let vid_item = shelf_item_to_video_item(&track);
         start_nonblocking_playback_with_live_opts(
             &vid_item,
@@ -4951,7 +5145,7 @@ async fn apply_album_popup_hit(
             if let Some((name, aid)) = tr_opt
                 .and_then(|t| {
                     t.album_browse_id
-                        .map(|id| (t.album.unwrap_or_else(|| t.title), id))
+                        .map(|id| (t.album.unwrap_or(t.title), id))
                 })
                 .or_else(|| it_opt.and_then(|it| it.browse_id.map(|id| (it.title, id))))
             {
@@ -5076,6 +5270,49 @@ async fn apply_album_popup_hit(
                 }
             }
         }
+        YtmAlbumPopupHit::KaraokeTrack(t_idx) => {
+            if let Some(p) = state.music.album_popup.page.as_ref() {
+                let q = prepare_popup_queue(
+                    p,
+                    &state.music.album_popup.browse_id,
+                    p.header_playlist_id.as_deref(),
+                );
+                if let Some(tr) = q.get(t_idx).cloned() {
+                    karaoke_ops::send_tracks_to_karaoke(vec![tr], state, pool, tx, client).await;
+                }
+            }
+        }
+        YtmAlbumPopupHit::PreviewKaraoke => {
+            let (tr_opt, it_opt) = selected_popup_track_or_item(state);
+            let tracks: Vec<YtmTrack> = if let Some(mut tr) = tr_opt {
+                if let Some(p) = state.music.album_popup.page.as_ref() {
+                    let enriched = prepare_popup_queue(
+                        p,
+                        &state.music.album_popup.browse_id,
+                        p.header_playlist_id.as_deref(),
+                    );
+                    if let Some(found) = enriched.into_iter().find(|t| t.video_id == tr.video_id) {
+                        tr = found;
+                    }
+                }
+                vec![tr]
+            } else if let Some(tr) = it_opt.and_then(|it| it.to_track()) {
+                vec![tr]
+            } else {
+                Vec::new()
+            };
+            karaoke_ops::send_tracks_to_karaoke(tracks, state, pool, tx, client).await;
+        }
+        YtmAlbumPopupHit::SendAllToKaraoke => {
+            if let Some(p) = state.music.album_popup.page.as_ref() {
+                let q = prepare_popup_queue(
+                    p,
+                    &state.music.album_popup.browse_id,
+                    p.header_playlist_id.as_deref(),
+                );
+                karaoke_ops::send_tracks_to_karaoke(q, state, pool, tx, client).await;
+            }
+        }
     }
 }
 
@@ -5088,6 +5325,27 @@ async fn handle_music_mouse_event(
 ) -> bool {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if state.music.section == YtmSection::Karaoke {
+                if let Some((_, k_hit)) = state
+                    .music
+                    .karaoke
+                    .hitboxes
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| {
+                        r.width > 0
+                            && r.height > 0
+                            && mouse.column >= r.x
+                            && mouse.column < r.x + r.width
+                            && mouse.row >= r.y
+                            && mouse.row < r.y + r.height
+                    })
+                    .copied()
+                {
+                    karaoke_ops::handle_karaoke_hit(k_hit, state, pool, tx, client).await;
+                    return true;
+                }
+            }
             if let Some((rect, hit)) = state
                 .music
                 .hitboxes
@@ -5111,7 +5369,12 @@ async fn handle_music_mouse_event(
                         state.music.browse_stack.clear();
                         state.music.cursor = 0;
                         state.music.scroll = 0;
-                        ensure_music_section_loaded(sec, false, state, tx, client);
+                        if sec == YtmSection::Karaoke {
+                            karaoke_ops::reload_active_karaoke_playlist(state, pool, tx, client)
+                                .await;
+                        } else {
+                            ensure_music_section_loaded(sec, false, state, tx, client);
+                        }
                     }
                     MusicHit::OpenSidebarPlaylist(idx) => {
                         let now = Instant::now();
@@ -5204,6 +5467,39 @@ async fn handle_music_mouse_event(
                     MusicHit::ShowNowPlaying => {
                         state.music.preview_item = None;
                         state.kitty_flush_needed = true;
+                    }
+                    MusicHit::SendPreviewToKaraoke => {
+                        let tr_opt = state
+                            .music
+                            .preview_item
+                            .as_ref()
+                            .and_then(|p| p.to_track())
+                            .or_else(|| {
+                                state
+                                    .music
+                                    .selectable_items()
+                                    .get(state.music.cursor)
+                                    .and_then(|it| it.to_track())
+                            });
+                        karaoke_ops::send_tracks_to_karaoke(
+                            tr_opt.into_iter().collect(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
+                    }
+                    MusicHit::SendCurrentToKaraoke => {
+                        let tr_opt = state.music.current_track().cloned();
+                        karaoke_ops::send_tracks_to_karaoke(
+                            tr_opt.into_iter().collect(),
+                            state,
+                            pool,
+                            tx,
+                            client,
+                        )
+                        .await;
                     }
                     MusicHit::TogglePlayPause => {
                         if state.has_live_ipc() {
@@ -5426,6 +5722,25 @@ async fn handle_music_mouse_event(
                 }
                 return true;
             }
+            if state.music.section == YtmSection::Karaoke {
+                if in_rect(state.music.karaoke.setlist_rect) {
+                    let total_k = state.music.karaoke.items.len();
+                    if down && total_k > 0 {
+                        state.music.karaoke.cursor = (state.music.karaoke.cursor + 1).min(total_k - 1);
+                    } else {
+                        state.music.karaoke.cursor = state.music.karaoke.cursor.saturating_sub(1);
+                    }
+                    return true;
+                }
+                if in_rect(state.music.karaoke.stage_rect) {
+                    state.music.karaoke.lyrics_scroll = step_scroll(
+                        state.music.karaoke.lyrics_scroll,
+                        state.music.karaoke.lyrics_max_scroll,
+                    );
+                    state.music.karaoke.lyrics_manual_scroll = true;
+                    return true;
+                }
+            }
             let total = state.music.selectable_items().len();
             if down {
                 if total > 0 {
@@ -5448,6 +5763,10 @@ async fn handle_music_key_event(
     tx: &mpsc::Sender<AppMessage>,
     client: &reqwest::Client,
 ) -> bool {
+    if state.music.section == YtmSection::Karaoke {
+        return karaoke_ops::handle_karaoke_key(code, modifiers, state, pool, tx, client).await;
+    }
+
     if state.music.search_editing {
         match code {
             KeyCode::Esc => state.music.search_editing = false,
@@ -5691,6 +6010,29 @@ async fn handle_music_key_event(
         }
         KeyCode::Char('l') => {
             toggle_music_like(state, client);
+        }
+        KeyCode::Char('K') => {
+            let tr_opt = state
+                .music
+                .preview_item
+                .as_ref()
+                .and_then(|p| p.to_track())
+                .or_else(|| {
+                    state
+                        .music
+                        .selectable_items()
+                        .get(state.music.cursor)
+                        .and_then(|it| it.to_track())
+                })
+                .or_else(|| state.music.current_track().cloned());
+            karaoke_ops::send_tracks_to_karaoke(
+                tr_opt.into_iter().collect(),
+                state,
+                pool,
+                tx,
+                client,
+            )
+            .await;
         }
         _ => {}
     }
@@ -7122,6 +7464,10 @@ fn apply_audio_filter_chain(state: &mut AppState) {
 
 /// Apply dedicated YouTube Music DSP chain (`preamp` + EQ + normalization + `alimiter`) live to headless mpv.
 fn apply_music_audio_filter_chain(state: &mut AppState) {
+    if state.music.karaoke.session_active {
+        karaoke_ops::apply_karaoke_dsp_chain(state);
+        return;
+    }
     let chain = build_music_audio_filter_chain(&state.config.music);
     if state.has_live_ipc()
         && state.music.active_audio_session_id == Some(state.active_session_id)
@@ -9684,7 +10030,7 @@ async fn handle_mouse_event(
     false
 }
 
-fn open_confirm_quit(state: &mut AppState) {
+pub(crate) fn open_confirm_quit(state: &mut AppState) {
     state.quit_confirm_yes = false;
     state.overlay = ActiveOverlay::ConfirmQuit;
 }
@@ -11446,6 +11792,10 @@ async fn handle_overlay_key(
                 }
                 KeyCode::Char('l') => {
                     apply_album_popup_hit(YtmAlbumPopupHit::PreviewLike, state, pool, tx, client)
+                        .await;
+                }
+                KeyCode::Char('K') => {
+                    apply_album_popup_hit(YtmAlbumPopupHit::PreviewKaraoke, state, pool, tx, client)
                         .await;
                 }
                 _ => {}
