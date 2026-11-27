@@ -58,9 +58,84 @@ fn queue_music_cover(state: &mut AppState, key: &str, url: &str, priority: Thumb
     }
 }
 
+/// Shared pane geometry for YouTube Music workspace (used by both renderer and cursor navigation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MusicLayoutDims {
+    pub show_sidebar: bool,
+    pub sidebar_w: u16,
+    pub show_drawer: bool,
+    pub drawer_w: u16,
+    pub stage_w: u16,
+}
+
+/// Compute balanced pane widths so Main Stage, Sidebar, and Right Drawer stay proportional.
+pub fn music_layout_dims(total_w: u16, drawer_open: bool) -> MusicLayoutDims {
+    let show_sidebar = total_w >= 68;
+    let sidebar_w = if !show_sidebar {
+        0
+    } else if total_w >= 128 {
+        23
+    } else {
+        19
+    };
+    let show_drawer = drawer_open && total_w >= 104;
+    let drawer_w = if !show_drawer {
+        0
+    } else if total_w >= 156 {
+        46
+    } else if total_w >= 136 {
+        42
+    } else {
+        35
+    };
+    let min_stage = if show_sidebar { 32 } else { 28 };
+    let stage_w = total_w.saturating_sub(sidebar_w + drawer_w).max(min_stage);
+    MusicLayoutDims {
+        show_sidebar,
+        sidebar_w,
+        show_drawer,
+        drawer_w,
+        stage_w,
+    }
+}
+
 /// Compute number of cover-grid columns fitting cleanly inside the Spotify main stage.
 pub fn spotify_grid_cols(stage_width: u16) -> usize {
-    ((stage_width.saturating_sub(2)) / 21).clamp(2, 5) as usize
+    let card_w_target: u16 = 18;
+    let card_gap: u16 = 1;
+    ((stage_width.saturating_sub(2)) / (card_w_target + card_gap)).clamp(2, 5) as usize
+}
+
+fn render_vertical_scrollbar(
+    frame: &mut Frame,
+    col_rect: Rect,
+    scroll: usize,
+    visible: usize,
+    total: usize,
+    track_fg: Color,
+    thumb_fg: Color,
+) {
+    if col_rect.width == 0 || col_rect.height < 2 || total <= visible || visible == 0 {
+        return;
+    }
+    let track_h = col_rect.height as usize;
+    let max_scroll = total.saturating_sub(visible);
+    let thumb_h = ((visible * track_h) / total).clamp(1, track_h);
+    let thumb_pos = (scroll.min(max_scroll) * track_h.saturating_sub(thumb_h))
+        .checked_div(max_scroll)
+        .unwrap_or(0);
+    for row in 0..track_h {
+        let is_thumb = row >= thumb_pos && row < thumb_pos + thumb_h;
+        let (glyph, col) = if is_thumb {
+            ("█", thumb_fg)
+        } else {
+            ("│", track_fg)
+        };
+        frame.render_widget(
+            Paragraph::new(glyph).style(Style::default().fg(col)),
+            Rect::new(col_rect.x, col_rect.y + row as u16, 1, 1),
+        );
+    }
 }
 
 /// Render the full 4-zone Spotify-style YouTube Music workspace below Phaenna's top tab bar.
@@ -72,6 +147,8 @@ pub fn render_music_workspace(
 ) {
     state.music.hitboxes.clear();
     state.music.progress_bar_rect = Rect::default();
+    state.music.sidebar_rect = Rect::default();
+    state.music.right_drawer_rect = Rect::default();
 
     if area.width < 40 || area.height < 12 {
         return;
@@ -86,19 +163,16 @@ pub fn render_music_workspace(
     let body_area = root_chunks[0];
     let bar_area = root_chunks[1];
 
-    let show_sidebar = body_area.width >= 68;
-    let show_drawer = state.music.right_drawer_open && body_area.width >= 104;
-    let sidebar_w = if body_area.width >= 120 { 24 } else { 19 };
-    let drawer_w = if body_area.width >= 136 { 35 } else { 29 };
+    let dims = music_layout_dims(body_area.width, state.music.right_drawer_open);
 
-    match (show_sidebar, show_drawer) {
+    match (dims.show_sidebar, dims.show_drawer) {
         (true, true) => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(sidebar_w),
+                    Constraint::Length(dims.sidebar_w),
                     Constraint::Min(32),
-                    Constraint::Length(drawer_w),
+                    Constraint::Length(dims.drawer_w),
                 ])
                 .split(body_area);
             render_spotify_sidebar(frame, cols[0], state);
@@ -108,7 +182,7 @@ pub fn render_music_workspace(
         (true, false) => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(sidebar_w), Constraint::Min(32)])
+                .constraints([Constraint::Length(dims.sidebar_w), Constraint::Min(32)])
                 .split(body_area);
             render_spotify_sidebar(frame, cols[0], state);
             render_main_stage(frame, cols[1], state, modal_rect);
@@ -116,7 +190,7 @@ pub fn render_music_workspace(
         (false, true) => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(28), Constraint::Length(drawer_w)])
+                .constraints([Constraint::Min(28), Constraint::Length(dims.drawer_w)])
                 .split(body_area);
             render_main_stage(frame, cols[0], state, modal_rect);
             render_right_drawer(frame, cols[1], state, modal_rect);
@@ -130,6 +204,7 @@ pub fn render_music_workspace(
 }
 
 fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    state.music.sidebar_rect = area;
     let theme = state.base_theme().clone();
     let spotify_green = Color::Rgb(30, 215, 96);
     let blk = Block::default()
@@ -140,6 +215,8 @@ fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
     if inner.width < 10 || inner.height < 6 {
+        state.music.sidebar_total = 0;
+        state.music.sidebar_visible_rows = 0;
         return;
     }
 
@@ -224,20 +301,6 @@ fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         y += 1;
     }
 
-    if y + 1 < inner.y + inner.height {
-        y += 1;
-        let hdr_rect = Rect::new(inner.x, y, inner.width, 1);
-        frame.render_widget(
-            Paragraph::new(" PLAYLISTS & ALBUMS").style(
-                Style::default()
-                    .fg(theme.text_dim)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            hdr_rect,
-        );
-        y += 1;
-    }
-
     // Populate Library playlists / albums clickable shortcut rail
     let lib_items: Vec<YtmShelfItem> = state
         .music
@@ -250,6 +313,58 @@ fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 .collect()
         })
         .unwrap_or_default();
+    let total = lib_items.len();
+
+    let hdr_y = if y + 1 < inner.y + inner.height {
+        y += 1;
+        let hy = y;
+        y += 1;
+        Some(hy)
+    } else {
+        None
+    };
+
+    let visible_rows = (inner.y + inner.height).saturating_sub(y) as usize;
+    state.music.sidebar_total = total;
+    state.music.sidebar_visible_rows = visible_rows;
+    let max_scroll = total.saturating_sub(visible_rows);
+    state.music.sidebar_scroll = state.music.sidebar_scroll.min(max_scroll);
+
+    if let Some(hy) = hdr_y {
+        let hdr_rect = Rect::new(inner.x, hy, inner.width, 1);
+        let hdr_label = if total > visible_rows && visible_rows > 0 {
+            let arrow = match (
+                state.music.sidebar_scroll > 0,
+                state.music.sidebar_scroll < max_scroll,
+            ) {
+                (true, true) => "↕",
+                (false, true) => "▼",
+                (true, false) => "▲",
+                (false, false) => "",
+            };
+            if inner.width >= 26 {
+                let start = state.music.sidebar_scroll + 1;
+                let end = (state.music.sidebar_scroll + visible_rows).min(total);
+                format!(" PLAYLISTS {start}-{end}/{total}")
+            } else if inner.width >= 21 {
+                format!(" PLAYLISTS & ALBUMS {arrow}")
+            } else {
+                let start = state.music.sidebar_scroll + 1;
+                let end = (state.music.sidebar_scroll + visible_rows).min(total);
+                format!(" LIB {start}-{end}/{total} {arrow}")
+            }
+        } else {
+            " PLAYLISTS & ALBUMS".to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_str(&hdr_label, inner.width as usize)).style(
+                Style::default()
+                    .fg(theme.text_dim)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            hdr_rect,
+        );
+    }
 
     if lib_items.is_empty() && y < inner.y + inner.height {
         let msg = if state.auth_vault.active_account().is_some() {
@@ -265,22 +380,57 @@ fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
 
-    for (idx, item) in lib_items.iter().enumerate() {
+    let has_sb = total > visible_rows && visible_rows >= 2 && inner.width >= 8;
+    let row_w = if has_sb {
+        inner.width - 1
+    } else {
+        inner.width
+    };
+    let list_top_y = y;
+
+    for (idx, item) in lib_items
+        .iter()
+        .enumerate()
+        .skip(state.music.sidebar_scroll)
+        .take(visible_rows)
+    {
         if y >= inner.y + inner.height {
             break;
         }
-        let r = Rect::new(inner.x, y, inner.width, 1);
+        let r = Rect::new(inner.x, y, row_w, 1);
         state
             .music
             .hitboxes
             .push((r, MusicHit::OpenSidebarPlaylist(idx)));
+        let is_recent = state
+            .music
+            .sidebar_last_click
+            .is_some_and(|(prev, _)| prev == idx);
         let label = format!(" ◈ {}", item.title);
         frame.render_widget(
-            Paragraph::new(truncate_str(&label, inner.width as usize))
-                .style(Style::default().fg(theme.text_dim)),
+            Paragraph::new(truncate_str(&label, row_w as usize)).style(if is_recent {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_dim)
+            }),
             r,
         );
         y += 1;
+    }
+
+    if has_sb {
+        let sb_rect = Rect::new(inner.x + inner.width - 1, list_top_y, 1, visible_rows as u16);
+        render_vertical_scrollbar(
+            frame,
+            sb_rect,
+            state.music.sidebar_scroll,
+            visible_rows,
+            total,
+            theme.border_idle,
+            theme.accent,
+        );
     }
 }
 
@@ -528,7 +678,6 @@ fn render_cover_shelves_grid(
     let cols = spotify_grid_cols(area.width);
     let card_gap: u16 = 1;
     let total_gaps = card_gap * (cols.saturating_sub(1) as u16);
-    let card_w = (area.width.saturating_sub(total_gaps) / (cols as u16)).max(14);
 
     // Tall crisp 1:1 card height: 1px top pad + square art + 1 title + 1 sub + 1 border/pad
     let cover_h: u16 = if area.height >= 24 {
@@ -539,6 +688,9 @@ fn render_cover_shelves_grid(
         4
     };
     let card_h: u16 = cover_h + 4;
+    let slot_w = (area.width.saturating_sub(total_gaps) / (cols as u16)).max(14);
+    let card_w_cap = (cover_h * 2 + 5).clamp(16, 22);
+    let card_w = slot_w.min(card_w_cap);
 
     struct ShelfRowBlock {
         shelf_title: Option<String>,
@@ -628,7 +780,9 @@ fn render_cover_shelves_grid(
         }
 
         for (c_i, (s_idx, item)) in rb.items.iter().enumerate() {
-            let cx = area.x + (c_i as u16) * (card_w + card_gap);
+            let cx = area.x
+                + (c_i as u16) * (slot_w + card_gap)
+                + slot_w.saturating_sub(card_w) / 2;
             let card_rect = Rect::new(cx, cur_y, card_w, card_h);
             let is_sel = *s_idx == state.music.cursor;
             let is_playing = item
@@ -869,65 +1023,32 @@ fn render_right_drawer(
     state: &mut AppState,
     modal_rect: Option<Rect>,
 ) {
+    state.music.right_drawer_rect = area;
+
     let cur_track = state.music.current_track().cloned();
     let preview = state.music.preview_item.clone();
     let is_preview = preview.is_some();
 
-    let (art_id, art_url, title, artist, album_opt, preview_kind) = if let Some(ref p) = preview {
-        (
-            p.thumb_cache_key(),
-            p.thumb_url.clone(),
-            p.title.clone(),
-            if p.subtitle.is_empty() {
-                p.kind.badge().to_string()
-            } else {
-                p.subtitle.clone()
-            },
-            p.duration_secs.map(|d| format!("Duration: {}", format_duration_secs(d))),
-            Some(p.kind),
-        )
+    let (art_id, art_url) = if let Some(ref p) = preview {
+        (p.thumb_cache_key(), p.thumb_url.clone())
     } else if let Some(ref tr) = cur_track {
-        (
-            tr.thumb_cache_key(),
-            tr.effective_thumb_url(),
-            tr.title.clone(),
-            tr.artist.clone(),
-            tr.album.clone(),
-            Some(tr.kind),
-        )
+        (tr.thumb_cache_key(), tr.effective_thumb_url())
+    } else if let Some(p) = state.music.selectable_items().get(state.music.cursor) {
+        (p.thumb_cache_key(), p.thumb_url.clone())
     } else {
-        let fallback = state.music.selectable_items().get(state.music.cursor).cloned();
-        if let Some(ref p) = fallback {
-            (
-                p.thumb_cache_key(),
-                p.thumb_url.clone(),
-                p.title.clone(),
-                p.subtitle.clone(),
-                p.duration_secs.map(|d| format!("Duration: {}", format_duration_secs(d))),
-                Some(p.kind),
-            )
-        } else {
-            (
-                String::new(),
-                String::new(),
-                "Nothing Playing".to_string(),
-                "Click to inspect · 2x-click to play".to_string(),
-                None,
-                None,
-            )
-        }
+        (String::new(), String::new())
     };
 
     if !art_id.is_empty() && !art_url.is_empty() {
         state.queue_thumb_with_priority(&art_id, &art_url, ThumbPriority::Focused);
     }
     let pal = if !art_id.is_empty() {
-        state.active_palette_for(Some(&art_id)).clone()
+        state.active_palette_for(Some(&art_id))
     } else {
-        state.base_theme().clone()
+        *state.base_theme()
     };
 
-    let drawer_title = if is_preview {
+    let drawer_title = if is_preview && state.music.right_tab == YtmRightPaneTab::Info {
         " Preview Inspector "
     } else {
         " Now Playing "
@@ -945,204 +1066,530 @@ fn render_right_drawer(
         .style(Style::default().bg(Color::Reset));
     let inner = blk.inner(area);
     frame.render_widget(blk, area);
-    if inner.width < 12 || inner.height < 10 {
+    if inner.width < 12 || inner.height < 8 {
         return;
     }
 
-    let art_h = ((inner.height as usize * 54) / 100).clamp(7, 15) as u16;
-    let parts = Layout::default()
+    let show_div = inner.height >= 10;
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(art_h),
-            Constraint::Length(if is_preview { 4 } else { 3 }),
-            Constraint::Min(4),
-        ])
+        .constraints(if show_div {
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(4),
+            ]
+        } else {
+            vec![Constraint::Length(1), Constraint::Min(4)]
+        })
         .split(inner);
 
-    if !art_id.is_empty() && !rect_intersects_optional(parts[0], modal_rect) {
-        render_thumbnail_cover(frame, parts[0], &art_id, state, "ART");
+    render_right_drawer_tabs(frame, chunks[0], state, &pal, is_preview);
+    let body = if show_div {
+        frame.render_widget(
+            Paragraph::new("─".repeat(inner.width as usize))
+                .style(Style::default().fg(pal.border_idle)),
+            chunks[1],
+        );
+        chunks[2]
+    } else {
+        chunks[1]
+    };
+
+    match state.music.right_tab {
+        YtmRightPaneTab::UpNext => render_up_next_list(frame, body, state, &pal),
+        YtmRightPaneTab::Lyrics => render_lyrics_view(frame, body, state, &pal),
+        YtmRightPaneTab::Info => render_info_tab(frame, body, state, &pal, modal_rect),
+    }
+}
+
+fn render_right_drawer_tabs(
+    frame: &mut Frame,
+    tab_bar: Rect,
+    state: &mut AppState,
+    theme: &crate::ui::theme::ThemePalette,
+    is_preview: bool,
+) {
+    let q_len = state.music.queue.len();
+    let is_timed = state.music.lyrics.as_ref().is_some_and(|l| l.is_timed);
+    let up_full = format!("Up Next ({q_len})");
+    let lyr_sync = if is_timed { "Lyrics (Sync)" } else { "Lyrics" };
+    let info_full = if is_preview && state.music.right_tab != YtmRightPaneTab::Info {
+        "Info •"
+    } else {
+        "Info"
+    };
+
+    let candidates = [
+        (up_full.as_str(), lyr_sync, info_full),
+        (up_full.as_str(), "Lyrics", info_full),
+        ("Up Next", "Lyrics", "Info"),
+        ("Queue", "Lyr", "Info"),
+    ];
+    let avail = tab_bar.width as usize;
+    let (up_raw, lyr_raw, info_raw) = candidates
+        .iter()
+        .find(|(u, l, i)| u.chars().count() + l.chars().count() + i.chars().count() + 8 <= avail)
+        .copied()
+        .unwrap_or(("Queue", "Lyr", "Info"));
+
+    let tabs = [
+        (
+            format!(" {up_raw} "),
+            YtmRightPaneTab::UpNext,
+            theme.primary,
+        ),
+        (
+            format!(" {lyr_raw} "),
+            YtmRightPaneTab::Lyrics,
+            Color::Rgb(30, 215, 96),
+        ),
+        (
+            format!(" {info_raw} "),
+            YtmRightPaneTab::Info,
+            theme.accent,
+        ),
+    ];
+
+    let mut tx = tab_bar.x;
+    let max_x = tab_bar.x + tab_bar.width;
+    let mut spans = Vec::new();
+    for (idx, (lbl, tab, active_bg)) in tabs.into_iter().enumerate() {
+        let w = lbl.chars().count() as u16;
+        if idx > 0 && tx < max_x {
+            spans.push(Span::raw(" "));
+            tx += 1;
+        }
+        let fit_w = w.min(max_x.saturating_sub(tx));
+        if fit_w == 0 {
+            break;
+        }
+        state.music.hitboxes.push((
+            Rect::new(tx, tab_bar.y, fit_w, 1),
+            MusicHit::SelectRightTab(tab),
+        ));
+        let is_active = state.music.right_tab == tab;
+        let st = if is_active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(active_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if tab == YtmRightPaneTab::Info && is_preview {
+            Style::default()
+                .fg(theme.accent)
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim).bg(Color::Reset)
+        };
+        let shown = if fit_w < w {
+            truncate_str(&lbl, fit_w as usize)
+        } else {
+            lbl
+        };
+        spans.push(Span::styled(shown, st));
+        tx += fit_w;
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), tab_bar);
+}
+
+fn parse_preview_info(item: &YtmShelfItem) -> (String, String, String, String) {
+    let mut artist = if item.kind == YtmItemKind::Artist {
+        item.title.clone()
+    } else {
+        String::new()
+    };
+    let mut detail_parts = Vec::new();
+    let mut songs_or_count = String::new();
+    let mut length = item
+        .duration_secs
+        .map(format_duration_secs)
+        .unwrap_or_default();
+
+    let sep = if item.subtitle.contains(" • ") {
+        " • "
+    } else {
+        " · "
+    };
+    for raw in item.subtitle.split(sep) {
+        let part = raw.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let low = part.to_ascii_lowercase();
+        if matches!(
+            low.as_str(),
+            "song" | "video" | "album" | "playlist" | "ep" | "single" | "radio" | "artist"
+        ) {
+            continue;
+        }
+        let looks_like_time = part.contains(':')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ':');
+        if looks_like_time {
+            if length.is_empty() {
+                length = part.to_string();
+            }
+            continue;
+        }
+        if low.contains("song")
+            || low.contains("track")
+            || low.contains("sub")
+            || low.contains("listener")
+            || low.contains("audience")
+            || low.contains("view")
+            || low.contains("play")
+            || low.contains("item")
+        {
+            if songs_or_count.is_empty() {
+                songs_or_count = part.to_string();
+            } else {
+                songs_or_count.push_str(" · ");
+                songs_or_count.push_str(part);
+            }
+            continue;
+        }
+        if artist.is_empty() {
+            artist = part.to_string();
+        } else {
+            detail_parts.push(part.to_string());
+        }
+    }
+
+    if artist.is_empty() {
+        artist = item.kind.badge().to_string();
+    }
+    let album_or_detail = if detail_parts.is_empty() {
+        item.kind.badge().to_string()
+    } else {
+        detail_parts.join(" · ")
+    };
+    if songs_or_count.is_empty() {
+        songs_or_count = match item.kind {
+            YtmItemKind::Album => "Album Collection".to_string(),
+            YtmItemKind::Playlist | YtmItemKind::Radio => "Playlist Mix".to_string(),
+            YtmItemKind::Artist => "Artist Channel".to_string(),
+            YtmItemKind::Song | YtmItemKind::Video => "Single Track".to_string(),
+        };
+    }
+
+    (artist, album_or_detail, songs_or_count, length)
+}
+
+struct InfoPill {
+    label: String,
+    hit: MusicHit,
+    fg: Color,
+    bg: Color,
+}
+
+struct PositionedPill {
+    pill: InfoPill,
+    width: u16,
+}
+
+fn render_info_action_pills(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    pills: Vec<InfoPill>,
+) {
+    if area.width == 0 || area.height == 0 || pills.is_empty() {
+        return;
+    }
+    let mut rows: Vec<Vec<PositionedPill>> = vec![Vec::new()];
+    let mut cur_w: u16 = 0;
+    for pill in pills {
+        let w = (pill.label.chars().count() as u16).min(area.width);
+        let need = if cur_w == 0 { w } else { w + 1 };
+        if cur_w > 0 && cur_w + need > area.width {
+            if rows.len() >= area.height as usize {
+                break;
+            }
+            rows.push(Vec::new());
+            cur_w = 0;
+        }
+        let add = if cur_w == 0 { w } else { w + 1 };
+        cur_w += add;
+        if let Some(last) = rows.last_mut() {
+            last.push(PositionedPill { pill, width: w });
+        }
+    }
+
+    for (ri, row_pills) in rows.into_iter().enumerate() {
+        let y = area.y + ri as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        let mut bx = area.x;
+        let mut spans = Vec::new();
+        for (pi, PositionedPill { pill, width: _w }) in row_pills.into_iter().enumerate() {
+            if pi > 0 {
+                spans.push(Span::raw(" "));
+                bx += 1;
+            }
+            let shown = truncate_str(
+                &pill.label,
+                area.x.saturating_add(area.width).saturating_sub(bx) as usize,
+            );
+            let actual_w = shown.chars().count() as u16;
+            if actual_w == 0 {
+                break;
+            }
+            state
+                .music
+                .hitboxes
+                .push((Rect::new(bx, y, actual_w, 1), pill.hit));
+            spans.push(Span::styled(
+                shown,
+                Style::default()
+                    .fg(pill.fg)
+                    .bg(pill.bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            bx += actual_w;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+}
+
+fn render_info_tab(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    pal: &crate::ui::theme::ThemePalette,
+    modal_rect: Option<Rect>,
+) {
+    if area.width < 12 || area.height < 6 {
+        return;
+    }
+    let spotify_green = Color::Rgb(30, 215, 96);
+    let cur_track = state.music.current_track().cloned();
+    let preview = state.music.preview_item.clone();
+    let is_preview = preview.is_some();
+
+    let item_for_info = preview
+        .clone()
+        .or_else(|| {
+            if cur_track.is_none() {
+                state
+                    .music
+                    .selectable_items()
+                    .get(state.music.cursor)
+                    .cloned()
+            } else {
+                None
+            }
+        });
+
+    let (art_id, kind_badge, title, meta_rows) = if let Some(ref p) = item_for_info {
+        let (artist, detail, songs_info, length) = parse_preview_info(p);
+        let eq_badge = state.config.music.eq_badge_label();
+        let len_line = if length.is_empty() {
+            format!("EQ: {eq_badge}")
+        } else {
+            format!("{length} · EQ: {eq_badge}")
+        };
+        let detail_key = match p.kind {
+            YtmItemKind::Artist => "Role",
+            YtmItemKind::Playlist | YtmItemKind::Radio => "Source",
+            _ => "Detail",
+        };
+        let rows = vec![
+            ("Artist", artist, Color::White),
+            (detail_key, detail, pal.text_dim),
+            ("Songs", songs_info, pal.accent),
+            ("Length", len_line, pal.text_dim),
+        ];
+        (p.thumb_cache_key(), p.kind.badge(), p.title.clone(), rows)
+    } else if let Some(ref tr) = cur_track {
+        let artist = if tr.artist.is_empty() {
+            "YouTube Music".to_string()
+        } else {
+            tr.artist.clone()
+        };
+        let album = tr
+            .album
+            .clone()
+            .unwrap_or_else(|| "Single / Mix".to_string());
+        let songs_info = format!(
+            "Track {} of {}",
+            state.music.queue_index + 1,
+            state.music.queue.len().max(1)
+        );
+        let dur = tr
+            .duration_text
+            .clone()
+            .or_else(|| tr.duration_secs.map(format_duration_secs))
+            .unwrap_or_else(|| "--:--".to_string());
+        let eff_preamp = crate::api::player::effective_music_preamp_db(&state.config.music);
+        let eq_badge = state.config.music.eq_badge_label();
+        let audio_mode = if tr.kind == YtmItemKind::Video || state.music.video_mode {
+            "Video"
+        } else if state.config.music.anti_clip_limiter {
+            "Lossless Safe"
+        } else {
+            "Direct"
+        };
+        let len_line = format!("{dur} · EQ:{eq_badge} ({eff_preamp:+}dB) · {audio_mode}");
+        let rows = vec![
+            ("Artist", artist, Color::White),
+            ("Album", album, pal.text_dim),
+            ("Songs", songs_info, spotify_green),
+            ("Length", len_line, pal.text_dim),
+        ];
+        (tr.thumb_cache_key(), tr.kind.badge(), tr.title.clone(), rows)
+    } else {
+        let rows = vec![
+            ("Hint", "Click a card to inspect".to_string(), pal.text_dim),
+            ("Play", "2x-Click or Enter".to_string(), pal.accent),
+        ];
+        (
+            String::new(),
+            "READY",
+            "Nothing Playing".to_string(),
+            rows,
+        )
+    };
+
+    let action_h: u16 = if area.height >= 14 { 2 } else { 1 };
+    let meta_h: u16 = 6; // kind+title + 4 info rows + 1 gap
+    let max_cov_h = area.height.saturating_sub(meta_h + action_h + 1).max(4);
+    let cov_h = (area.width / 2).saturating_sub(1).clamp(5, 13).min(max_cov_h);
+    let cov_w = (cov_h * 2 + 2).min(area.width);
+    let cov_rect = Rect::new(
+        area.x + area.width.saturating_sub(cov_w) / 2,
+        area.y,
+        cov_w,
+        cov_h,
+    );
+
+    if !art_id.is_empty() && !rect_intersects_optional(cov_rect, modal_rect) {
+        render_thumbnail_cover(frame, cov_rect, &art_id, state, "ART");
     } else {
         frame.render_widget(
             Paragraph::new("\n◈\nYTM")
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(pal.primary).bg(Color::Reset)),
-            parts[0],
+            cov_rect,
         );
     }
 
-    let w = parts[1].width as usize;
-    let marq = marquee_window(&title, w.max(6), state.ticker_step);
-    let sub_line = if let Some(ref alb) = album_opt {
-        format!("{artist} · {alb}")
-    } else {
-        artist
+    let info_y = area.y + cov_h + if area.height > cov_h + meta_h + action_h { 1 } else { 0 };
+    let info_h = area.height.saturating_sub(info_y - area.y + action_h);
+    let info_rect = Rect::new(area.x, info_y, area.width, info_h);
+    if info_rect.height >= 2 {
+        let w = info_rect.width as usize;
+        let badge_prefix = format!("[{kind_badge}] ");
+        let title_budget = w.saturating_sub(badge_prefix.chars().count()).max(6);
+        let marq = marquee_window(&title, title_budget, state.ticker_step);
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                badge_prefix,
+                Style::default()
+                    .fg(pal.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                marq,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        for (k, val, col) in meta_rows {
+            if lines.len() >= info_rect.height as usize {
+                break;
+            }
+            let key_lbl = format!("{k:<6} : ");
+            let val_w = w.saturating_sub(key_lbl.chars().count()).max(4);
+            lines.push(Line::from(vec![
+                Span::styled(key_lbl, Style::default().fg(pal.text_dim)),
+                Span::styled(truncate_str(&val, val_w), Style::default().fg(col)),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), info_rect);
+    }
+
+    let act_y = area.y + area.height.saturating_sub(action_h);
+    let act_rect = Rect::new(area.x, act_y, area.width, action_h);
+    let mut pills: Vec<InfoPill> = Vec::new();
+    let push_pill = |pills: &mut Vec<InfoPill>, label: &str, hit: MusicHit, fg: Color, bg: Color| {
+        pills.push(InfoPill {
+            label: label.to_string(),
+            hit,
+            fg,
+            bg,
+        });
     };
     if is_preview {
-        let kind = preview_kind.unwrap_or(YtmItemKind::Song);
+        let kind = preview.as_ref().map(|p| p.kind).unwrap_or(YtmItemKind::Song);
         let play_lbl = match kind {
-            YtmItemKind::Video => " [▸ Watch Video] ",
-            YtmItemKind::Album | YtmItemKind::Playlist | YtmItemKind::Artist => " [◈ Open] ",
-            _ => " [▸ Play Now] ",
+            YtmItemKind::Video => " ▶ Watch ",
+            YtmItemKind::Album | YtmItemKind::Playlist | YtmItemKind::Artist => " ◈ Open ",
+            _ => " ▶ Play ",
         };
-        let pw = play_lbl.chars().count() as u16;
-        let btn_y = parts[1].y + 3;
-        let mut bx = parts[1].x;
-        let mut btn_spans = Vec::new();
-        if bx + pw <= parts[1].x + parts[1].width {
-            state
-                .music
-                .hitboxes
-                .push((Rect::new(bx, btn_y, pw, 1), MusicHit::PreviewPlay));
-            btn_spans.push(Span::styled(
-                play_lbl,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(30, 215, 96))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            bx += pw + 1;
+        push_pill(&mut pills, play_lbl, MusicHit::PreviewPlay, Color::Black, spotify_green);
+        if let Some(vid) = preview.as_ref().and_then(|p| p.video_id.as_deref()) {
+            let liked = state.music.liked_ids.contains(vid);
+            push_pill(
+                &mut pills,
+                if liked { " ♥ Liked " } else { " ♡ Like " },
+                MusicHit::TogglePreviewLike,
+                if liked { Color::Black } else { Color::White },
+                if liked { Color::Rgb(255, 110, 150) } else { Color::Rgb(46, 52, 68) },
+            );
         }
         if cur_track.is_some() {
-            let np_lbl = " [Live] ";
-            let nw = np_lbl.chars().count() as u16;
-            if bx + nw <= parts[1].x + parts[1].width {
-                state
-                    .music
-                    .hitboxes
-                    .push((Rect::new(bx, btn_y, nw, 1), MusicHit::ShowNowPlaying));
-                btn_spans.push(Span::raw(" "));
-                btn_spans.push(Span::styled(
-                    np_lbl,
-                    Style::default()
-                        .fg(pal.accent)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
+            push_pill(
+                &mut pills,
+                " ← Playing ",
+                MusicHit::ShowNowPlaying,
+                Color::Black,
+                pal.accent,
+            );
         }
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    format!("[{}] 2x-click to run", kind.badge()),
-                    Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    marq,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    truncate_str(&sub_line, w),
-                    Style::default().fg(pal.text_dim),
-                )),
-                Line::from(btn_spans),
-            ]),
-            parts[1],
+    } else if let Some(ref tr) = cur_track {
+        let liked = state.music.liked_ids.contains(&tr.video_id);
+        push_pill(
+            &mut pills,
+            if liked { " ♥ Liked " } else { " ♡ Like " },
+            MusicHit::ToggleLike,
+            if liked { Color::Black } else { Color::White },
+            if liked { Color::Rgb(255, 110, 150) } else { Color::Rgb(46, 52, 68) },
         );
-    } else {
-        let album_btn_rect = Rect::new(parts[1].x, parts[1].y + 2, parts[1].width, 1);
-        if cur_track.as_ref().is_some_and(|t| t.album_browse_id.is_some()) {
-            state
-                .music
-                .hitboxes
-                .push((album_btn_rect, MusicHit::OpenCurrentAlbum));
+        if tr.album_browse_id.is_some() || state.music.last_opened_collection.is_some() {
+            push_pill(
+                &mut pills,
+                " Open Album ",
+                MusicHit::OpenCurrentAlbum,
+                Color::Black,
+                pal.accent,
+            );
         }
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    marq,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    truncate_str(&sub_line, w),
-                    Style::default().fg(pal.text_dim),
-                )),
-                Line::from(Span::styled(
-                    if cur_track.as_ref().is_some_and(|t| t.album_browse_id.is_some()) {
-                        "[Open Album Popup]"
-                    } else {
-                        ""
-                    },
-                    Style::default().fg(pal.accent),
-                )),
-            ]),
-            parts[1],
+    }
+    if is_preview || cur_track.is_some() {
+        push_pill(
+            &mut pills,
+            " Up Next -> ",
+            MusicHit::SelectRightTab(YtmRightPaneTab::UpNext),
+            pal.text,
+            Color::Rgb(40, 44, 58),
+        );
+        push_pill(
+            &mut pills,
+            " Lyrics -> ",
+            MusicHit::SelectRightTab(YtmRightPaneTab::Lyrics),
+            pal.text,
+            Color::Rgb(40, 44, 58),
         );
     }
-
-    render_drawer_queue_or_lyrics(frame, parts[2], state, &pal);
-}
-
-fn render_drawer_queue_or_lyrics(
-    frame: &mut Frame,
-    area: Rect,
-    state: &mut AppState,
-    theme: &crate::ui::theme::ThemePalette,
-) {
-    if area.height < 3 {
-        return;
-    }
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(2)])
-        .split(area);
-
-    let tab_bar = chunks[0];
-    let up_lbl = format!(" Up Next ({}) ", state.music.queue.len());
-    let lyr_lbl = if state.music.lyrics.as_ref().is_some_and(|l| l.is_timed) {
-        " Lyrics (Sync) ".to_string()
-    } else {
-        " Lyrics ".to_string()
-    };
-    let up_w = up_lbl.chars().count() as u16;
-    let lyr_w = lyr_lbl.chars().count() as u16;
-
-    state.music.hitboxes.push((
-        Rect::new(tab_bar.x, tab_bar.y, up_w, 1),
-        MusicHit::SelectRightTab(YtmRightPaneTab::UpNext),
-    ));
-    state.music.hitboxes.push((
-        Rect::new(tab_bar.x + up_w + 1, tab_bar.y, lyr_w, 1),
-        MusicHit::SelectRightTab(YtmRightPaneTab::Lyrics),
-    ));
-
-    let up_st = if state.music.right_tab == YtmRightPaneTab::UpNext {
-        Style::default()
-            .fg(Color::Black)
-            .bg(theme.primary)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme.text_dim)
-            .bg(Color::Reset)
-    };
-    let lyr_st = if state.music.right_tab == YtmRightPaneTab::Lyrics {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(30, 215, 96))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme.text_dim)
-            .bg(Color::Reset)
-    };
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(up_lbl, up_st),
-            Span::raw(" "),
-            Span::styled(lyr_lbl, lyr_st),
-        ])),
-        tab_bar,
-    );
-
-    let body = chunks[1];
-    match state.music.right_tab {
-        YtmRightPaneTab::UpNext => render_up_next_list(frame, body, state, theme),
-        YtmRightPaneTab::Lyrics => render_lyrics_view(frame, body, state, theme),
-    }
+    render_info_action_pills(frame, act_rect, state, pills);
 }
 
 fn render_bottom_player_bar(
@@ -1627,6 +2074,7 @@ fn render_up_next_list(
     theme: &crate::ui::theme::ThemePalette,
 ) {
     if state.music.queue.is_empty() {
+        state.music.up_next_max_scroll = 0;
         frame.render_widget(
             Paragraph::new("\nQueue empty — double-click album or play song.")
                 .alignment(Alignment::Center)
@@ -1635,27 +2083,94 @@ fn render_up_next_list(
         );
         return;
     }
-
-    let max_vis = area.height as usize;
-    let total = state.music.queue.len();
-    let cur = state.music.queue_index.min(total - 1);
-    let scroll = if cur >= max_vis / 2 && total > max_vis {
-        (cur - max_vis / 2).min(total - max_vis)
-    } else {
-        0
-    };
+    if area.height < 2 {
+        return;
+    }
 
     let spotify_green = Color::Rgb(30, 215, 96);
+    let total = state.music.queue.len();
+    let cur = state.music.queue_index.min(total - 1);
+
+    // Sub-header row with track counter and [Live] snap control when manually scrolled
+    let sub_rect = Rect::new(area.x, area.y, area.width, 1);
+    let left_txt = format!("Playing Track {}/{total}", cur + 1);
+    let mut sub_spans = vec![Span::styled(
+        left_txt.clone(),
+        Style::default()
+            .fg(spotify_green)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if state.music.up_next_manual_scroll {
+        let live_lbl = " [Live] ";
+        let lw = live_lbl.chars().count() as u16;
+        if area.width > left_txt.chars().count() as u16 + lw + 1 {
+            let lx = area.x + area.width - lw;
+            state
+                .music
+                .hitboxes
+                .push((Rect::new(lx, area.y, lw, 1), MusicHit::ResumeLiveQueue));
+            let gap = area.width.saturating_sub(left_txt.chars().count() as u16 + lw);
+            sub_spans.push(Span::raw(" ".repeat(gap as usize)));
+            sub_spans.push(Span::styled(
+                live_lbl,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    } else if area.width >= 32 {
+        let hint = "Wheel ↑/↓";
+        let gap = area
+            .width
+            .saturating_sub(left_txt.chars().count() as u16 + hint.chars().count() as u16);
+        if gap >= 1 {
+            sub_spans.push(Span::raw(" ".repeat(gap as usize)));
+            sub_spans.push(Span::styled(hint, Style::default().fg(theme.text_dim)));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(sub_spans)), sub_rect);
+
+    let list_area = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    let max_vis = list_area.height as usize;
+    if max_vis == 0 {
+        return;
+    }
+
+    let max_scroll = total.saturating_sub(max_vis);
+    state.music.up_next_max_scroll = max_scroll;
+    if !state.music.up_next_manual_scroll {
+        state.music.up_next_scroll = if cur >= max_vis / 2 && total > max_vis {
+            (cur - max_vis / 2).min(max_scroll)
+        } else {
+            0
+        };
+    } else {
+        state.music.up_next_scroll = state.music.up_next_scroll.min(max_scroll);
+    }
+
+    let has_sb = total > max_vis && max_vis >= 2 && list_area.width >= 10;
+    let row_w = if has_sb {
+        list_area.width - 1
+    } else {
+        list_area.width
+    };
+
     for (vi, (q_idx, tr)) in state
         .music
         .queue
         .iter()
         .enumerate()
-        .skip(scroll)
+        .skip(state.music.up_next_scroll)
         .take(max_vis)
         .enumerate()
     {
-        let r = Rect::new(area.x, area.y + vi as u16, area.width, 1);
+        let r = Rect::new(list_area.x, list_area.y + vi as u16, row_w, 1);
         state
             .music
             .hitboxes
@@ -1664,68 +2179,232 @@ fn render_up_next_list(
         let is_cur = q_idx == cur;
         let bg = Color::Reset;
         let lead = if is_cur {
-            "▶ ".to_string()
+            "▸ ".to_string()
+        } else if total >= 100 {
+            format!("{:>3}.", q_idx + 1)
         } else {
             format!("{:>2}.", q_idx + 1)
         };
+        let lead_str = if total >= 100 {
+            format!("{lead:<5}")
+        } else {
+            format!("{lead:<4}")
+        };
+        let lead_w = lead_str.chars().count();
+
         let dur = tr
             .duration_text
             .clone()
             .or_else(|| tr.duration_secs.map(format_duration_secs))
             .unwrap_or_default();
-        let avail = (area.width as usize).saturating_sub(dur.chars().count() + 6);
-        let t_w = (avail * 58) / 100;
-        let a_w = avail.saturating_sub(t_w + 2);
-        let title_str = truncate_str(&tr.title, t_w.max(6));
-        let art_str = if a_w >= 4 && !tr.artist.is_empty() {
-            format!(" · {}", truncate_str(&tr.artist, a_w))
+        let dur_w = dur.chars().count();
+        let right_reserve = if dur_w > 0 { dur_w + 1 } else { 0 };
+        let avail = (row_w as usize).saturating_sub(lead_w + right_reserve);
+        let (title_str, art_str) = if avail >= 22 && !tr.artist.is_empty() {
+            let t_w = (avail * 62) / 100;
+            let a_w = avail.saturating_sub(t_w + 3);
+            (
+                truncate_str(&tr.title, t_w.max(6)),
+                if a_w >= 4 {
+                    format!(" · {}", truncate_str(&tr.artist, a_w))
+                } else {
+                    String::new()
+                },
+            )
         } else {
-            String::new()
+            (truncate_str(&tr.title, avail.max(4)), String::new())
         };
+        let used_meta = title_str.chars().count() + art_str.chars().count();
+        let pad = avail.saturating_sub(used_meta);
+
+        let mut row_spans = vec![
+            Span::styled(
+                lead_str,
+                Style::default()
+                    .fg(if is_cur { spotify_green } else { theme.text_dim })
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                title_str,
+                Style::default()
+                    .fg(if is_cur { spotify_green } else { theme.text })
+                    .bg(bg)
+                    .add_modifier(if is_cur {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(art_str, Style::default().fg(theme.text_dim).bg(bg)),
+        ];
+        if dur_w > 0 {
+            row_spans.push(Span::raw(" ".repeat(pad + 1)));
+            row_spans.push(Span::styled(
+                dur,
+                Style::default().fg(theme.text_dim).bg(bg),
+            ));
+        }
 
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("{lead:<3}"),
-                    Style::default()
-                        .fg(if is_cur { spotify_green } else { theme.text_dim })
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    title_str,
-                    Style::default()
-                        .fg(if is_cur { spotify_green } else { theme.text })
-                        .bg(bg)
-                        .add_modifier(if is_cur {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(art_str, Style::default().fg(theme.text_dim).bg(bg)),
-                Span::styled(
-                    if dur.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {dur}")
-                    },
-                    Style::default().fg(theme.text_dim).bg(bg),
-                ),
-            ]))
-            .style(Style::default().bg(bg)),
+            Paragraph::new(Line::from(row_spans)).style(Style::default().bg(bg)),
             r,
         );
     }
+
+    if has_sb {
+        let sb_rect = Rect::new(
+            list_area.x + list_area.width - 1,
+            list_area.y,
+            1,
+            list_area.height,
+        );
+        render_vertical_scrollbar(
+            frame,
+            sb_rect,
+            state.music.up_next_scroll,
+            max_vis,
+            total,
+            theme.border_idle,
+            spotify_green,
+        );
+    }
+}
+
+/// Word-wrap `text` into segments of at most `max_width` characters, tracking exact
+/// `[char_start, char_end)` positions in `text` for seamless multi-row karaoke sweeps.
+pub fn wrap_lyric_line_with_offsets(text: &str, max_width: usize) -> Vec<(usize, usize, String)> {
+    let w = max_width.max(4);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![(0, 0, String::new())];
+    }
+
+    let mut words: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        words.push((start, i, word));
+    }
+
+    if words.is_empty() {
+        return vec![(0, 0, String::new())];
+    }
+
+    let mut out: Vec<(usize, usize, String)> = Vec::new();
+    let mut cur_start = 0usize;
+    let mut cur_end = 0usize;
+    let mut cur_buf = String::new();
+    let mut cur_len = 0usize;
+
+    for (ws, we, word) in words {
+        let wlen = we - ws;
+        if !cur_buf.is_empty() && cur_len + 1 + wlen <= w {
+            cur_buf.push(' ');
+            cur_buf.push_str(&word);
+            cur_end = we;
+            cur_len += 1 + wlen;
+            continue;
+        }
+        if !cur_buf.is_empty() {
+            out.push((cur_start, cur_end, std::mem::take(&mut cur_buf)));
+            cur_len = 0;
+        }
+        if wlen <= w {
+            cur_start = ws;
+            cur_end = we;
+            cur_buf = word;
+            cur_len = wlen;
+        } else {
+            // Split oversized single word into max_width chunks
+            let wchars: Vec<char> = word.chars().collect();
+            for (ci, chunk) in wchars.chunks(w).enumerate() {
+                let cs = ws + ci * w;
+                let ce = cs + chunk.len();
+                let s: String = chunk.iter().collect();
+                if ce < we {
+                    out.push((cs, ce, s));
+                } else {
+                    cur_start = cs;
+                    cur_end = ce;
+                    cur_buf = s;
+                    cur_len = chunk.len();
+                }
+            }
+        }
+    }
+
+    if !cur_buf.is_empty() {
+        out.push((cur_start, cur_end, cur_buf));
+    }
+    out
+}
+
+/// Compute normalized `0.0..=1.0` karaoke sweep progress inside a timed lyric line.
+pub fn karaoke_progress(
+    pos_ms: u64,
+    start_ms: u64,
+    end_ms: Option<u64>,
+    next_start_ms: Option<u64>,
+) -> f64 {
+    let t1 = end_ms
+        .filter(|&e| e > start_ms)
+        .or_else(|| next_start_ms.filter(|&ns| ns > start_ms))
+        .unwrap_or(start_ms.saturating_add(4000));
+    let dur = t1.saturating_sub(start_ms).max(250) as f64;
+    ((pos_ms.saturating_sub(start_ms)) as f64 / dur).clamp(0.0, 1.0)
+}
+
+/// Split a wrapped lyric chunk into (sung, tip, unsung) text slices given global `sung_chars`.
+pub fn karaoke_chunk_parts(
+    chunk: &str,
+    chunk_start: usize,
+    total_chars: usize,
+    sung_chars: usize,
+) -> (String, String, String) {
+    let chunk_chars: Vec<char> = chunk.chars().collect();
+    let len = chunk_chars.len();
+    if len == 0 || total_chars == 0 || sung_chars == 0 {
+        return (String::new(), String::new(), chunk.to_string());
+    }
+    if sung_chars >= total_chars {
+        return (chunk.to_string(), String::new(), String::new());
+    }
+
+    let tip_global = sung_chars - 1;
+    let chunk_end = chunk_start + len;
+    if tip_global < chunk_start {
+        return (String::new(), String::new(), chunk.to_string());
+    }
+    if tip_global >= chunk_end {
+        return (chunk.to_string(), String::new(), String::new());
+    }
+
+    let tip_local = tip_global - chunk_start;
+    let sung: String = chunk_chars[..tip_local].iter().collect();
+    let tip: String = chunk_chars[tip_local..tip_local + 1].iter().collect();
+    let unsung: String = chunk_chars[tip_local + 1..].iter().collect();
+    (sung, tip, unsung)
 }
 
 fn render_lyrics_view(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
+    state: &mut AppState,
     theme: &crate::ui::theme::ThemePalette,
 ) {
     if state.music.lyrics_loading {
+        state.music.lyrics_max_scroll = 0;
         frame.render_widget(
             Paragraph::new("\nLoading lyrics…")
                 .alignment(Alignment::Center)
@@ -1735,7 +2414,8 @@ fn render_lyrics_view(
         return;
     }
 
-    let Some(ref lyrics) = state.music.lyrics else {
+    let Some(lyrics) = state.music.lyrics.clone() else {
+        state.music.lyrics_max_scroll = 0;
         let msg = if state.music.lyrics_browse_id.is_none() && state.music.current_track().is_some()
         {
             "\nLyrics unavailable for this track."
@@ -1752,6 +2432,7 @@ fn render_lyrics_view(
     };
 
     if lyrics.lines.is_empty() {
+        state.music.lyrics_max_scroll = 0;
         frame.render_widget(
             Paragraph::new("\nInstrumental / no lyrics.")
                 .alignment(Alignment::Center)
@@ -1760,50 +2441,310 @@ fn render_lyrics_view(
         );
         return;
     }
+    if area.height < 3 {
+        return;
+    }
 
-    let max_vis = area.height.saturating_sub(1) as usize;
-    let active_idx = state.music.active_lyric_index(state.active_playback_pos);
-    let scroll = if let Some(act) = active_idx {
-        if act >= max_vis / 2 && lyrics.lines.len() > max_vis {
-            (act - max_vis / 2).min(lyrics.lines.len() - max_vis)
-        } else {
-            0
+    let spotify_green = Color::Rgb(30, 215, 96);
+    let sub_rect = Rect::new(area.x, area.y, area.width, 1);
+    let left_lbl = if lyrics.is_timed {
+        "LIVE KARAOKE · Synced"
+    } else {
+        "LYRICS · Unsynced"
+    };
+    let mut sub_spans = vec![Span::styled(
+        left_lbl,
+        Style::default()
+            .fg(if lyrics.is_timed {
+                spotify_green
+            } else {
+                theme.accent
+            })
+            .add_modifier(Modifier::BOLD),
+    )];
+    if state.music.lyrics_manual_scroll {
+        let fl_lbl = " [Follow Live] ";
+        let fw = fl_lbl.chars().count() as u16;
+        if area.width > left_lbl.chars().count() as u16 + fw + 1 {
+            let fx = area.x + area.width - fw;
+            state
+                .music
+                .hitboxes
+                .push((Rect::new(fx, area.y, fw, 1), MusicHit::ResumeLiveLyrics));
+            let gap = area
+                .width
+                .saturating_sub(left_lbl.chars().count() as u16 + fw);
+            sub_spans.push(Span::raw(" ".repeat(gap as usize)));
+            sub_spans.push(Span::styled(
+                fl_lbl,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(spotify_green)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
+    } else if lyrics.is_timed && area.width >= 36 {
+        let hint = "Click line to seek";
+        let gap = area
+            .width
+            .saturating_sub(left_lbl.chars().count() as u16 + hint.chars().count() as u16);
+        if gap >= 1 {
+            sub_spans.push(Span::raw(" ".repeat(gap as usize)));
+            sub_spans.push(Span::styled(hint, Style::default().fg(theme.text_dim)));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(sub_spans)), sub_rect);
+
+    let footer_h: u16 = if lyrics.source.is_some() && area.height >= 5 {
+        1
     } else {
         0
     };
+    let body_area = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1 + footer_h),
+    );
+    let view_h = body_area.height as usize;
+    if view_h == 0 {
+        return;
+    }
 
-    let mut rendered_lines: Vec<Line> = Vec::new();
-    for (idx, line) in lyrics.lines.iter().enumerate().skip(scroll).take(max_vis) {
+    struct LyricVisualRow {
+        spans: Vec<Span<'static>>,
+        seek_ms: Option<u64>,
+        is_focus: bool,
+    }
+
+    let pos_ms = (state.active_playback_pos.max(0.0) * 1000.0) as u64;
+    let active_idx = state.music.active_lyric_index(state.active_playback_pos);
+
+    // Pre-pass: check if scrollbar is needed at full width - 1
+    let probe_w = (body_area.width.saturating_sub(3) as usize).max(8);
+    let mut est_rows = 0usize;
+    for l in &lyrics.lines {
+        est_rows += wrap_lyric_line_with_offsets(&l.text, probe_w).len();
+    }
+    let has_sb = est_rows + 1 > view_h && view_h >= 2 && body_area.width >= 10;
+    let row_w = if has_sb {
+        body_area.width - 1
+    } else {
+        body_area.width
+    };
+    let text_w = (row_w.saturating_sub(2) as usize).max(6);
+
+    let mut visual_rows: Vec<LyricVisualRow> = Vec::new();
+    let in_intro = lyrics.is_timed
+        && lyrics
+            .lines
+            .first()
+            .and_then(|l| l.start_ms)
+            .is_some_and(|s| s > 1500 && pos_ms < s);
+    if in_intro {
+        visual_rows.push(LyricVisualRow {
+            spans: vec![
+                Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(spotify_green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "◈ • • • (Intro)",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            seek_ms: lyrics.lines.first().and_then(|l| l.start_ms),
+            is_focus: true,
+        });
+    }
+
+    for (idx, line) in lyrics.lines.iter().enumerate() {
         let is_active = active_idx == Some(idx);
         let is_past = active_idx.is_some_and(|a| idx < a);
-        let st = if is_active {
-            Style::default()
-                .fg(Color::Rgb(30, 215, 96))
-                .add_modifier(Modifier::BOLD)
-        } else if is_past {
-            Style::default().fg(theme.text_dim)
+        let is_next = active_idx.is_some_and(|a| idx == a + 1);
+        let next_start = lyrics.lines.get(idx + 1).and_then(|n| n.start_ms);
+
+        let in_post_interlude = is_active
+            && line.end_ms.is_some_and(|e| {
+                next_start.is_some_and(|ns| ns > e + 3000) && pos_ms > e + 1000
+            });
+
+        if line.text.trim().is_empty() {
+            visual_rows.push(LyricVisualRow {
+                spans: vec![Span::styled("  ◈ • • •", Style::default().fg(theme.text_dim))],
+                seek_ms: line.start_ms,
+                is_focus: is_active && !in_post_interlude,
+            });
+            continue;
+        }
+
+        let chunks = wrap_lyric_line_with_offsets(&line.text, text_w);
+        let total_chars = line.text.chars().count();
+        let sung_chars = if is_active {
+            if let Some(t0) = line.start_ms {
+                let p = karaoke_progress(pos_ms, t0, line.end_ms, next_start);
+                ((p * total_chars as f64).round() as usize).min(total_chars)
+            } else {
+                total_chars
+            }
         } else {
-            Style::default().fg(Color::White)
+            0
         };
-        let prefix = if is_active { "▸ " } else { "  " };
-        rendered_lines.push(Line::from(Span::styled(
-            format!("{prefix}{}", line.text),
-            st,
-        )));
+
+        for (ci, (cs, _ce, chunk)) in chunks.into_iter().enumerate() {
+            let prefix = if is_active && !in_post_interlude && ci == 0 {
+                "▸ "
+            } else {
+                "  "
+            };
+            let pfx_style = if is_active && !in_post_interlude {
+                Style::default()
+                    .fg(spotify_green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_dim)
+            };
+
+            let mut spans = vec![Span::styled(prefix, pfx_style)];
+            if is_active {
+                let (sung, tip, unsung) =
+                    karaoke_chunk_parts(&chunk, cs, total_chars, sung_chars);
+                if !sung.is_empty() {
+                    spans.push(Span::styled(
+                        sung,
+                        Style::default()
+                            .fg(spotify_green)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if !tip.is_empty() {
+                    spans.push(Span::styled(
+                        tip,
+                        Style::default()
+                            .fg(Color::Rgb(175, 255, 210))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if !unsung.is_empty() {
+                    spans.push(Span::styled(
+                        unsung,
+                        Style::default()
+                            .fg(Color::Rgb(225, 230, 238))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+            } else if is_past {
+                spans.push(Span::styled(chunk, Style::default().fg(theme.text_dim)));
+            } else if is_next {
+                spans.push(Span::styled(
+                    chunk,
+                    Style::default().fg(Color::Rgb(205, 212, 224)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    chunk,
+                    Style::default().fg(Color::Rgb(155, 162, 175)),
+                ));
+            }
+
+            visual_rows.push(LyricVisualRow {
+                spans,
+                seek_ms: line.start_ms,
+                is_focus: is_active && !in_post_interlude && ci == 0,
+            });
+        }
+
+        if in_post_interlude {
+            visual_rows.push(LyricVisualRow {
+                spans: vec![
+                    Span::styled(
+                        "▸ ",
+                        Style::default()
+                            .fg(spotify_green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "◈ • • •",
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ],
+                seek_ms: next_start,
+                is_focus: true,
+            });
+        }
     }
 
-    if let Some(ref src) = lyrics.source {
-        rendered_lines.push(Line::from(Span::styled(
-            format!("  {src}"),
-            Style::default().fg(theme.text_dim),
-        )));
+    let total_vis = visual_rows.len();
+    let max_scroll = total_vis.saturating_sub(view_h);
+    state.music.lyrics_max_scroll = max_scroll;
+    if !state.music.lyrics_manual_scroll {
+        let focus_row = visual_rows.iter().position(|r| r.is_focus);
+        state.music.lyrics_scroll = if let Some(f) = focus_row {
+            if total_vis > view_h {
+                f.saturating_sub(view_h / 3).min(max_scroll)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+    } else {
+        state.music.lyrics_scroll = state.music.lyrics_scroll.min(max_scroll);
     }
 
-    frame.render_widget(
-        Paragraph::new(rendered_lines).wrap(Wrap { trim: true }),
-        area,
-    );
+    let show_sb = total_vis > view_h && view_h >= 2 && body_area.width >= 10;
+    let draw_w = if show_sb {
+        body_area.width - 1
+    } else {
+        body_area.width
+    };
+    for (vi, vr) in visual_rows
+        .into_iter()
+        .skip(state.music.lyrics_scroll)
+        .take(view_h)
+        .enumerate()
+    {
+        let r = Rect::new(body_area.x, body_area.y + vi as u16, draw_w, 1);
+        if let Some(ms) = vr.seek_ms {
+            state.music.hitboxes.push((r, MusicHit::SeekLyricMs(ms)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(vr.spans)), r);
+    }
+
+    if show_sb {
+        let sb_rect = Rect::new(
+            body_area.x + body_area.width - 1,
+            body_area.y,
+            1,
+            body_area.height,
+        );
+        render_vertical_scrollbar(
+            frame,
+            sb_rect,
+            state.music.lyrics_scroll,
+            view_h,
+            total_vis,
+            theme.border_idle,
+            spotify_green,
+        );
+    }
+
+    if footer_h > 0 {
+        if let Some(ref src) = lyrics.source {
+            let f_rect = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+            frame.render_widget(
+                Paragraph::new(truncate_str(&format!("  {src}"), area.width as usize))
+                    .style(Style::default().fg(theme.text_dim)),
+                f_rect,
+            );
+        }
+    }
 }
 
 /// Interactive row inside the unified Album / Playlist / Artist popup body.
@@ -3931,5 +4872,199 @@ mod tests {
         for bad in ["🔀", "📻", "💾", "⚙", "➕", "❌", "♪"] {
             assert!(!set_text.contains(bad), "unexpected emoji {bad} in settings modal");
         }
+    }
+
+    #[test]
+    fn test_music_layout_dims_and_snug_grid_cols() {
+        let wide = music_layout_dims(160, true);
+        assert_eq!(wide.sidebar_w, 23);
+        assert_eq!(wide.drawer_w, 46);
+        assert_eq!(wide.stage_w, 91);
+
+        let std_wide = music_layout_dims(140, true);
+        assert_eq!(std_wide.sidebar_w, 23);
+        assert_eq!(std_wide.drawer_w, 42);
+        assert_eq!(std_wide.stage_w, 75);
+        assert_eq!(spotify_grid_cols(std_wide.stage_w.saturating_sub(2)), 3);
+
+        let med = music_layout_dims(110, true);
+        assert_eq!(med.sidebar_w, 19);
+        assert_eq!(med.drawer_w, 35);
+        assert_eq!(spotify_grid_cols(med.stage_w.saturating_sub(2)), 2);
+
+        let closed = music_layout_dims(140, false);
+        assert_eq!(closed.drawer_w, 0);
+        assert_eq!(closed.stage_w, 117);
+        assert_eq!(spotify_grid_cols(closed.stage_w.saturating_sub(2)), 5);
+    }
+
+    #[test]
+    fn test_karaoke_wrap_and_sweep_split() {
+        let line = "Walking down the quiet hallway tonight";
+        let chunks = wrap_lyric_line_with_offsets(line, 22);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].2, "Walking down the quiet");
+        assert_eq!(chunks[1].2, "hallway tonight");
+        assert_eq!(chunks[0].0, 0);
+        assert_eq!(chunks[1].0, 23);
+
+        let total_chars = line.chars().count();
+        assert_eq!(karaoke_progress(1_000, 1_000, Some(5_000), None), 0.0);
+        assert_eq!(karaoke_progress(3_000, 1_000, Some(5_000), None), 0.5);
+        assert_eq!(karaoke_progress(6_000, 1_000, Some(5_000), None), 1.0);
+        // Fallback to next line start_ms then +4000ms
+        assert_eq!(karaoke_progress(3_000, 1_000, None, Some(5_000)), 0.5);
+        assert_eq!(karaoke_progress(3_000, 1_000, None, None), 0.5);
+
+        // Sweep positioned in chunk 1 (sung_chars = 30 -> chunk 0 fully sung, chunk 1 split)
+        let (s0, t0, u0) = karaoke_chunk_parts(&chunks[0].2, chunks[0].0, total_chars, 30);
+        assert_eq!(s0, "Walking down the quiet");
+        assert!(t0.is_empty());
+        assert!(u0.is_empty());
+
+        let (s1, t1, u1) = karaoke_chunk_parts(&chunks[1].2, chunks[1].0, total_chars, 30);
+        assert_eq!(s1, "hallwa");
+        assert_eq!(t1, "y");
+        assert_eq!(u1, " tonight");
+    }
+
+    #[test]
+    fn test_sidebar_scroll_and_three_tab_right_drawer() {
+        let mut st = AppState::new(Config::default());
+        st.active_category = st
+            .categories
+            .iter()
+            .position(|(c, _)| *c == Category::Music)
+            .unwrap();
+        let lib_items: Vec<YtmShelfItem> = (0..24)
+            .map(|i| YtmShelfItem {
+                kind: YtmItemKind::Playlist,
+                title: format!("Mix {i:02}"),
+                subtitle: "Playlist".to_string(),
+                video_id: None,
+                browse_id: Some(format!("VLPL_{i}")),
+                playlist_id: None,
+                params: None,
+                thumb_url: String::new(),
+                duration_secs: None,
+            })
+            .collect();
+        st.music.library_page = Some(YtmPage {
+            shelves: vec![YtmShelf {
+                title: "Playlists".to_string(),
+                items: lib_items,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        st.music.sidebar_scroll = 10;
+
+        st.music.queue = (0..18)
+            .map(|i| YtmTrack {
+                video_id: format!("vid_{i}"),
+                title: format!("Track {i:02}"),
+                artist: "Artist".to_string(),
+                artist_browse_id: None,
+                album: Some("Census Designated".to_string()),
+                album_browse_id: Some("MPREb_cd".to_string()),
+                duration_text: Some("3:30".to_string()),
+                duration_secs: Some(210),
+                plays_text: None,
+                thumb_url: String::new(),
+                playlist_id: None,
+                kind: YtmItemKind::Song,
+            })
+            .collect();
+        st.music.lyrics = Some(YtmLyrics {
+            lines: vec![
+                YtmLyricLine {
+                    text: "Line one of the song".to_string(),
+                    start_ms: Some(1_000),
+                    end_ms: Some(4_000),
+                },
+                YtmLyricLine {
+                    text: "Line two wraps cleanly inside the wider drawer".to_string(),
+                    start_ms: Some(5_000),
+                    end_ms: Some(9_000),
+                },
+            ],
+            source: Some("Source: Musixmatch".to_string()),
+            is_timed: true,
+        });
+        st.active_playback_pos = 6.5;
+
+        let backend = TestBackend::new(140, 32);
+        let mut term = Terminal::new(backend).unwrap();
+
+        // 1. Up Next tab + scrolled sidebar
+        st.music.right_tab = YtmRightPaneTab::UpNext;
+        term.draw(|f| crate::ui::home::render_home_screen(f, &mut st, None))
+            .unwrap();
+        let up_text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(up_text.contains("Mix 10"));
+        assert!(!up_text.contains("Mix 00"));
+        assert!(st
+            .music
+            .hitboxes
+            .iter()
+            .any(|(_, h)| *h == MusicHit::OpenSidebarPlaylist(10)));
+        assert!(up_text.contains("Up Next (18)"));
+        assert!(up_text.contains("Info"));
+        assert!(up_text.contains("Playing Track 1/18"));
+        assert!(st.music.sidebar_rect.width > 0);
+        assert!(st.music.right_drawer_rect.width == 42);
+
+        // 2. Lyrics tab (karaoke + click-to-seek + manual scroll pill)
+        st.music.right_tab = YtmRightPaneTab::Lyrics;
+        st.music.lyrics_manual_scroll = true;
+        st.music.lyrics_scroll = 999; // should clamp cleanly
+        term.draw(|f| crate::ui::home::render_home_screen(f, &mut st, None))
+            .unwrap();
+        let lyr_text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(st.music.lyrics_scroll <= st.music.lyrics_max_scroll);
+        assert!(lyr_text.contains("LIVE KARAOKE"));
+        assert!(lyr_text.contains("Follow Live"));
+        assert!(st
+            .music
+            .hitboxes
+            .iter()
+            .any(|(_, h)| *h == MusicHit::ResumeLiveLyrics));
+        assert!(st
+            .music
+            .hitboxes
+            .iter()
+            .any(|(_, h)| *h == MusicHit::SeekLyricMs(5_000)));
+
+        // 3. Info tab (metadata + action pills + preview inspector)
+        st.music.right_tab = YtmRightPaneTab::Info;
+        term.draw(|f| crate::ui::home::render_home_screen(f, &mut st, None))
+            .unwrap();
+        let info_text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(info_text.contains("Census Designated"));
+        assert!(info_text.contains("Track 1 of 18"));
+        assert!(info_text.contains("Open Album"));
+        assert!(st
+            .music
+            .hitboxes
+            .iter()
+            .any(|(_, h)| *h == MusicHit::OpenCurrentAlbum));
     }
 }

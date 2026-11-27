@@ -2757,6 +2757,8 @@ async fn handle_app_message(
             {
                 state.music.lyrics = Some(lyrics);
                 state.music.lyrics_loading = false;
+                state.music.lyrics_manual_scroll = false;
+                state.music.lyrics_scroll = 0;
             }
         }
         AppMessage::MusicAlbumPopupLoaded {
@@ -3979,18 +3981,8 @@ fn prepare_album_queue(tracks: &[YtmTrack], header_playlist_id: Option<&str>) ->
 
 fn music_grid_cols(state: &AppState) -> usize {
     let total_w = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
-    let sidebar_w = if total_w >= 68 {
-        if total_w >= 120 { 24 } else { 19 }
-    } else {
-        0
-    };
-    let drawer_w = if state.music.right_drawer_open && total_w >= 104 {
-        if total_w >= 136 { 35 } else { 29 }
-    } else {
-        0
-    };
-    let stage_w = total_w.saturating_sub(sidebar_w + drawer_w).max(32);
-    ui::music::spotify_grid_cols(stage_w)
+    let dims = ui::music::music_layout_dims(total_w, state.music.right_drawer_open);
+    ui::music::spotify_grid_cols(dims.stage_w.saturating_sub(2))
 }
 
 fn go_back_music(state: &mut AppState) {
@@ -4057,9 +4049,14 @@ async fn play_music_track_at(
     state.music.queue_index = queue_idx;
     state.music.queue_cursor = queue_idx;
     state.music.preview_item = None;
+    state.music.up_next_manual_scroll = false;
+    state.music.up_next_scroll = 0;
+    state.music.lyrics_manual_scroll = false;
+    state.music.lyrics_scroll = 0;
     state.music.lyrics = None;
     state.music.lyrics_browse_id = None;
     state.music.lyrics_loading = false;
+    state.kitty_flush_needed = true;
     state.live_playback.paused = false;
     state.live_playback.is_live_stream = false;
 
@@ -5018,12 +5015,28 @@ async fn handle_music_mouse_event(
                             state.music.last_click = Some((idx, now));
                             state.music.preview_item =
                                 state.music.selectable_items().get(idx).cloned();
+                            if state.music.right_drawer_open
+                                && state.music.preview_item.is_some()
+                            {
+                                state.music.right_tab = YtmRightPaneTab::Info;
+                            }
                             state.kitty_flush_needed = true;
                         }
                     }
                     MusicHit::PreviewPlay => {
                         state.music.preview_item = None;
+                        state.kitty_flush_needed = true;
                         activate_music_item(state.music.cursor, state, pool, tx, client).await;
+                    }
+                    MusicHit::TogglePreviewLike => {
+                        if let Some(vid) = state
+                            .music
+                            .preview_item
+                            .as_ref()
+                            .and_then(|p| p.video_id.clone())
+                        {
+                            toggle_music_track_like(vid, state, client);
+                        }
                     }
                     MusicHit::ShowNowPlaying => {
                         state.music.preview_item = None;
@@ -5146,11 +5159,39 @@ async fn handle_music_mouse_event(
                         }
                     }
                     MusicHit::SelectRightTab(tab) => {
+                        if state.music.right_tab != tab || !state.music.right_drawer_open {
+                            state.kitty_flush_needed = true;
+                        }
                         state.music.right_tab = tab;
                         state.music.right_drawer_open = true;
                     }
                     MusicHit::SelectQueueTrack(q_idx) => {
                         play_music_track_at(q_idx, None, false, state, pool, tx, client).await;
+                    }
+                    MusicHit::ResumeLiveLyrics => {
+                        state.music.lyrics_manual_scroll = false;
+                    }
+                    MusicHit::ResumeLiveQueue => {
+                        state.music.up_next_manual_scroll = false;
+                    }
+                    MusicHit::SeekLyricMs(ms) => {
+                        let target = (ms as f64) / 1000.0;
+                        state.music.lyrics_manual_scroll = false;
+                        if state.has_live_ipc() {
+                            state.active_playback_pos = target;
+                            state.send_player_cmd(PlayerCommand::SeekAbsolute(target));
+                        } else if state.music.current_track().is_some() {
+                            play_music_track_at(
+                                state.music.queue_index,
+                                Some(target),
+                                false,
+                                state,
+                                pool,
+                                tx,
+                                client,
+                            )
+                            .await;
+                        }
                     }
                     MusicHit::SeekBar => {
                         if state.has_live_ipc() && rect.width > 1 {
@@ -5175,15 +5216,59 @@ async fn handle_music_mouse_event(
             }
             false
         }
-        MouseEventKind::ScrollDown => {
-            let total = state.music.selectable_items().len();
-            if total > 0 {
-                state.music.cursor = (state.music.cursor + 3).min(total - 1);
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
+            let step_scroll = |cur: usize, max: usize| -> usize {
+                if down {
+                    (cur + 2).min(max)
+                } else {
+                    cur.saturating_sub(2)
+                }
+            };
+            let in_rect = |r: ratatui::layout::Rect| {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            if in_rect(state.music.sidebar_rect) {
+                let max_scroll = state
+                    .music
+                    .sidebar_total
+                    .saturating_sub(state.music.sidebar_visible_rows);
+                state.music.sidebar_scroll = step_scroll(state.music.sidebar_scroll, max_scroll);
+                return true;
             }
-            true
-        }
-        MouseEventKind::ScrollUp => {
-            state.music.cursor = state.music.cursor.saturating_sub(3);
+            if in_rect(state.music.right_drawer_rect) {
+                match state.music.right_tab {
+                    YtmRightPaneTab::UpNext => {
+                        state.music.up_next_scroll = step_scroll(
+                            state.music.up_next_scroll,
+                            state.music.up_next_max_scroll,
+                        );
+                        state.music.up_next_manual_scroll = true;
+                    }
+                    YtmRightPaneTab::Lyrics => {
+                        state.music.lyrics_scroll = step_scroll(
+                            state.music.lyrics_scroll,
+                            state.music.lyrics_max_scroll,
+                        );
+                        state.music.lyrics_manual_scroll = true;
+                    }
+                    YtmRightPaneTab::Info => {}
+                }
+                return true;
+            }
+            let total = state.music.selectable_items().len();
+            if down {
+                if total > 0 {
+                    state.music.cursor = (state.music.cursor + 3).min(total - 1);
+                }
+            } else {
+                state.music.cursor = state.music.cursor.saturating_sub(3);
+            }
             true
         }
         _ => false,
@@ -5424,11 +5509,20 @@ async fn handle_music_key_event(
                 .await;
             }
         }
-        KeyCode::Char('y') => {
-            state.music.right_tab = match state.music.right_tab {
-                YtmRightPaneTab::UpNext => YtmRightPaneTab::Lyrics,
-                YtmRightPaneTab::Lyrics => YtmRightPaneTab::UpNext,
+        KeyCode::Char('u') | KeyCode::Char('y') | KeyCode::Char('i') => {
+            let target = match code {
+                KeyCode::Char('u') => YtmRightPaneTab::UpNext,
+                KeyCode::Char('i') => YtmRightPaneTab::Info,
+                _ => match state.music.right_tab {
+                    YtmRightPaneTab::Lyrics => YtmRightPaneTab::UpNext,
+                    YtmRightPaneTab::UpNext | YtmRightPaneTab::Info => YtmRightPaneTab::Lyrics,
+                },
             };
+            if state.music.right_tab != target || !state.music.right_drawer_open {
+                state.kitty_flush_needed = true;
+            }
+            state.music.right_tab = target;
+            state.music.right_drawer_open = true;
         }
         KeyCode::Char('l') => {
             toggle_music_like(state, client);
