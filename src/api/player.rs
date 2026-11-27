@@ -219,8 +219,9 @@ j seek -10
 l seek 10
 LEFT seek -5
 RIGHT seek 5
-UP add volume 5
-DOWN add volume -5
+- add volume -5
+= add volume 5
++ add volume 5
 m cycle mute
 f script-binding phaenna-toggle-fullscreen
 F script-binding phaenna-toggle-fullscreen
@@ -256,10 +257,16 @@ Alt+r script-binding phaenna-toggle-chat-replay
 Alt+l script-binding phaenna-toggle-chat-side
 Alt+s script-binding phaenna-toggle-chat-sort
 Alt+t script-binding phaenna-translate-chat-comment
+UP script-binding phaenna-chat-scroll-up
+DOWN script-binding phaenna-chat-scroll-down
+WHEEL_UP script-binding phaenna-chat-scroll-up
+WHEEL_DOWN script-binding phaenna-chat-scroll-down
 PGUP script-binding phaenna-chat-scroll-up
 PGDWN script-binding phaenna-chat-scroll-down
 Alt+UP script-binding phaenna-chat-scroll-up
 Alt+DOWN script-binding phaenna-chat-scroll-down
+MBTN_LEFT script-binding phaenna-chat-left-click
+MBTN_LEFT_DBL script-binding phaenna-chat-left-dbl
 ; script-binding phaenna-chat-compose
 \ script-binding phaenna-chat-compose
 ' script-binding phaenna-chat-toggle-replies
@@ -1176,14 +1183,23 @@ local chat_items = {}
 local chat_loading = false
 local chat_scroll = 1
 local chat_cursor = 1
+local chat_loading_replies = {}
 local chat_expanded = {}
 local chat_translations = {}
+local chat_media_assets = {}
+local chat_active_sprites = {}
+local chat_rendered_slots = {}
+local chat_hitboxes = {}
+local chat_panel_rect = nil
 local chat_status_msg = nil
 local chat_status_until = 0
 local chat_compose = false
 local chat_compose_buf = ""
 local chat_compose_reply_mode = false
+local chat_compose_target_root_id = nil
+local chat_compose_target_author = nil
 local chat_timer = nil
+local chat_last_ass_sync = 0
 
 local author_palette = {
     "&HFFE87C&", -- Sky cyan
@@ -1247,7 +1263,59 @@ local function wrap_lines(str, max_col)
     return out
 end
 
-local function active_chat_list()
+local function clear_chat_media_slots()
+    for id = 62, 69 do
+        if chat_rendered_slots[id] then
+            mp.commandv("overlay-remove", id)
+            chat_rendered_slots[id] = nil
+        end
+    end
+    chat_active_sprites = {}
+end
+
+local function step_chat_media_frames()
+    if not chat_visible then
+        clear_chat_media_slots()
+        return
+    end
+    local used = {}
+    local now_ms = math.floor(mp.get_time() * 1000)
+    for _, sp in ipairs(chat_active_sprites) do
+        used[sp.id] = true
+        local paths = sp.asset.paths
+        if type(paths) == "table" and #paths > 0 then
+            local delay = math.max(45, sp.asset.delay_ms or 95)
+            local fidx = (math.floor(now_ms / delay) % #paths) + 1
+            local path = paths[fidx]
+            local sig = string.format("%s|%d|%d|%d|%d", path, sp.px, sp.py, sp.pw, sp.ph)
+            if chat_rendered_slots[sp.id] ~= sig then
+                mp.command_native({
+                    name = "overlay-add",
+                    id = sp.id,
+                    x = sp.px,
+                    y = sp.py,
+                    file = path,
+                    offset = 0,
+                    fmt = "bgra",
+                    w = sp.asset.w,
+                    h = sp.asset.h,
+                    stride = sp.asset.w * 4,
+                    dw = sp.pw,
+                    dh = sp.ph,
+                })
+                chat_rendered_slots[sp.id] = sig
+            end
+        end
+    end
+    for id = 62, 69 do
+        if not used[id] and chat_rendered_slots[id] then
+            mp.commandv("overlay-remove", id)
+            chat_rendered_slots[id] = nil
+        end
+    end
+end
+
+local function active_chat_roots()
     if not chat_replay then
         return chat_items
     end
@@ -1265,24 +1333,109 @@ local function active_chat_list()
     return chat_items
 end
 
+local function build_visible_chat_rows()
+    local rows = {}
+    for _, root in ipairs(active_chat_roots()) do
+        local has_children = (type(root.replies) == "table" and #root.replies > 0)
+            or ((root.replies_count or 0) > 0)
+            or (type(root.replies_cont) == "string" and root.replies_cont ~= "")
+        table.insert(rows, {
+            kind = "root",
+            comment = root,
+            root = root,
+            depth = 0,
+            id = root.id,
+            has_children = has_children,
+        })
+        if chat_expanded[root.id] then
+            local reps = type(root.replies) == "table" and root.replies or {}
+            if chat_loading_replies[root.id] and #reps == 0 then
+                table.insert(rows, {
+                    kind = "loading",
+                    root = root,
+                    depth = 1,
+                    id = "load_" .. tostring(root.id),
+                })
+            else
+                for r_i, rep in ipairs(reps) do
+                    table.insert(rows, {
+                        kind = "reply",
+                        comment = rep,
+                        root = root,
+                        depth = 1,
+                        is_last = (r_i == #reps) and not (type(root.replies_cont) == "string" and root.replies_cont ~= ""),
+                        id = rep.id,
+                    })
+                end
+                if chat_loading_replies[root.id] then
+                    table.insert(rows, {
+                        kind = "loading",
+                        root = root,
+                        depth = 1,
+                        id = "load_" .. tostring(root.id),
+                    })
+                elseif type(root.replies_cont) == "string" and root.replies_cont ~= "" then
+                    table.insert(rows, {
+                        kind = "load_more",
+                        root = root,
+                        depth = 1,
+                        cont = root.replies_cont,
+                        id = "more_" .. tostring(root.id),
+                    })
+                end
+            end
+        end
+    end
+    return rows
+end
+
+local function add_hitbox(x0, y0, x1, y1, action, payload)
+    table.insert(chat_hitboxes, {
+        x0 = x0,
+        y0 = y0,
+        x1 = x1,
+        y1 = y1,
+        action = action,
+        payload = payload,
+    })
+end
+
 local function render_chat_overlay()
     if not chat_visible then
+        chat_panel_rect = nil
+        chat_hitboxes = {}
         chat_ov:remove()
+        clear_chat_media_slots()
         return
     end
 
+    local osd_w, osd_h = mp.get_osd_size()
+    if not osd_w or osd_w < 320 then osd_w = 1280 end
+    if not osd_h or osd_h < 200 then osd_h = 720 end
+    local sc = math.min(osd_w / 1280.0, osd_h / 720.0)
+    local ox = math.floor((osd_w - 1280 * sc) / 2)
+    local oy = math.floor((osd_h - 720 * sc) / 2)
+    local function to_px(vx) return math.floor(ox + vx * sc) end
+    local function to_py(vy) return math.floor(oy + vy * sc) end
+    local function to_ps(vs) return math.max(8, math.floor(vs * sc)) end
+
+    chat_hitboxes = {}
+    chat_active_sprites = {}
+    local next_sprite_id = 62
+
     local is_right = (chat_side == "right")
-    local panel_w = (chat_style == "compact") and 390 or 432
-    local x0 = is_right and (1280 - panel_w - 18) or 18
+    local panel_w = (chat_style == "compact") and 404 or 446
+    local x0 = is_right and (1280 - panel_w - 14) or 14
     local x1 = x0 + panel_w
     local tx = x0 + 12
-    local max_cols = (chat_style == "compact") and 44 or 48
+    local max_cols = (chat_style == "compact") and 43 or 48
     local max_msg_lines = (chat_style == "compact") and 14 or 22
+
+    chat_panel_rect = { x0 = x0, y0 = 14, x1 = x1, y1 = 706 }
 
     local parts = {}
 
     if chat_style == "glass" then
-        -- Smooth semi-transparent edge scrim (~20% dark tint), zero harsh box border
         table.insert(parts, string.format(
             "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&HC8&\\p1}m %d 16 l %d 16 l %d 704 l %d 704{\\p0}",
             x0, x1, x1, x0
@@ -1294,126 +1447,193 @@ local function render_chat_overlay()
     end
 
     local style_lbl = (chat_style == "ink" and "TRANSPARENT") or (chat_style == "glass" and "GLASS") or "COMPACT"
-    local mode_lbl = chat_replay and "VOD SYNC" or chat_sort_label
+    local mode_lbl = chat_replay and "VOD" or chat_sort_label
     local count_n = #chat_items
     local hdr_text = string.format(
-        "{\\an7\\pos(%d,18)\\bord1.6\\shad1.4\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs16\\b1\\1c&HF8BD38&}◈ COMMENTS{\\1c&H24BFFB&} · %s (%d) {\\1c&H99D334&}[%s]{\\1c&HC8B8A4&\\b0\\fs13}  [C] Hide  [;] Write",
+        "{\\an7\\pos(%d,18)\\bord1.6\\shad1.4\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs15\\b1\\1c&HF8BD38&}◈ CHAT {\\1c&H24BFFB&}[%s:%d] {\\1c&H99D334&}[%s] {\\1c&HFFE87C&}[Write ;] {\\1c&HC8B8A4&}[✕]",
         tx, mode_lbl, count_n, style_lbl
     )
     table.insert(parts, hdr_text)
+    -- Clickable header controls (Sort / Style / Write / Close)
+    add_hitbox(tx + 72, 16, tx + 152, 40, "toggle_sort", nil)
+    add_hitbox(tx + 154, 16, tx + 260, 40, "cycle_style", nil)
+    add_hitbox(tx + 262, 16, tx + 344, 40, "compose", nil)
+    add_hitbox(tx + 346, 16, x1 - 4, 40, "hide", nil)
 
-    local list = active_chat_list()
-    if #list == 0 then
-        local msg = chat_loading and "Loading live comments…" or (chat_replay and "Waiting for timestamped comments…" or "No comments loaded yet ([Alt+s] refresh)")
+    local rows = build_visible_chat_rows()
+    if #rows == 0 then
+        local msg = chat_loading and "Loading live comments…" or (chat_replay and "Waiting for timestamped comments…" or "No comments loaded ([Alt+s] refresh)")
         table.insert(parts, string.format(
             "{\\an7\\pos(%d,56)\\bord1.5\\shad1.2\\3c&H000000&\\fs15\\1c&HDAD4CE&}%s",
             tx, msg
         ))
     else
         if chat_cursor < 1 then chat_cursor = 1 end
-        if chat_cursor > #list then chat_cursor = #list end
+        if chat_cursor > #rows then chat_cursor = #rows end
         if chat_cursor < chat_scroll then chat_scroll = chat_cursor end
-
-        -- Reserve bottom strip for compose input / status hint
-        local bottom_limit_y = chat_compose and 608 or 672
-        local cur_y = 50
-        local drawn = 0
-        local line_budget = max_msg_lines
-
-        -- Build visible message blocks starting at chat_scroll
         if chat_replay and not chat_compose then
-            chat_scroll = math.max(1, #list - 8)
+            chat_scroll = math.max(1, #rows - 7)
         end
 
-        for idx = chat_scroll, #list do
+        local bottom_limit_y = chat_compose and 606 or 672
+        local cur_y = 50
+        local line_budget = max_msg_lines
+
+        for idx = chat_scroll, #rows do
             if cur_y >= bottom_limit_y or line_budget <= 0 then break end
-            local c = list[idx]
+            local row = rows[idx]
             local is_sel = (idx == chat_cursor)
-            local author = esc_ass(c.author or "@user")
-            local acol = c.creator and "&H4FD5FF&" or (c.self_msg and "&H8CEB78&" or hash_author_color(author))
+            local row_start_y = cur_y
 
-            local badge = ""
-            if c.creator then badge = badge .. "{\\1c&H4FD5FF&\\b1} [CREATOR]{\\b0}" end
-            if c.pinned then badge = badge .. "{\\1c&H24BFFB&\\b1} [PIN]{\\b0}" end
-            if c.self_msg then badge = badge .. "{\\1c&H8CEB78&\\b1} [YOU]{\\b0}" end
-            if type(c.ts) == "number" then
-                badge = badge .. string.format("{\\1c&HF8BD38&} [%s]", fmt_clock(c.ts))
-            end
-
-            local meta_tail = ""
-            if c.likes and c.likes ~= "" and c.likes ~= "0" then
-                meta_tail = meta_tail .. " ♥" .. esc_ass(c.likes)
-            end
-            if c.replies_count and c.replies_count > 0 then
-                meta_tail = meta_tail .. string.format(" · ↳%d", c.replies_count)
-            end
-
-            local sel_mark = is_sel and "{\\1c&HF8BD38&}▸ " or ""
-            table.insert(parts, string.format(
-                "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs14}%s{\\b1\\1c%s}%s{\\b0}%s{\\1c&HAAA49E&\\fs12}%s",
-                tx, cur_y, sel_mark, acol, author, badge, meta_tail
-            ))
-            cur_y = cur_y + 19
-
-            local body_lines = wrap_lines(c.text or "", max_cols)
-            for _, ln in ipairs(body_lines) do
-                if cur_y >= bottom_limit_y then break end
+            if row.kind == "loading" then
                 table.insert(parts, string.format(
-                    "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H20&\\4c&H000000&\\4a&H38&\\fs15\\1c&HFAF7F2&}%s",
-                    tx + (is_sel and 10 or 4), cur_y, ln
+                    "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.3\\3c&H000000&\\fs13\\i1\\1c&H24BFFB&}  ├─ Loading replies…",
+                    tx + 6, cur_y
                 ))
-                cur_y = cur_y + 19
+                cur_y = cur_y + 20
                 line_budget = line_budget - 1
-            end
+            elseif row.kind == "load_more" then
+                local lm_col = is_sel and "&HF8BD38&" or "&H99D334&"
+                local sel_mark = is_sel and "▸ " or "  "
+                table.insert(parts, string.format(
+                    "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.4\\3c&H000000&\\fs13\\b1\\1c%s}%s├─ [+ Load more replies]",
+                    tx + 6, cur_y, lm_col, sel_mark
+                ))
+                add_hitbox(tx, cur_y - 2, x1 - 8, cur_y + 20, "load_more", { index = idx, root = row.root, cont = row.cont })
+                cur_y = cur_y + 22
+                line_budget = line_budget - 1
+            else
+                local c = row.comment
+                local is_sub = (row.depth or 0) > 0
+                local indent_px = is_sub and 18 or 0
+                local sub_rail = is_sub and "{\\1c&H78FFA8&}├─ {\\1c&HFFFFFF&}" or ""
+                local author = esc_ass(c.author or "@user")
+                local acol = c.creator and "&H4FD5FF&" or (c.self_msg and "&H8CEB78&" or hash_author_color(author))
 
-            if chat_translations[c.id] then
-                for _, tl in ipairs(wrap_lines("TR: " .. chat_translations[c.id], max_cols - 2)) do
+                local badge = ""
+                if c.creator then badge = badge .. "{\\1c&H4FD5FF&\\b1} [CREATOR]{\\b0}" end
+                if c.pinned then badge = badge .. "{\\1c&H24BFFB&\\b1} [PIN]{\\b0}" end
+                if c.self_msg then badge = badge .. "{\\1c&H8CEB78&\\b1} [YOU]{\\b0}" end
+                if type(c.ts) == "number" then
+                    badge = badge .. string.format("{\\1c&HF8BD38&} [%s]", fmt_clock(c.ts))
+                end
+
+                local meta_tail = ""
+                if c.likes and c.likes ~= "" and c.likes ~= "0" then
+                    meta_tail = meta_tail .. " ♥" .. esc_ass(c.likes)
+                end
+
+                local fold_pill = ""
+                if row.kind == "root" and row.has_children then
+                    local rep_n = math.max(type(c.replies) == "table" and #c.replies or 0, c.replies_count or 1)
+                    fold_pill = chat_expanded[c.id] and " {\\1c&H24BFFB&\\b1}[-]{\\b0}" or string.format(" {\\1c&H24BFFB&\\b1}[+%d]{\\b0}", rep_n)
+                end
+
+                local action_pills = ""
+                if is_sel then
+                    action_pills = " {\\1c&H99D334&\\b1}[Reply]{\\b0} {\\1c&HFFE87C&\\b1}[TR]{\\b0}"
+                end
+
+                local sel_mark = is_sel and "{\\1c&HF8BD38&}▸ " or ""
+                local rx_text = tx + indent_px
+                table.insert(parts, string.format(
+                    "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs14}%s%s{\\b1\\1c%s}%s{\\b0}%s{\\1c&HAAA49E&\\fs12}%s%s%s",
+                    rx_text, cur_y, sel_mark, sub_rail, acol, author, badge, meta_tail, fold_pill, action_pills
+                ))
+
+                -- Specific action pill hitboxes on the header line
+                if is_sel then
+                    add_hitbox(x1 - 122, cur_y - 2, x1 - 62, cur_y + 18, "reply_row", { index = idx, row = row })
+                    add_hitbox(x1 - 60, cur_y - 2, x1 - 8, cur_y + 18, "translate_row", { index = idx, row = row })
+                end
+                if row.kind == "root" and row.has_children then
+                    add_hitbox(rx_text, cur_y - 2, x1 - 124, cur_y + 18, "toggle_fold", { index = idx, root = row.root })
+                end
+                cur_y = cur_y + 19
+
+                local body_lines = wrap_lines(c.text or "", max_cols - (is_sub and 3 or 0))
+                local body_rail = is_sub and "{\\1c&H4D7058&}│  {\\1c&HFAF7F2&}" or ""
+                for _, ln in ipairs(body_lines) do
                     if cur_y >= bottom_limit_y then break end
                     table.insert(parts, string.format(
-                        "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.3\\3c&H000000&\\fs14\\i1\\1c&HFFE87C&}%s",
-                        tx + 8, cur_y, tl
+                        "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H20&\\4c&H000000&\\4a&H38&\\fs15\\1c&HFAF7F2&}%s%s",
+                        rx_text + (is_sel and 8 or 4), cur_y, body_rail, ln
                     ))
-                    cur_y = cur_y + 18
+                    cur_y = cur_y + 19
+                    line_budget = line_budget - 1
                 end
-            end
 
-            if chat_expanded[c.id] and type(c.replies) == "table" and #c.replies > 0 then
-                for _, rep in ipairs(c.replies) do
-                    if cur_y >= bottom_limit_y then break end
-                    local rauth = esc_ass(rep.author or "")
-                    local rlines = wrap_lines(rauth .. ": " .. (rep.text or ""), max_cols - 4)
-                    for _, rl in ipairs(rlines) do
+                if chat_translations[c.id] then
+                    for _, tl in ipairs(wrap_lines("TR: " .. chat_translations[c.id], max_cols - 4)) do
                         if cur_y >= bottom_limit_y then break end
                         table.insert(parts, string.format(
-                            "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.3\\3c&H000000&\\fs13\\1c&HC8D6E5&}  ↳ %s",
-                            tx + 8, cur_y, rl
+                            "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.3\\3c&H000000&\\fs14\\i1\\1c&HFFE87C&}%s%s",
+                            rx_text + 6, cur_y, body_rail, tl
                         ))
-                        cur_y = cur_y + 17
+                        cur_y = cur_y + 18
                     end
                 end
-            end
 
-            cur_y = cur_y + 7
-            drawn = drawn + 1
+                -- Reserve space & place GPU bitmap/animated GIF sprites for comment/subcomment media!
+                if type(c.media) == "table" and #c.media > 0 then
+                    local media_x = rx_text + 12
+                    local max_row_h = 0
+                    for m_i, m in ipairs(c.media) do
+                        if m_i > 3 then break end
+                        local asset = m.key and chat_media_assets[m.key] or nil
+                        if asset and next_sprite_id <= 69 then
+                            if cur_y + asset.h < bottom_limit_y and (media_x + asset.w) <= (x1 - 10) then
+                                table.insert(chat_active_sprites, {
+                                    id = next_sprite_id,
+                                    asset = asset,
+                                    px = to_px(media_x),
+                                    py = to_py(cur_y + 2),
+                                    pw = to_ps(asset.w),
+                                    ph = to_ps(asset.h),
+                                })
+                                next_sprite_id = next_sprite_id + 1
+                                media_x = media_x + asset.w + 8
+                                if asset.h > max_row_h then max_row_h = asset.h end
+                            end
+                        else
+                            if cur_y + 18 < bottom_limit_y then
+                                table.insert(parts, string.format(
+                                    "{\\an7\\pos(%d,%d)\\bord1.5\\shad1.2\\3c&H000000&\\fs13\\1c&H24BFFB&}[GIF: %s]",
+                                    media_x, cur_y, esc_ass(m.label or "Sticker")
+                                ))
+                                max_row_h = math.max(max_row_h, 18)
+                                break
+                            end
+                        end
+                    end
+                    if max_row_h > 0 then
+                        cur_y = cur_y + max_row_h + 6
+                        line_budget = line_budget - math.max(1, math.floor(max_row_h / 19))
+                    end
+                end
+
+                -- Fallback full-row selection hitbox (added BEFORE/BELOW pill hitboxes; matched in reverse order so pills take priority!)
+                add_hitbox(x0 + 4, row_start_y, x1 - 4, cur_y, "select_row", { index = idx, row = row })
+                cur_y = cur_y + 6
+            end
         end
     end
 
     if chat_status_msg and mp.get_time() < chat_status_until then
         table.insert(parts, string.format(
             "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.4\\3c&H000000&\\fs14\\b1\\1c&H99D334&}%s",
-            tx, chat_compose and 592 or 674, esc_ass(chat_status_msg)
+            tx, chat_compose and 590 or 672, esc_ass(chat_status_msg)
         ))
     end
 
     if chat_compose then
-        local box_y = 616
+        local box_y = 614
         table.insert(parts, string.format(
             "{\\an7\\pos(0,0)\\bord1.5\\3c&HF8BD38&\\1c&H14100D&\\1a&H42&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}",
-            x0 + 6, box_y, x1 - 6, box_y, x1 - 6, box_y + 76, x0 + 6, box_y + 76
+            x0 + 6, box_y, x1 - 6, box_y, x1 - 6, box_y + 78, x0 + 6, box_y + 78
         ))
-        local list_cur = list[chat_cursor]
-        local target_lbl = (chat_compose_reply_mode and list_cur)
-            and ("Reply to " .. esc_ass(list_cur.author or "user") .. "  [Tab: New]")
+        local target_lbl = (chat_compose_reply_mode and chat_compose_target_author)
+            and ("Reply to " .. esc_ass(chat_compose_target_author) .. "  [Tab: New]")
             or "New Comment  [Tab: Reply]"
         table.insert(parts, string.format(
             "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs13\\b1\\1c&HF8BD38&}✎ %s   {\\1c&HC8B8A4&\\b0}[Enter] Post · [Esc] Cancel",
@@ -1425,17 +1645,19 @@ local function render_chat_overlay()
         end
         table.insert(parts, string.format(
             "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs16\\1c&HFFFFFF&}%s|",
-            tx, box_y + 34, shown_txt
+            tx, box_y + 36, shown_txt
         ))
+        add_hitbox(x0 + 6, box_y, x1 - 6, box_y + 78, "compose_box", nil)
     else
         table.insert(parts, string.format(
-            "{\\an7\\pos(%d,692)\\bord1.5\\shad1.2\\3c&H000000&\\fs12\\1c&HB8B0A6&}[PgUp/Dn] Scroll · [Alt+r] VOD Sync · [Alt+s] Sort · [Alt+l] Side · [Alt+t] Translate",
+            "{\\an7\\pos(%d,692)\\bord1.5\\shad1.2\\3c&H000000&\\fs12\\1c&HB8B0A6&}[↑↓/Wheel] Scroll · [Click] Select/Expand · [Alt+r] VOD · [Alt+l] Side · [-/+] Vol",
             tx
         ))
     end
 
     chat_ov.data = table.concat(parts, "\n")
     chat_ov:update()
+    step_chat_media_frames()
 end
 
 local function set_chat_status(msg, secs)
@@ -1446,8 +1668,16 @@ end
 
 local function ensure_chat_timer()
     if not chat_timer then
-        chat_timer = mp.add_periodic_timer(0.8, function()
-            if chat_visible then render_chat_overlay() end
+        chat_timer = mp.add_periodic_timer(0.12, function()
+            if not chat_visible then return end
+            local now = mp.get_time()
+            if #chat_active_sprites > 0 then
+                step_chat_media_frames()
+            end
+            if now - chat_last_ass_sync >= 0.85 then
+                chat_last_ass_sync = now
+                render_chat_overlay()
+            end
         end)
     end
 end
@@ -1461,6 +1691,23 @@ local function close_chat_compose()
     render_chat_overlay()
 end
 
+local function sync_compose_target_from_cursor()
+    local rows = build_visible_chat_rows()
+    local row = rows[chat_cursor]
+    if row and row.root then
+        chat_compose_target_root_id = row.root.id
+        local c = row.comment or row.root
+        chat_compose_target_author = c and c.author or nil
+        if row.kind == "reply" then
+            chat_compose_reply_mode = true
+        end
+    else
+        chat_compose_target_root_id = nil
+        chat_compose_target_author = nil
+        chat_compose_reply_mode = false
+    end
+end
+
 local function submit_chat_compose()
     local text = chat_compose_buf:gsub("^%s+", ""):gsub("%s+$", "")
     if text == "" then
@@ -1472,10 +1719,15 @@ local function submit_chat_compose()
         close_chat_compose()
         return
     end
-    local list = active_chat_list()
     local parent_id = ""
-    if chat_compose_reply_mode and list[chat_cursor] and list[chat_cursor].id then
-        parent_id = tostring(list[chat_cursor].id)
+    if chat_compose_reply_mode and chat_compose_target_root_id then
+        parent_id = tostring(chat_compose_target_root_id)
+        if chat_compose_target_author and chat_compose_target_author ~= "" then
+            local clean_at = chat_compose_target_author:gsub("^@", "")
+            if not text:find("^@") then
+                text = "@" .. clean_at .. " " .. text
+            end
+        end
     end
     mp.commandv("script-message", "phaenna-ipc-post-comment", parent_id, text)
     chat_compose_buf = ""
@@ -1483,7 +1735,7 @@ local function submit_chat_compose()
     set_chat_status("Posting comment to YouTube…", 4.0)
 end
 
-local function open_chat_compose()
+local function open_chat_compose(force_reply)
     if not chat_visible then
         chat_visible = true
         if #chat_items == 0 then
@@ -1491,7 +1743,16 @@ local function open_chat_compose()
             mp.commandv("script-message", "phaenna-ipc-request-comments", chat_sort_newest and "newest" or "top")
         end
     end
-    if chat_compose then return end
+    if force_reply == true then
+        chat_compose_reply_mode = true
+    elseif force_reply == false then
+        chat_compose_reply_mode = false
+    end
+    sync_compose_target_from_cursor()
+    if chat_compose then
+        render_chat_overlay()
+        return
+    end
     chat_compose = true
     chat_compose_buf = ""
     ensure_chat_timer()
@@ -1518,7 +1779,12 @@ local function open_chat_compose()
     end, { repeatable = true })
 
     mp.add_forced_key_binding("TAB", "chat-cap-tab", function()
-        chat_compose_reply_mode = not chat_compose_reply_mode
+        sync_compose_target_from_cursor()
+        if chat_compose_target_root_id then
+            chat_compose_reply_mode = not chat_compose_reply_mode
+        else
+            chat_compose_reply_mode = false
+        end
         render_chat_overlay()
     end)
 
@@ -1540,6 +1806,7 @@ local function toggle_chat_overlay()
     else
         close_chat_compose()
         chat_ov:remove()
+        clear_chat_media_slots()
     end
 end
 
@@ -1581,10 +1848,10 @@ end
 
 local function chat_scroll_delta(d)
     if not chat_visible then return end
-    local list = active_chat_list()
-    if #list == 0 then return end
+    local rows = build_visible_chat_rows()
+    if #rows == 0 then return end
     chat_replay = false
-    chat_cursor = math.max(1, math.min(#list, chat_cursor + d))
+    chat_cursor = math.max(1, math.min(#rows, chat_cursor + d))
     if chat_cursor < chat_scroll then
         chat_scroll = chat_cursor
     elseif d > 0 and chat_cursor - chat_scroll >= 5 then
@@ -1593,23 +1860,120 @@ local function chat_scroll_delta(d)
     render_chat_overlay()
 end
 
+local function trigger_fold_root(root)
+    if not root or not root.id then return end
+    local reps = type(root.replies) == "table" and root.replies or {}
+    local has_more = type(root.replies_cont) == "string" and root.replies_cont ~= ""
+    if chat_expanded[root.id] then
+        chat_expanded[root.id] = false
+        render_chat_overlay()
+    else
+        chat_expanded[root.id] = true
+        if #reps == 0 and (has_more or (root.replies_count or 0) > 0) and not chat_loading_replies[root.id] then
+            chat_loading_replies[root.id] = true
+            mp.commandv("script-message", "phaenna-ipc-request-replies", tostring(root.id), tostring(root.replies_cont or ""))
+        end
+        render_chat_overlay()
+    end
+end
+
 local function chat_toggle_replies()
     if not chat_visible then return end
-    local list = active_chat_list()
-    local cur = list[chat_cursor]
-    if cur and cur.id then
-        chat_expanded[cur.id] = not chat_expanded[cur.id]
-        render_chat_overlay()
+    local rows = build_visible_chat_rows()
+    local cur = rows[chat_cursor]
+    if cur and cur.root then
+        trigger_fold_root(cur.root)
     end
 end
 
 local function chat_translate_selected()
     if not chat_visible then return end
-    local list = active_chat_list()
-    local cur = list[chat_cursor]
-    if cur and cur.id and cur.text and cur.text ~= "" then
-        mp.commandv("script-message", "phaenna-ipc-translate-comment", tostring(cur.id), tostring(cur.text))
+    local rows = build_visible_chat_rows()
+    local cur = rows[chat_cursor]
+    if cur and cur.comment and cur.comment.id and cur.comment.text and cur.comment.text ~= "" then
+        mp.commandv("script-message", "phaenna-ipc-translate-comment", tostring(cur.comment.id), tostring(cur.comment.text))
         set_chat_status("Translating comment…", 2.5)
+    end
+end
+
+local function mouse_to_virtual()
+    local mx, my = mp.get_mouse_pos()
+    local osd_w, osd_h = mp.get_osd_size()
+    if not mx or not my or not osd_w or osd_w <= 0 or not osd_h or osd_h <= 0 then
+        return nil, nil
+    end
+    local sc = math.min(osd_w / 1280.0, osd_h / 720.0)
+    local vx = (mx - (osd_w - 1280 * sc) / 2) / sc
+    local vy = (my - (osd_h - 720 * sc) / 2) / sc
+    return vx, vy
+end
+
+local function point_in_rect(x, y, r)
+    return r and x >= r.x0 and x <= r.x1 and y >= r.y0 and y <= r.y1
+end
+
+local function handle_chat_left_click(is_dbl)
+    if chat_visible and chat_panel_rect then
+        local vx, vy = mouse_to_virtual()
+        if vx and vy and point_in_rect(vx, vy, chat_panel_rect) then
+            -- Hit-test specific pills first (stored in draw order; pill hitboxes precede full-row select_row!)
+            for _, hb in ipairs(chat_hitboxes) do
+                if hb.action ~= "select_row" and point_in_rect(vx, vy, hb) then
+                    if hb.action == "toggle_sort" then
+                        toggle_chat_sort()
+                    elseif hb.action == "cycle_style" then
+                        cycle_chat_style()
+                    elseif hb.action == "compose" then
+                        open_chat_compose(false)
+                    elseif hb.action == "hide" then
+                        toggle_chat_overlay()
+                    elseif hb.action == "toggle_fold" and hb.payload then
+                        chat_cursor = hb.payload.index or chat_cursor
+                        trigger_fold_root(hb.payload.root)
+                    elseif hb.action == "load_more" and hb.payload then
+                        chat_cursor = hb.payload.index or chat_cursor
+                        if hb.payload.root and not chat_loading_replies[hb.payload.root.id] then
+                            chat_loading_replies[hb.payload.root.id] = true
+                            mp.commandv("script-message", "phaenna-ipc-request-replies", tostring(hb.payload.root.id), tostring(hb.payload.cont or ""))
+                            render_chat_overlay()
+                        end
+                    elseif hb.action == "reply_row" and hb.payload then
+                        chat_cursor = hb.payload.index or chat_cursor
+                        open_chat_compose(true)
+                    elseif hb.action == "translate_row" and hb.payload then
+                        chat_cursor = hb.payload.index or chat_cursor
+                        chat_translate_selected()
+                    elseif hb.action == "compose_box" then
+                        -- already inside compose box; keep focus safely
+                    end
+                    return
+                end
+            end
+            for _, hb in ipairs(chat_hitboxes) do
+                if hb.action == "select_row" and point_in_rect(vx, vy, hb) and hb.payload then
+                    local next_idx = hb.payload.index or chat_cursor
+                    if is_dbl or (chat_cursor == next_idx) then
+                        if hb.payload.row and hb.payload.row.kind == "root" and hb.payload.row.has_children then
+                            trigger_fold_root(hb.payload.row.root)
+                        elseif hb.payload.row and hb.payload.row.kind == "reply" then
+                            open_chat_compose(true)
+                        end
+                    else
+                        chat_cursor = next_idx
+                        render_chat_overlay()
+                    end
+                    return
+                end
+            end
+            return
+        end
+    end
+    if not chat_compose then
+        if is_dbl then
+            toggle_fullscreen()
+        else
+            mp.command("cycle pause")
+        end
     end
 end
 
@@ -1633,12 +1997,60 @@ mp.register_script_message("phaenna-overlay-comment-result", function(payload_st
     if res.ok and type(res.new_comment_json) == "string" and res.new_comment_json ~= "" then
         local c = utils.parse_json(res.new_comment_json)
         if type(c) == "table" then
-            table.insert(chat_items, 1, c)
-            chat_cursor = 1
-            chat_scroll = 1
+            if type(res.parent_id) == "string" and res.parent_id ~= "" then
+                for _, item in ipairs(chat_items) do
+                    if item.id == res.parent_id then
+                        if type(item.replies) ~= "table" then item.replies = {} end
+                        table.insert(item.replies, 1, c)
+                        item.replies_count = (item.replies_count or 0) + 1
+                        chat_expanded[item.id] = true
+                        break
+                    end
+                end
+            else
+                table.insert(chat_items, 1, c)
+                chat_cursor = 1
+                chat_scroll = 1
+            end
         end
     end
     set_chat_status(res.status or (res.ok and "Comment posted!" or "Post failed"), 4.0)
+end)
+
+mp.register_script_message("phaenna-overlay-comment-replies", function(payload_str)
+    local rep = utils.parse_json(payload_str or "")
+    if type(rep) ~= "table" or not rep.root_id then return end
+    chat_loading_replies[rep.root_id] = nil
+    local parsed_arr = utils.parse_json(rep.replies_json or "[]")
+    if type(parsed_arr) == "table" then
+        for _, item in ipairs(chat_items) do
+            if item.id == rep.root_id then
+                if type(item.replies) ~= "table" then item.replies = {} end
+                local existing = {}
+                for _, er in ipairs(item.replies) do
+                    if er.id then existing[er.id] = true end
+                end
+                for _, nr in ipairs(parsed_arr) do
+                    if nr.id and not existing[nr.id] then
+                        table.insert(item.replies, nr)
+                        existing[nr.id] = true
+                    end
+                end
+                item.replies_cont = rep.continuation
+                chat_expanded[item.id] = true
+                break
+            end
+        end
+    end
+    if chat_visible then render_chat_overlay() end
+end)
+
+mp.register_script_message("phaenna-overlay-comment-media", function(payload_str)
+    local asset = utils.parse_json(payload_str or "")
+    if type(asset) == "table" and asset.key and type(asset.paths) == "table" and #asset.paths > 0 then
+        chat_media_assets[asset.key] = asset
+        if chat_visible then render_chat_overlay() end
+    end
 end)
 
 mp.register_script_message("phaenna-overlay-comment-translation", function(payload_str)
@@ -1655,12 +2067,18 @@ mp.add_forced_key_binding("Alt+r", "phaenna-toggle-chat-replay", toggle_chat_rep
 mp.add_forced_key_binding("Alt+l", "phaenna-toggle-chat-side", toggle_chat_side)
 mp.add_forced_key_binding("Alt+s", "phaenna-toggle-chat-sort", toggle_chat_sort)
 mp.add_forced_key_binding("Alt+t", "phaenna-translate-chat-comment", chat_translate_selected)
-mp.add_forced_key_binding("PGUP", "phaenna-chat-scroll-up", function() chat_scroll_delta(-1) end, { repeatable = true })
-mp.add_forced_key_binding("PGDWN", "phaenna-chat-scroll-down", function() chat_scroll_delta(1) end, { repeatable = true })
+mp.add_forced_key_binding("UP", "phaenna-chat-scroll-up", function() chat_scroll_delta(-1) end, { repeatable = true })
+mp.add_forced_key_binding("DOWN", "phaenna-chat-scroll-down", function() chat_scroll_delta(1) end, { repeatable = true })
+mp.add_forced_key_binding("WHEEL_UP", "phaenna-chat-wheel-up", function() chat_scroll_delta(-1) end, { repeatable = true })
+mp.add_forced_key_binding("WHEEL_DOWN", "phaenna-chat-wheel-down", function() chat_scroll_delta(1) end, { repeatable = true })
+mp.add_forced_key_binding("PGUP", "phaenna-chat-scroll-up-pg", function() chat_scroll_delta(-1) end, { repeatable = true })
+mp.add_forced_key_binding("PGDWN", "phaenna-chat-scroll-down-pg", function() chat_scroll_delta(1) end, { repeatable = true })
 mp.add_forced_key_binding("Alt+UP", "phaenna-chat-scroll-up-alt", function() chat_scroll_delta(-1) end, { repeatable = true })
 mp.add_forced_key_binding("Alt+DOWN", "phaenna-chat-scroll-down-alt", function() chat_scroll_delta(1) end, { repeatable = true })
-mp.add_forced_key_binding(";", "phaenna-chat-compose", open_chat_compose)
-mp.add_forced_key_binding("\\", "phaenna-chat-compose-bsl", open_chat_compose)
+mp.add_forced_key_binding("MBTN_LEFT", "phaenna-chat-left-click", function() handle_chat_left_click(false) end)
+mp.add_forced_key_binding("MBTN_LEFT_DBL", "phaenna-chat-left-dbl", function() handle_chat_left_click(true) end)
+mp.add_forced_key_binding(";", "phaenna-chat-compose", function() open_chat_compose(nil) end)
+mp.add_forced_key_binding("\\", "phaenna-chat-compose-bsl", function() open_chat_compose(nil) end)
 mp.add_forced_key_binding("'", "phaenna-chat-toggle-replies", chat_toggle_replies)
 
 start_anim()

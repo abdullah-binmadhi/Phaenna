@@ -1117,6 +1117,28 @@ impl VideoVote {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommentMedia {
+    pub key: String,
+    pub label: String,
+    pub url: String,
+    pub is_animated: bool,
+}
+
+impl CommentMedia {
+    /// Deterministic short cache key for a comment image/GIF URL.
+    pub fn key_for_url(url: &str) -> String {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(url.as_bytes());
+        let dig = hasher.finalize();
+        format!(
+            "cm:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            dig[0], dig[1], dig[2], dig[3], dig[4], dig[5], dig[6], dig[7]
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct VideoComment {
     pub id: String,
@@ -1139,6 +1161,8 @@ pub struct VideoComment {
     pub replies_expanded: bool,
     #[serde(default)]
     pub replies_loading: bool,
+    #[serde(default)]
+    pub media: Vec<CommentMedia>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1249,12 +1273,163 @@ fn find_comments_continuation_in_next(v: &serde_json::Value) -> Option<String> {
 
 fn clean_comment_body(raw: &str) -> String {
     raw.replace("\r\n", "\n")
+        .replace('\u{FFFC}', "")
         .lines()
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn best_url_from_sources_or_thumbs(val: &serde_json::Value) -> Option<String> {
+    let arr = val
+        .get("sources")
+        .or_else(|| val.get("thumbnails"))
+        .and_then(|x| x.as_array())?;
+    arr.iter()
+        .filter_map(|item| {
+            let url = item.get("url").and_then(|u| u.as_str())?.trim();
+            if url.is_empty() {
+                return None;
+            }
+            let w = item.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some((w, normalize_media_url(url)))
+        })
+        .max_by_key(|(w, _)| *w)
+        .map(|(_, u)| u)
+}
+
+fn normalize_media_url(url: &str) -> String {
+    if url.starts_with("//") {
+        format!("https:{url}")
+    } else {
+        url.to_string()
+    }
+}
+
+fn push_unique_media(out: &mut Vec<CommentMedia>, url: String, label: String) {
+    if url.is_empty() || out.iter().any(|m| m.url == url) || out.len() >= 4 {
+        return;
+    }
+    let low = url.to_ascii_lowercase();
+    let is_animated = low.contains(".gif")
+        || low.contains("format=gif")
+        || low.contains("animated")
+        || label.eq_ignore_ascii_case("[GIF]");
+    let key = CommentMedia::key_for_url(&url);
+    out.push(CommentMedia {
+        key,
+        label,
+        url,
+        is_animated,
+    });
+}
+
+fn collect_media_urls_recursive(v: &serde_json::Value, out: &mut Vec<CommentMedia>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(emoji) = map.get("emoji") {
+                if let Some(url) = emoji
+                    .get("image")
+                    .and_then(best_url_from_sources_or_thumbs)
+                {
+                    let label = emoji
+                        .pointer("/shortcuts/0")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| "[Sticker]".to_string());
+                    push_unique_media(out, url, label);
+                }
+            }
+            if let Some(img) = map.get("image").or_else(|| map.get("thumbnail")) {
+                if let Some(url) = best_url_from_sources_or_thumbs(img) {
+                    let lbl = if url.to_ascii_lowercase().contains("gif") {
+                        "[GIF]".to_string()
+                    } else {
+                        "[Image]".to_string()
+                    };
+                    push_unique_media(out, url, lbl);
+                }
+            }
+            if let Some(s) = map.get("url").and_then(|u| u.as_str()) {
+                let sl = s.to_ascii_lowercase();
+                if sl.starts_with("http")
+                    && (sl.contains(".gif")
+                        || sl.contains("tenor")
+                        || sl.contains("giphy")
+                        || sl.contains("yt3.ggpht.com")
+                        || sl.contains("googleusercontent.com"))
+                {
+                    let lbl = if sl.contains("gif") {
+                        "[GIF]"
+                    } else {
+                        "[Image]"
+                    };
+                    push_unique_media(out, normalize_media_url(s), lbl.to_string());
+                }
+            }
+            for (k, val) in map {
+                if k != "thumbnails" && k != "sources" && k != "avatar" {
+                    collect_media_urls_recursive(val, out);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_media_urls_recursive(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_comment_media_from_entity(cep: &serde_json::Value) -> Vec<CommentMedia> {
+    let mut out = Vec::new();
+    if let Some(content) = cep.pointer("/properties/content") {
+        if let Some(runs) = content.get("attachmentRuns") {
+            collect_media_urls_recursive(runs, &mut out);
+        }
+        if let Some(emojis) = content.get("customEmojis") {
+            collect_media_urls_recursive(emojis, &mut out);
+        }
+    }
+    if let Some(att) = cep.get("attachment") {
+        collect_media_urls_recursive(att, &mut out);
+    }
+    out
+}
+
+fn extract_comment_media_from_classic(cr: &serde_json::Value) -> Vec<CommentMedia> {
+    let mut out = Vec::new();
+    if let Some(runs) = cr.pointer("/contentText/runs").and_then(|r| r.as_array()) {
+        for run in runs {
+            if let Some(emoji) = run.get("emoji") {
+                let is_custom = emoji
+                    .get("isCustomEmoji")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_custom || emoji.pointer("/image/thumbnails").is_some() {
+                    if let Some(url) = emoji
+                        .get("image")
+                        .and_then(best_url_from_sources_or_thumbs)
+                    {
+                        let label = emoji
+                            .pointer("/shortcuts/0")
+                            .and_then(|s| s.as_str())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| "[Sticker]".to_string());
+                        push_unique_media(&mut out, url, label);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(att) = cr.get("attachment") {
+        collect_media_urls_recursive(att, &mut out);
+    }
+    out
 }
 
 fn parse_reply_count_val(val: Option<&serde_json::Value>) -> u32 {
@@ -1318,11 +1493,18 @@ fn parse_comment_renderer_node(cr: &serde_json::Value) -> Option<VideoComment> {
     }
     let author = extract_yt_text(cr.get("authorText")).unwrap_or_else(|| "Viewer".to_string());
     let published_text = extract_yt_text(cr.get("publishedTimeText")).unwrap_or_default();
-    let text = extract_yt_text(cr.get("contentText"))
+    let mut text = extract_yt_text(cr.get("contentText"))
         .map(|s| clean_comment_body(&s))
         .unwrap_or_default();
-    if text.is_empty() {
+    let media = extract_comment_media_from_classic(cr);
+    if text.is_empty() && media.is_empty() {
         return None;
+    }
+    if text.is_empty() {
+        text = media
+            .first()
+            .map(|m| m.label.clone())
+            .unwrap_or_else(|| "[GIF]".to_string());
     }
     let like_raw = extract_yt_text(cr.get("voteCount"));
     let like_count_text = normalize_like_count(like_raw.as_deref());
@@ -1339,6 +1521,7 @@ fn parse_comment_renderer_node(cr: &serde_json::Value) -> Option<VideoComment> {
         is_pinned,
         is_self: false,
         create_reply_params,
+        media,
         ..Default::default()
     })
 }
@@ -1489,13 +1672,14 @@ fn collect_comments_nodes(
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let text = cep
+                    let mut text = cep
                         .get("properties")
                         .and_then(|p| p.get("content"))
                         .and_then(|c| c.get("content"))
                         .and_then(|x| x.as_str())
                         .map(clean_comment_body)
                         .unwrap_or_default();
+                    let media = extract_comment_media_from_entity(cep);
                     let like_count_text = normalize_like_count(
                         cep.get("toolbar")
                             .and_then(|t| t.get("likeCountNotliked"))
@@ -1506,7 +1690,13 @@ fn collect_comments_nodes(
                     );
                     let create_reply_params = extract_reply_params_from_node(cep)
                         .or_else(|| ctx.create_reply_params_by_id.remove(id));
-                    if !text.is_empty() {
+                    if !text.is_empty() || !media.is_empty() {
+                        if text.is_empty() {
+                            text = media
+                                .first()
+                                .map(|m| m.label.clone())
+                                .unwrap_or_else(|| "[GIF]".to_string());
+                        }
                         let replies_continuation = ctx.reply_tokens.remove(id);
                         let replies = ctx.inline_replies.remove(id).unwrap_or_default();
                         ctx.out.push(VideoComment {
@@ -1521,6 +1711,7 @@ fn collect_comments_nodes(
                             create_reply_params,
                             replies_continuation,
                             replies,
+                            media,
                             ..Default::default()
                         });
                     }
@@ -3371,6 +3562,78 @@ mod tests {
         );
         assert_eq!(normalize_like_count(Some("   ")), "0");
         assert_eq!(normalize_like_count(Some(" 42 ")), "42");
+
+        // Verify GIF/sticker media parsing on both entity comments & classic GIF-only subcomments
+        let media_sample = serde_json::json!({
+            "onResponseReceivedEndpoints": [{
+                "reloadContinuationItemsCommand": {
+                    "continuationItems": [{
+                        "commentThreadRenderer": {
+                            "commentViewModel": {
+                                "commentViewModel": { "commentId": "cmt_gif_root" }
+                            },
+                            "replies": {
+                                "commentRepliesRenderer": {
+                                    "contents": [{
+                                        "commentRenderer": {
+                                            "commentId": "sub_gif_only",
+                                            "authorText": { "simpleText": "@gif_replier" },
+                                            "contentText": {
+                                                "runs": [{
+                                                    "emoji": {
+                                                        "shortcuts": [":hype:"],
+                                                        "isCustomEmoji": true,
+                                                        "image": { "thumbnails": [{ "url": "https://yt3.ggpht.com/sticker_hype.gif", "width": 48, "height": 48 }] }
+                                                    }
+                                                }]
+                                            }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }],
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [{
+                        "payload": {
+                            "commentEntityPayload": {
+                                "properties": {
+                                    "commentId": "cmt_gif_root",
+                                    "publishedTime": "1m ago",
+                                    "content": {
+                                        "content": "W moment \u{FFFC}",
+                                        "attachmentRuns": [{
+                                            "element": {
+                                                "type": {
+                                                    "imageType": {
+                                                        "image": {
+                                                            "sources": [{ "url": "https://yt3.ggpht.com/custom_emote.gif", "width": 64, "height": 64 }]
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }]
+                                    }
+                                },
+                                "author": { "displayName": "@meme_fan" },
+                                "toolbar": { "likeCountNotliked": "7", "replyCount": "1" }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let parsed_media = parse_innertube_comments_json(&media_sample);
+        assert_eq!(parsed_media.comments.len(), 1);
+        assert_eq!(parsed_media.comments[0].text, "W moment");
+        assert_eq!(parsed_media.comments[0].media.len(), 1);
+        assert!(parsed_media.comments[0].media[0].is_animated);
+        assert_eq!(parsed_media.comments[0].replies.len(), 1);
+        assert_eq!(parsed_media.comments[0].replies[0].media.len(), 1);
+        assert_eq!(parsed_media.comments[0].replies[0].text, ":hype:");
     }
 
     #[test]

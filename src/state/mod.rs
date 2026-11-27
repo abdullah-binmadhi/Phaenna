@@ -898,6 +898,10 @@ pub struct AppState {
     pub failed_thumbs: HashMap<String, FailedThumbEntry>,
     pub pending_thumb_requests: Vec<ThumbRequest>,
     pub kitty_flush_needed: bool,
+    pub comment_media_cache: HashMap<String, crate::services::comment_media::DecodedCommentMedia>,
+    pub loading_comment_media: HashSet<String>,
+    pub pending_comment_media: Vec<(String, String)>,
+    pub failed_comment_media: HashSet<String>,
 }
 
 impl AppState {
@@ -1103,6 +1107,10 @@ impl AppState {
             failed_thumbs: HashMap::new(),
             pending_thumb_requests: Vec::new(),
             kitty_flush_needed: false,
+            comment_media_cache: HashMap::new(),
+            loading_comment_media: HashSet::new(),
+            pending_comment_media: Vec::new(),
+            failed_comment_media: HashSet::new(),
         }
     }
 
@@ -1961,6 +1969,20 @@ impl AppState {
 
     pub fn queue_thumb_if_needed(&mut self, id: &str, url: &str) {
         self.queue_thumb_with_priority(id, url, ThumbPriority::Visible);
+    }
+
+    pub fn queue_comment_media(&mut self, key: &str, url: &str) {
+        if key.is_empty()
+            || url.is_empty()
+            || self.comment_media_cache.contains_key(key)
+            || self.loading_comment_media.contains(key)
+            || self.failed_comment_media.contains(key)
+            || self.pending_comment_media.iter().any(|(k, _)| k == key)
+        {
+            return;
+        }
+        self.pending_comment_media
+            .push((key.to_string(), url.to_string()));
     }
 
     pub fn queue_thumb_with_priority(&mut self, id: &str, url: &str, priority: ThumbPriority) {

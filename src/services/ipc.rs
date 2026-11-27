@@ -275,11 +275,20 @@ pub enum PlayerCommand {
     PushOverlayCommentResult {
         ok: bool,
         status: String,
+        parent_id: Option<String>,
         new_comment_json: String,
     },
     PushOverlayCommentTranslation {
         comment_id: String,
         translated_text: String,
+    },
+    PushOverlayCommentReplies {
+        root_id: String,
+        replies_json: String,
+        continuation: Option<String>,
+    },
+    PushOverlayCommentMedia {
+        media_json: String,
     },
     HotSwitchStream {
         primary_url: String,
@@ -680,11 +689,13 @@ impl PlayerCommand {
             Self::PushOverlayCommentResult {
                 ok,
                 status,
+                parent_id,
                 new_comment_json,
             } => {
                 let res_json = json!({
                     "ok": ok,
                     "status": status,
+                    "parent_id": parent_id,
                     "new_comment_json": new_comment_json,
                 })
                 .to_string();
@@ -700,6 +711,22 @@ impl PlayerCommand {
                 })
                 .to_string();
                 vec![json!({"command": ["script-message", "phaenna-overlay-comment-translation", tr_json]}).to_string()]
+            }
+            Self::PushOverlayCommentReplies {
+                root_id,
+                replies_json,
+                continuation,
+            } => {
+                let rep_json = json!({
+                    "root_id": root_id,
+                    "replies_json": replies_json,
+                    "continuation": continuation,
+                })
+                .to_string();
+                vec![json!({"command": ["script-message", "phaenna-overlay-comment-replies", rep_json]}).to_string()]
+            }
+            Self::PushOverlayCommentMedia { media_json } => {
+                vec![json!({"command": ["script-message", "phaenna-overlay-comment-media", media_json]}).to_string()]
             }
             Self::UpdateSkipSegments(_) | Self::UndoLastSkip | Self::SetSponsorOsdToast(_) => {
                 Vec::new()
@@ -1396,6 +1423,26 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                 }
                                 continue;
                             }
+                            "phaenna-ipc-request-replies" => {
+                                let root_id = args.first().cloned().unwrap_or_default();
+                                let continuation = args
+                                    .get(1)
+                                    .map(|s| s.trim())
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToOwned::to_owned);
+                                if !root_id.is_empty() {
+                                    let _ = config
+                                        .tx
+                                        .send(AppMessage::OverlayRepliesRequested {
+                                            session_id: config.session_id,
+                                            video_id: config.video_id.clone(),
+                                            root_id,
+                                            continuation,
+                                        })
+                                        .await;
+                                }
+                                continue;
+                            }
                             _ => {}
                         }
                     }
@@ -1913,10 +1960,10 @@ fn trim_comment_text(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Serialize one comment entry into compact overlay chat JSON (also used on optimistic post).
-pub fn overlay_comment_json_value(
+fn overlay_node_json_value(
     c: &crate::api::innertube::VideoComment,
     uploader_hint: Option<&str>,
+    include_replies: bool,
 ) -> Value {
     let clean_upl = uploader_hint
         .unwrap_or("")
@@ -1925,35 +1972,67 @@ pub fn overlay_comment_json_value(
         .to_ascii_lowercase();
     let clean_auth = c.author.trim().trim_start_matches('@').to_ascii_lowercase();
     let is_creator = !clean_upl.is_empty() && !clean_auth.is_empty() && clean_auth == clean_upl;
-    let replies: Vec<Value> = c
-        .replies
+    let media_arr: Vec<Value> = c
+        .media
         .iter()
         .take(3)
-        .map(|r| {
+        .map(|m| {
             json!({
-                "id": r.id,
-                "author": r.author,
-                "published": r.published_text,
-                "text": trim_comment_text(&r.text, 200),
-                "likes": r.like_count_text,
-                "self_msg": r.is_self,
+                "key": m.key,
+                "label": m.label,
+                "url": m.url,
+                "animated": m.is_animated,
             })
         })
         .collect();
+    let replies: Vec<Value> = if include_replies {
+        c.replies
+            .iter()
+            .take(35)
+            .map(|r| overlay_node_json_value(r, uploader_hint, false))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     json!({
         "id": c.id,
+        "parent_id": c.parent_id,
         "author": c.author,
         "published": c.published_text,
         "text": trim_comment_text(&c.text, 280),
         "likes": c.like_count_text,
         "replies_count": c.reply_count,
+        "replies_cont": c.replies_continuation,
+        "can_reply": c.create_reply_params.is_some(),
         "pinned": c.is_pinned,
         "creator": is_creator,
         "self_msg": c.is_self,
         "ts": parse_comment_timestamp_secs(&c.text),
+        "media": media_arr,
         "replies": replies,
     })
+}
+
+/// Serialize one comment entry into compact overlay chat JSON (also used on optimistic post).
+pub fn overlay_comment_json_value(
+    c: &crate::api::innertube::VideoComment,
+    uploader_hint: Option<&str>,
+) -> Value {
+    overlay_node_json_value(c, uploader_hint, true)
+}
+
+/// Serialize a list of fetched subcomments into JSON for `PushOverlayCommentReplies`.
+pub fn overlay_replies_json_value(
+    replies: &[crate::api::innertube::VideoComment],
+    uploader_hint: Option<&str>,
+) -> String {
+    let arr: Vec<Value> = replies
+        .iter()
+        .take(50)
+        .map(|r| overlay_node_json_value(r, uploader_hint, false))
+        .collect();
+    Value::Array(arr).to_string()
 }
 
 /// Build the full compact JSON payload pushed to the `mpv` fullscreen comment overlay.

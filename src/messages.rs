@@ -119,7 +119,7 @@ pub enum AppMessage {
         error: Option<String>,
     },
 
-    // Thumbnail Pipeline
+    // Thumbnail & Comment Media Pipeline
     ThumbnailReady {
         video_id: String,
         image: image::DynamicImage,
@@ -128,6 +128,8 @@ pub enum AppMessage {
     ThumbnailFailed {
         video_id: String,
     },
+    CommentMediaReady(crate::services::comment_media::DecodedCommentMedia),
+    CommentMediaFailed(String),
 
     // In-App Google Auth & Identity Hub
     AuthPopupReady {
@@ -186,6 +188,12 @@ pub enum AppMessage {
         session_id: u64,
         comment_id: String,
         text: String,
+    },
+    OverlayRepliesRequested {
+        session_id: u64,
+        video_id: String,
+        root_id: String,
+        continuation: Option<String>,
     },
     SponsorSkipped {
         video_id: String,

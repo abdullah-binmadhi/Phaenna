@@ -342,7 +342,7 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
 
         render_left_column(frame, cols[0], state, &video, &pal, art_outer_h, now_unix, modal_rect);
         render_center_column(frame, cols[1], state, &video, &pal);
-        render_comments_panel(frame, cols[2], state, &video, &pal);
+        render_comments_panel(frame, cols[2], state, &video, &pal, modal_rect);
     } else {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -357,7 +357,7 @@ pub fn render_detail_screen(frame: &mut Frame, state: &mut AppState, modal_rect:
             .split(cols[1]);
 
         render_synopsis_panel(frame, right_stack[0], state, &video, &pal);
-        render_comments_panel(frame, right_stack[1], state, &video, &pal);
+        render_comments_panel(frame, right_stack[1], state, &video, &pal, modal_rect);
     }
 
     if show_np {
@@ -1424,6 +1424,7 @@ fn render_comments_panel(
     state: &mut AppState,
     video: &VideoItem,
     pal: &ThemePalette,
+    modal_rect: Option<Rect>,
 ) {
     state.detail_comments_panel_rect = area;
 
@@ -1693,6 +1694,13 @@ fn render_comments_panel(
     let creator_low = video.display_uploader().trim().trim_start_matches('@').to_lowercase();
     let vis_h = list_area.height.max(1) as usize;
 
+    struct PendingMediaRender {
+        s_line: usize,
+        rows_h: usize,
+        indent_cols: u16,
+        items: Vec<crate::api::innertube::CommentMedia>,
+    }
+
     struct PendingNodeMeta {
         s_line: usize,
         e_line: usize,
@@ -1703,6 +1711,8 @@ fn render_comments_panel(
         reply_col_range: Option<(u16, u16)>,
         translate_col_range: Option<(u16, u16)>,
     }
+
+    let mut pending_media: Vec<PendingMediaRender> = Vec::new();
 
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     let mut selected_start_line = 0usize;
@@ -1943,6 +1953,52 @@ fn render_comments_panel(
             }
         }
 
+        if !c.media.is_empty() {
+            for m in &c.media {
+                state.queue_comment_media(&m.key, &m.url);
+            }
+            let all_small_stickers = c.media.iter().all(|m| {
+                state
+                    .comment_media_cache
+                    .get(&m.key)
+                    .is_some_and(|d| d.overlay_w <= 60)
+            });
+            let rows_h = if all_small_stickers && c.media.len() <= 3 {
+                3usize
+            } else {
+                4usize
+            };
+            let s_media_line = all_lines.len();
+            for r_i in 0..rows_h {
+                let (mut sp_spans, _) = build_node_rail_spans(node, pal, row_bg, false);
+                if r_i == 0 {
+                    let any_cached = c
+                        .media
+                        .iter()
+                        .any(|m| state.comment_media_cache.contains_key(&m.key));
+                    if !any_cached {
+                        let lbls: String = c
+                            .media
+                            .iter()
+                            .map(|m| m.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        sp_spans.push(Span::styled(
+                            format!("Loading media {lbls}..."),
+                            Style::default().fg(pal.accent).bg(row_bg),
+                        ));
+                    }
+                }
+                all_lines.push(Line::from(sp_spans));
+            }
+            pending_media.push(PendingMediaRender {
+                s_line: s_media_line,
+                rows_h,
+                indent_cols: body_prefix_cols as u16,
+                items: c.media.clone(),
+            });
+        }
+
         if node.depth == 0 && !node.collapsed {
             if c.replies_loading && c.replies.is_empty() {
                 all_lines.push(Line::from(vec![
@@ -2044,6 +2100,46 @@ fn render_comments_panel(
     }
 
     frame.render_widget(Paragraph::new(all_lines).scroll((scroll_y, 0)), list_area);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    for pm in pending_media {
+        if pm.s_line < sy || pm.s_line + pm.rows_h > sy + vis_h {
+            continue;
+        }
+        let ry = list_area.y + (pm.s_line - sy) as u16;
+        let rh = pm.rows_h as u16;
+        let mut rx = list_area.x + pm.indent_cols;
+        let max_x = list_area.x + list_area.width;
+
+        for m in pm.items.iter().take(3) {
+            let Some(decoded) = state.comment_media_cache.get(&m.key).cloned() else {
+                continue;
+            };
+            if decoded.frames.is_empty() {
+                continue;
+            }
+            let slot_w: u16 = if decoded.overlay_w <= 60 { 7 } else { 14 };
+            if rx + slot_w > max_x {
+                break;
+            }
+            let img_rect = Rect::new(rx, ry, slot_w, rh);
+            rx += slot_w + 1;
+
+            if occluded_by_modal(img_rect, modal_rect) {
+                continue;
+            }
+            let f_idx = ((now_ms / decoded.frame_delay_ms.max(45)) as usize) % decoded.frames.len();
+            let frame_key = format!("{}#f{}", m.key, f_idx);
+            if !state.raw_thumbs.contains_key(&frame_key) {
+                state.insert_loaded_thumbnail(frame_key.clone(), decoded.frames[f_idx].clone());
+            }
+            render_thumbnail_cover(frame, img_rect, &frame_key, state, &m.label);
+        }
+    }
 }
 
 fn render_footer_legend(frame: &mut Frame, area: Rect, state: &AppState, pal: &ThemePalette) {
@@ -2159,5 +2255,22 @@ mod tests {
             assert!(!text.contains("concatenationissues"), "Words must never concatenate");
             assert!(text.contains("27.5K"), "Expected compact views/likes telemetry");
         }
+
+        // Verify subcomments carrying GIF/sticker media queue fetches & reserve indented rows cleanly
+        st.detail_comments[0].replies[0].media.push(
+            crate::api::innertube::CommentMedia {
+                key: "cm:subgif1".to_string(),
+                label: ":hype:".to_string(),
+                url: "https://yt3.ggpht.com/sticker.gif".to_string(),
+                is_animated: true,
+            },
+        );
+        let backend = TestBackend::new(140, 42);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_detail_screen(f, &mut st, None)).unwrap();
+        assert!(st
+            .pending_comment_media
+            .iter()
+            .any(|(k, _)| k == "cm:subgif1"));
     }
 }

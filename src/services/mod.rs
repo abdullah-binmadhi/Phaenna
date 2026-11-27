@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod calendar;
 pub mod cast;
+pub mod comment_media;
 pub mod downloader;
 pub mod ipc;
 pub mod loading_art;

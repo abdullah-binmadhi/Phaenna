@@ -68,10 +68,11 @@ use crate::services::auth::{
 };
 use crate::services::calendar::{bucket_videos_by_week, compute_week_bounds};
 use crate::services::cast::{discover_devices, resolve_tv_stream_url, start_casting};
+use crate::services::comment_media::decode_comment_media_bytes;
 use crate::services::downloader::{spawn_download_task, DownloadTask};
 use crate::services::ipc::{
-    build_overlay_chat_payload, overlay_comment_json_value, spawn_mpv_ipc_monitor,
-    IpcMonitorConfig, LiveIpcEvent, PlayerCommand,
+    build_overlay_chat_payload, overlay_comment_json_value, overlay_replies_json_value,
+    spawn_mpv_ipc_monitor, IpcMonitorConfig, LiveIpcEvent, PlayerCommand,
 };
 use crate::services::remote::start_remote_server;
 use crate::services::shaders::{
@@ -377,6 +378,25 @@ async fn main() -> anyhow::Result<()> {
             handle_app_message(msg, &mut state, &pool, &tx, &client).await;
         }
 
+        // Advance animated GIF frames smoothly when viewing TUI comments with GIF/sticker media
+        if state.screen == Screen::Detail
+            && !state.comment_media_cache.is_empty()
+            && state.ticker_last_step_at.elapsed() >= Duration::from_millis(90)
+        {
+            let has_anim = state.detail_comments.iter().any(|c| {
+                c.media.iter().chain(c.replies.iter().flat_map(|r| r.media.iter())).any(|m| {
+                    state
+                        .comment_media_cache
+                        .get(&m.key)
+                        .is_some_and(|d| d.frames.len() > 1)
+                })
+            });
+            if has_anim {
+                state.ticker_last_step_at = Instant::now();
+                needs_redraw = true;
+            }
+        }
+
         if needs_redraw {
             let mut out_handle = io::stdout();
             let _ = execute!(out_handle, BeginSynchronizedUpdate);
@@ -428,10 +448,52 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        if !state.pending_comment_media.is_empty() {
+            let pending_cm = std::mem::take(&mut state.pending_comment_media);
+            for (key, url) in pending_cm {
+                if state.loading_comment_media.contains(&key)
+                    || state.comment_media_cache.contains_key(&key)
+                {
+                    continue;
+                }
+                state.loading_comment_media.insert(key.clone());
+                let c_cm = thumb_client.clone();
+                let tx_cm = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(resp) = c_cm
+                        .get(&url)
+                        .header("Referer", "https://www.youtube.com/")
+                        .timeout(Duration::from_secs(10))
+                        .send()
+                        .await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(bytes) = resp.bytes().await {
+                                let k_clone = key.clone();
+                                let decoded = tokio::task::spawn_blocking(move || {
+                                    decode_comment_media_bytes(&k_clone, &bytes)
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                if let Some(entry) = decoded {
+                                    let _ = tx_cm.send(AppMessage::CommentMediaReady(entry)).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let _ = tx_cm.send(AppMessage::CommentMediaFailed(key)).await;
+                });
+            }
+        }
+
         let is_animating = state.toast.is_some()
             || state.has_live_ipc()
             || !state.loading_feeds.is_empty()
             || !state.loading_thumbs.is_empty()
+            || !state.loading_comment_media.is_empty()
+            || (state.screen == Screen::Detail && !state.comment_media_cache.is_empty())
             || state.is_searching_remote
             || state.is_loading_channel
             || state.search_pending_remote;
@@ -1884,6 +1946,34 @@ async fn handle_app_message(
             replies,
             continuation,
         } => {
+            enqueue_overlay_comments_media(state, &replies);
+            if state
+                .active_playback_video_id
+                .as_deref()
+                .is_some_and(|v| v.trim_start_matches("RD") == video_id.trim_start_matches("RD"))
+            {
+                if let Some(root) = state
+                    .overlay_comments
+                    .iter_mut()
+                    .find(|c| c.id == parent_comment_id)
+                {
+                    root.replies_continuation = continuation.clone();
+                    for r in &replies {
+                        if !root.replies.iter().any(|existing| existing.id == r.id) {
+                            root.replies.push(r.clone());
+                        }
+                    }
+                    let replies_json = overlay_replies_json_value(
+                        &replies,
+                        state.overlay_comments_uploader.as_deref(),
+                    );
+                    state.send_player_cmd(PlayerCommand::PushOverlayCommentReplies {
+                        root_id: parent_comment_id.clone(),
+                        replies_json,
+                        continuation: continuation.clone(),
+                    });
+                }
+            }
             if state
                 .detail_video
                 .as_ref()
@@ -1958,6 +2048,29 @@ async fn handle_app_message(
             video_id, image, ..
         } => {
             state.insert_loaded_thumbnail(video_id, image);
+        }
+        AppMessage::CommentMediaReady(decoded) => {
+            state.loading_comment_media.remove(&decoded.key);
+            if state.has_live_ipc()
+                && state.music.active_audio_session_id != Some(state.active_session_id)
+            {
+                let media_json = serde_json::json!({
+                    "key": decoded.key,
+                    "w": decoded.overlay_w,
+                    "h": decoded.overlay_h,
+                    "delay_ms": decoded.frame_delay_ms,
+                    "paths": decoded.bgra_paths,
+                })
+                .to_string();
+                state.send_player_cmd(PlayerCommand::PushOverlayCommentMedia { media_json });
+            }
+            state
+                .comment_media_cache
+                .insert(decoded.key.clone(), decoded);
+        }
+        AppMessage::CommentMediaFailed(key) => {
+            state.loading_comment_media.remove(&key);
+            state.failed_comment_media.insert(key);
         }
         AppMessage::ThumbnailFailed { video_id } => {
             state.loading_thumbs.remove(&video_id);
@@ -2194,6 +2307,58 @@ async fn handle_app_message(
                             comment_id,
                             translated_text: translated,
                         });
+                    });
+                }
+            }
+        }
+        AppMessage::OverlayRepliesRequested {
+            session_id,
+            video_id,
+            root_id,
+            continuation,
+        } => {
+            if session_id == state.active_session_id {
+                let cont_tok = continuation.or_else(|| {
+                    state
+                        .overlay_comments
+                        .iter()
+                        .find(|c| c.id == root_id)
+                        .and_then(|c| c.replies_continuation.clone())
+                });
+                if let Some(tok) = cont_tok {
+                    let c_rep = client.clone();
+                    let sess_rep = state.auth_vault.active_account().cloned();
+                    let tx_rep = tx.clone();
+                    let rid = root_id.clone();
+                    tokio::spawn(async move {
+                        if let Ok(page) =
+                            fetch_comment_replies(&c_rep, sess_rep.as_ref(), &tok).await
+                        {
+                            let _ = tx_rep
+                                .send(AppMessage::CommentRepliesLoaded {
+                                    video_id,
+                                    parent_comment_id: rid,
+                                    replies: page.comments,
+                                    continuation: page.continuation,
+                                })
+                                .await;
+                        }
+                    });
+                } else {
+                    let cached_reps = state
+                        .overlay_comments
+                        .iter()
+                        .find(|c| c.id == root_id)
+                        .map(|c| c.replies.clone())
+                        .unwrap_or_default();
+                    let replies_json = overlay_replies_json_value(
+                        &cached_reps,
+                        state.overlay_comments_uploader.as_deref(),
+                    );
+                    state.send_player_cmd(PlayerCommand::PushOverlayCommentReplies {
+                        root_id,
+                        replies_json,
+                        continuation: None,
                     });
                 }
             }
@@ -2938,8 +3103,29 @@ fn open_detail_for_video(
     spawn_overlay_comments_fetch(vid_id, state, pool, tx, client);
 }
 
-fn push_overlay_comments_to_mpv(state: &AppState, sort_newest: bool) {
+fn enqueue_overlay_comments_media(state: &mut AppState, comments: &[VideoComment]) {
+    for c in comments.iter().take(35) {
+        for m in c.media.iter().chain(c.replies.iter().flat_map(|r| r.media.iter())) {
+            if let Some(decoded) = state.comment_media_cache.get(&m.key).cloned() {
+                let media_json = serde_json::json!({
+                    "key": decoded.key,
+                    "w": decoded.overlay_w,
+                    "h": decoded.overlay_h,
+                    "delay_ms": decoded.frame_delay_ms,
+                    "paths": decoded.bgra_paths,
+                })
+                .to_string();
+                state.send_player_cmd(PlayerCommand::PushOverlayCommentMedia { media_json });
+            } else {
+                state.queue_comment_media(&m.key, &m.url);
+            }
+        }
+    }
+}
+
+fn push_overlay_comments_to_mpv(state: &mut AppState, sort_newest: bool) {
     let mut ordered = state.overlay_comments.clone();
+    enqueue_overlay_comments_media(state, &ordered);
     if sort_newest {
         ordered.sort_by_key(|c| {
             (
@@ -3008,6 +3194,7 @@ async fn handle_overlay_post_comment(
         state.send_player_cmd(PlayerCommand::PushOverlayCommentResult {
             ok: false,
             status: "Sign in ([L] in Phaenna TUI) to post comments".to_string(),
+            parent_id: None,
             new_comment_json: String::new(),
         });
         return;
@@ -3051,7 +3238,7 @@ async fn handle_overlay_post_comment(
             .find(|c| &c.id == pid || c.replies.iter().any(|r| &r.id == pid))
         {
             root.reply_count = root.reply_count.saturating_add(1);
-            root.replies.push(local_cmt.clone());
+            root.replies.insert(0, local_cmt.clone());
         }
         if state
             .detail_video
@@ -3060,7 +3247,8 @@ async fn handle_overlay_post_comment(
         {
             state.insert_comment_reply(pid, pid, local_cmt.clone());
         }
-        String::new()
+        overlay_comment_json_value(&local_cmt, state.overlay_comments_uploader.as_deref())
+            .to_string()
     } else {
         state.overlay_comments.insert(0, local_cmt.clone());
         if state
@@ -3088,7 +3276,7 @@ async fn handle_overlay_post_comment(
             .overlay_comments
             .iter()
             .chain(state.detail_comments.iter())
-            .find(|c| &c.id == pid)
+            .find(|c| &c.id == pid || c.replies.iter().any(|r| &r.id == pid))
             .and_then(|c| c.create_reply_params.clone())
     });
 
@@ -3105,6 +3293,7 @@ async fn handle_overlay_post_comment(
         let _ = cmd_tx.send(PlayerCommand::PushOverlayCommentResult {
             ok,
             status,
+            parent_id,
             new_comment_json,
         });
     });
