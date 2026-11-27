@@ -211,6 +211,7 @@ pub enum ActiveOverlay {
     PlayOptions,
     Settings,
     MusicSettings,
+    MusicEq,
     MusicAlbum,
     Help,
     Analytics,
@@ -381,12 +382,58 @@ pub enum MusicHit {
     ToggleLike,
     ToggleRightDrawer,
     OpenMusicSettings,
+    OpenMusicEq,
     OpenCurrentAlbum,
     VolumeDelta(i64),
     ToggleMute,
     SelectRightTab(YtmRightPaneTab),
     SelectQueueTrack(usize),
     SeekBar,
+}
+
+/// Filter tabs inside a YouTube Music Artist Profile popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum YtmArtistSectionTab {
+    #[default]
+    All,
+    TopSongs,
+    Albums,
+    Singles,
+    Videos,
+    About,
+}
+
+impl YtmArtistSectionTab {
+    pub const ALL: [Self; 6] = [
+        Self::All,
+        Self::TopSongs,
+        Self::Albums,
+        Self::Singles,
+        Self::Videos,
+        Self::About,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::TopSongs => "Top Songs",
+            Self::Albums => "Albums",
+            Self::Singles => "Singles",
+            Self::Videos => "Videos",
+            Self::About => "About",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::All => Self::TopSongs,
+            Self::TopSongs => Self::Albums,
+            Self::Albums => Self::Singles,
+            Self::Singles => Self::Videos,
+            Self::Videos => Self::About,
+            Self::About => Self::All,
+        }
+    }
 }
 
 /// Mouse click target inside the Spotify-style Album / Playlist / Artist popup modal.
@@ -396,7 +443,10 @@ pub enum YtmAlbumPopupHit {
     Back,
     PlayAll,
     ShuffleAll,
+    StartRadio,
     OpenArtist,
+    SelectArtistTab(YtmArtistSectionTab),
+    ExpandShelf(usize),
     PlayTrack(usize),
     QueueTrack(usize),
     LikeTrack(usize),
@@ -414,6 +464,7 @@ pub struct YtmAlbumPopupState {
     pub error: Option<String>,
     pub cursor: usize,
     pub scroll: usize,
+    pub section_filter: YtmArtistSectionTab,
     pub history: Vec<(String, String, Option<String>, YtmPage)>,
     pub hitboxes: Vec<(Rect, YtmAlbumPopupHit)>,
 }
@@ -422,7 +473,35 @@ pub struct YtmAlbumPopupState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MusicSettingsHit {
     Close,
+    OpenEqStudio,
     ActivateRow(usize),
+}
+
+/// Mouse click target inside the dedicated YouTube Music 10-Band EQ Studio modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MusicEqHit {
+    Close,
+    SelectPreset(crate::config::AudioEqPreset),
+    SelectSavedPreset(usize),
+    DeleteSavedPreset(usize),
+    StartSavePrompt,
+    OverwriteCustom,
+    CancelSavePrompt,
+    ToggleBypass,
+    ResetFlat,
+    PreampDelta(i8),
+    SelectBand(usize),
+    BandDelta(usize, i8),
+    SetBandGain(usize, i8),
+}
+
+/// Interactive state for the dedicated YouTube Music 10-Band EQ Studio modal.
+#[derive(Debug, Clone, Default)]
+pub struct YtmMusicEqState {
+    pub band_cursor: usize,
+    pub save_editing: bool,
+    pub save_input: String,
+    pub hitboxes: Vec<(Rect, MusicEqHit)>,
 }
 
 /// Full interactive state for the YouTube Music tab and background audio player.
@@ -461,9 +540,12 @@ pub struct YtmMusicState {
     pub lyrics: Option<YtmLyrics>,
     pub lyrics_loading: bool,
     pub album_popup: YtmAlbumPopupState,
+    pub last_opened_collection: Option<(String, String, Option<String>)>,
+    pub eq: YtmMusicEqState,
     pub settings_cursor: usize,
     pub settings_hitboxes: Vec<(Rect, MusicSettingsHit)>,
     pub last_click: Option<(usize, Instant)>,
+    pub sidebar_last_click: Option<(usize, Instant)>,
     pub hitboxes: Vec<(Rect, MusicHit)>,
     pub progress_bar_rect: Rect,
 }
@@ -504,9 +586,12 @@ impl Default for YtmMusicState {
             lyrics: None,
             lyrics_loading: false,
             album_popup: YtmAlbumPopupState::default(),
+            last_opened_collection: None,
+            eq: YtmMusicEqState::default(),
             settings_cursor: 0,
             settings_hitboxes: Vec::new(),
             last_click: None,
+            sidebar_last_click: None,
             hitboxes: Vec::new(),
             progress_bar_rect: Rect::default(),
         }
@@ -3199,7 +3284,8 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::PlayOptions => return Some(play_options_modal_rect(frame_area)),
         ActiveOverlay::Settings => (82, 74),
         ActiveOverlay::MusicSettings => (72, 72),
-        ActiveOverlay::MusicAlbum => (84, 84),
+        ActiveOverlay::MusicEq => (84, 78),
+        ActiveOverlay::MusicAlbum => (88, 86),
         ActiveOverlay::Help => return Some(help_modal_rect(frame_area)),
         ActiveOverlay::Analytics => (94, 90),
         ActiveOverlay::Calendar => (90, 84),

@@ -61,6 +61,17 @@ impl YtmTrack {
         format!("ytm:{}", self.video_id)
     }
 
+    /// Best cover URL for this track, falling back to YouTube high-quality thumbnail when absent.
+    pub fn effective_thumb_url(&self) -> String {
+        if !self.thumb_url.trim().is_empty() {
+            self.thumb_url.clone()
+        } else if !self.video_id.trim().is_empty() {
+            format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", self.video_id)
+        } else {
+            String::new()
+        }
+    }
+
     #[allow(dead_code)]
     pub fn subtitle_line(&self) -> String {
         let mut parts = Vec::new();
@@ -142,6 +153,8 @@ impl YtmShelfItem {
 pub struct YtmShelf {
     pub title: String,
     pub items: Vec<YtmShelfItem>,
+    pub more_browse_id: Option<String>,
+    pub more_params: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -154,6 +167,10 @@ pub struct YtmPage {
     pub header_track_summary: Option<String>,
     pub header_thumb: Option<String>,
     pub header_playlist_id: Option<String>,
+    pub header_radio_playlist_id: Option<String>,
+    pub header_subscribers: Option<String>,
+    pub header_description: Option<String>,
+    pub is_artist_profile: bool,
     pub shelves: Vec<YtmShelf>,
     pub tracks: Vec<YtmTrack>,
     pub continuation: Option<String>,
@@ -313,6 +330,34 @@ fn runs_text(val: Option<&Value>) -> String {
     String::new()
 }
 
+fn upgrade_ytm_thumb_url(raw: &str) -> String {
+    let url = normalize_thumb_url(raw);
+    if url.contains("googleusercontent.com") || url.contains("yt3.ggpht.com") {
+        if let Some(eq_idx) = url.rfind('=') {
+            let suffix = &url[eq_idx + 1..];
+            if let Some(rest) = suffix.strip_prefix('w') {
+                if let Some(dash_h) = rest.find("-h") {
+                    let w_str = &rest[..dash_h];
+                    let after_h = &rest[dash_h + 2..];
+                    let h_len = after_h
+                        .bytes()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    if let (Ok(w), Ok(_h)) =
+                        (w_str.parse::<u32>(), after_h[..h_len].parse::<u32>())
+                    {
+                        if w > 0 && w < 400 {
+                            let tail = &after_h[h_len..];
+                            return format!("{}=w544-h544{tail}", &url[..eq_idx]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    url
+}
+
 fn best_thumb(val: Option<&Value>) -> String {
     let Some(arr) = val
         .and_then(|t| t.get("thumbnails").or_else(|| t.pointer("/musicThumbnailRenderer/thumbnail/thumbnails")))
@@ -323,7 +368,7 @@ fn best_thumb(val: Option<&Value>) -> String {
     arr.iter()
         .max_by_key(|t| t.get("width").and_then(Value::as_u64).unwrap_or(0))
         .and_then(|t| t.get("url").and_then(Value::as_str))
-        .map(normalize_thumb_url)
+        .map(upgrade_ytm_thumb_url)
         .unwrap_or_default()
 }
 
@@ -477,15 +522,15 @@ fn parse_two_row_item(r: &Value) -> Option<YtmShelfItem> {
     }
     let (bid, params, page_type) = extract_browse_endpoint(nav);
 
-    let kind = if vid.is_some() && bid.is_none() {
+    let kind = if let Some(ref b) = bid {
+        classify_browse_kind(b, page_type, &subtitle)
+    } else if vid.is_some() {
         let sub_low = subtitle.to_ascii_lowercase();
         if sub_low.contains("video") {
             YtmItemKind::Video
         } else {
             YtmItemKind::Song
         }
-    } else if let Some(ref b) = bid {
-        classify_browse_kind(b, page_type, &subtitle)
     } else if pid.is_some() {
         if pid.as_deref().unwrap_or("").starts_with("RD") {
             YtmItemKind::Radio
@@ -495,6 +540,15 @@ fn parse_two_row_item(r: &Value) -> Option<YtmShelfItem> {
     } else {
         return None;
     };
+
+    // Never attach an overlay child track video_id onto Album / Playlist / Artist collection cards,
+    // otherwise clicking another album to inspect it would hijack/stop active playback!
+    if matches!(
+        kind,
+        YtmItemKind::Album | YtmItemKind::Playlist | YtmItemKind::Artist
+    ) {
+        vid = None;
+    }
 
     Some(YtmShelfItem {
         kind,
@@ -591,7 +645,17 @@ fn parse_responsive_item(r: &Value, default_playlist_id: Option<&str>) -> Option
     let subtitle = sub_parts.join(" • ");
     let thumb_url = best_thumb(r.get("thumbnail"));
 
-    let kind = if vid.is_some() {
+    let nav_is_collection = bid.as_ref().is_some_and(|b| {
+        let k = classify_browse_kind(b, page_type, &subtitle);
+        matches!(
+            k,
+            YtmItemKind::Album | YtmItemKind::Playlist | YtmItemKind::Artist
+        )
+    });
+
+    let kind = if nav_is_collection {
+        classify_browse_kind(bid.as_deref().unwrap_or(""), page_type, &subtitle)
+    } else if vid.is_some() {
         let vtype = play_ep
             .or(nav_ep)
             .or(title_nav)
@@ -610,6 +674,13 @@ fn parse_responsive_item(r: &Value, default_playlist_id: Option<&str>) -> Option
     } else {
         return None;
     };
+
+    if matches!(
+        kind,
+        YtmItemKind::Album | YtmItemKind::Playlist | YtmItemKind::Artist
+    ) {
+        vid = None;
+    }
 
     Some(YtmShelfItem {
         kind,
@@ -711,7 +782,11 @@ fn responsive_to_track(r: &Value, fallback_thumb: &str, default_playlist_id: Opt
 
     let mut thumb_url = best_thumb(r.get("thumbnail"));
     if thumb_url.is_empty() {
-        thumb_url = fallback_thumb.to_string();
+        if !fallback_thumb.is_empty() {
+            thumb_url = fallback_thumb.to_string();
+        } else if !video_id.is_empty() {
+            thumb_url = format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg");
+        }
     }
 
     let vtype = play_ep
@@ -744,14 +819,25 @@ fn responsive_to_track(r: &Value, fallback_thumb: &str, default_playlist_id: Opt
 pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
     let mut page = YtmPage::default();
 
-    // Header (albums, playlists, artists)
+    // Header (albums, personal/editable playlists, immersive/visual artist headers)
     for hdr_ptr in [
         "/header/musicDetailHeaderRenderer",
+        "/header/musicEditablePlaylistDetailHeaderRenderer/header/musicDetailHeaderRenderer",
+        "/header/musicEditablePlaylistDetailHeaderRenderer/header/musicResponsiveHeaderRenderer",
         "/header/musicImmersiveHeaderRenderer",
         "/header/musicVisualHeaderRenderer",
         "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer",
+        "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicEditablePlaylistDetailHeaderRenderer/header/musicResponsiveHeaderRenderer",
+        "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicEditablePlaylistDetailHeaderRenderer/header/musicDetailHeaderRenderer",
     ] {
         if let Some(hdr) = root.pointer(hdr_ptr) {
+            if hdr_ptr.contains("ImmersiveHeaderRenderer")
+                || hdr_ptr.contains("VisualHeaderRenderer")
+                || hdr.get("subscriptionButton").is_some()
+                || hdr.get("startRadioButton").is_some()
+            {
+                page.is_artist_profile = true;
+            }
             let t = runs_text(hdr.get("title"));
             if !t.is_empty() {
                 page.header_title = Some(t);
@@ -789,23 +875,63 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                     page.header_artist = Some(strap);
                 }
             }
-            let summary = runs_text(hdr.get("secondSubtitle").or_else(|| hdr.get("description")));
+            let summary = runs_text(hdr.get("secondSubtitle"));
             if !summary.is_empty() {
                 page.header_track_summary = Some(summary);
+            }
+            let desc = runs_text(hdr.get("description"));
+            if !desc.is_empty() {
+                page.header_description = Some(desc.clone());
+                if page.header_track_summary.is_none() {
+                    page.header_track_summary = Some(desc);
+                }
+            }
+            let subs = runs_text(
+                hdr.pointer("/subscriptionButton/subscribeButtonRenderer/longSubscriberCountText")
+                    .or_else(|| {
+                        hdr.pointer(
+                            "/subscriptionButton/subscribeButtonRenderer/subscriberCountText",
+                        )
+                    })
+                    .or_else(|| {
+                        hdr.pointer(
+                            "/subscriptionButton/subscribeButtonRenderer/shortSubscriberCountText",
+                        )
+                    }),
+            );
+            if !subs.is_empty() {
+                page.header_subscribers = Some(subs);
             }
             let th = best_thumb(hdr.get("thumbnail"));
             if !th.is_empty() {
                 page.header_thumb = Some(th);
             }
+            let (_, play_pid) = extract_watch_endpoint(
+                hdr.pointer("/playButton/buttonRenderer/navigationEndpoint"),
+            );
+            if let Some(pid) = play_pid {
+                page.header_playlist_id = Some(pid);
+            }
+            let (_, radio_pid) = extract_watch_endpoint(
+                hdr.pointer("/startRadioButton/buttonRenderer/navigationEndpoint"),
+            );
+            if let Some(rpid) = radio_pid {
+                page.header_radio_playlist_id = Some(rpid);
+            }
             if let Some(btns) = hdr.get("buttons").and_then(Value::as_array) {
                 for b in btns {
-                    let (_, pid) = extract_watch_endpoint(
-                        b.pointer("/musicPlayButtonRenderer/playNavigationEndpoint")
-                            .or_else(|| b.pointer("/buttonRenderer/navigationEndpoint")),
-                    );
-                    if pid.is_some() {
-                        page.header_playlist_id = pid;
-                        break;
+                    let ep = b
+                        .pointer("/musicPlayButtonRenderer/playNavigationEndpoint")
+                        .or_else(|| b.pointer("/buttonRenderer/navigationEndpoint"));
+                    let (_, pid) = extract_watch_endpoint(ep);
+                    if let Some(p) = pid {
+                        if p.starts_with("RD") {
+                            if page.header_radio_playlist_id.is_none() {
+                                page.header_radio_playlist_id = Some(p);
+                            }
+                        } else if page.header_playlist_id.is_none() {
+                            page.header_playlist_id = Some(p);
+                        }
                     }
                 }
             }
@@ -854,6 +980,9 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                         }
                     }
                     if !items.is_empty() {
+                        let (more_bid, more_p, _) = extract_browse_endpoint(
+                            car.pointer("/header/musicCarouselShelfBasicHeaderRenderer/moreContentButton/buttonRenderer/navigationEndpoint"),
+                        );
                         page.shelves.push(YtmShelf {
                             title: if title.is_empty() {
                                 "For You".to_string()
@@ -861,6 +990,8 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                                 title
                             },
                             items,
+                            more_browse_id: more_bid,
+                            more_params: more_p,
                         });
                     }
                 } else if let Some(ms) = block
@@ -885,6 +1016,8 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                         }
                     }
                     if !items.is_empty() {
+                        let (more_bid, more_p, _) =
+                            extract_browse_endpoint(ms.get("bottomEndpoint"));
                         page.shelves.push(YtmShelf {
                             title: if title.is_empty() {
                                 page.header_title
@@ -894,7 +1027,25 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                                 title
                             },
                             items,
+                            more_browse_id: more_bid,
+                            more_params: more_p,
                         });
+                    }
+                } else if let Some(desc_blk) = block.get("musicDescriptionShelfRenderer") {
+                    let bio = runs_text(desc_blk.get("description"));
+                    if !bio.is_empty() {
+                        page.is_artist_profile = true;
+                        match page.header_description {
+                            Some(ref existing) if !existing.contains(&bio) => {
+                                page.header_description = Some(format!("{existing}\n{bio}"));
+                            }
+                            None => page.header_description = Some(bio),
+                            _ => {}
+                        }
+                    }
+                    let sub_info = runs_text(desc_blk.get("subheader"));
+                    if !sub_info.is_empty() && page.header_subscribers.is_none() {
+                        page.header_subscribers = Some(sub_info);
                     }
                 } else if let Some(grid) = block.get("gridRenderer") {
                     if page.continuation.is_none() {
@@ -914,6 +1065,8 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                         page.shelves.push(YtmShelf {
                             title: "Your Library".to_string(),
                             items,
+                            more_browse_id: None,
+                            more_params: None,
                         });
                     }
                 }
@@ -943,6 +1096,8 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                 page.shelves.push(YtmShelf {
                     title: "More Tracks".to_string(),
                     items,
+                    more_browse_id: None,
+                    more_params: None,
                 });
             }
         }
@@ -980,6 +1135,7 @@ pub fn parse_ytm_search_json(root: &Value) -> YtmPage {
                 page.shelves.push(YtmShelf {
                     title: "Results".to_string(),
                     items,
+                    ..Default::default()
                 });
             }
             return page;
@@ -994,16 +1150,24 @@ pub fn parse_ytm_search_json(root: &Value) -> YtmPage {
                 let (vid, pid) = extract_watch_endpoint(on_tap);
                 let (bid, params, pt) = extract_browse_endpoint(on_tap);
                 if !title.is_empty() && (vid.is_some() || bid.is_some()) {
-                    let kind = if vid.is_some() {
-                        YtmItemKind::Song
+                    let kind = if let Some(ref b) = bid {
+                        classify_browse_kind(b, pt, &subtitle)
                     } else {
-                        classify_browse_kind(bid.as_deref().unwrap_or(""), pt, &subtitle)
+                        YtmItemKind::Song
+                    };
+                    let keep_vid = if matches!(
+                        kind,
+                        YtmItemKind::Album | YtmItemKind::Playlist | YtmItemKind::Artist
+                    ) {
+                        None
+                    } else {
+                        vid
                     };
                     let it = YtmShelfItem {
                         kind,
                         title: title.clone(),
                         subtitle: subtitle.clone(),
-                        video_id: vid.clone(),
+                        video_id: keep_vid,
                         browse_id: bid,
                         playlist_id: pid.clone(),
                         params,
@@ -1016,6 +1180,7 @@ pub fn parse_ytm_search_json(root: &Value) -> YtmPage {
                     page.shelves.push(YtmShelf {
                         title: "Top result".to_string(),
                         items: vec![it],
+                        ..Default::default()
                     });
                 }
             } else if let Some(ms) = block.get("musicShelfRenderer") {
@@ -1044,6 +1209,7 @@ pub fn parse_ytm_search_json(root: &Value) -> YtmPage {
                             title
                         },
                         items,
+                        ..Default::default()
                     });
                 }
             }
@@ -1572,5 +1738,112 @@ mod tests {
             page.header_track_summary.as_deref(),
             Some("11 songs · 45 minutes")
         );
+
+        // Collection card with overlay videoId must drop video_id so clicking never interrupts playback
+        let album_card = serde_json::json!({
+            "title": { "runs": [{ "text": "Absolution" }] },
+            "subtitle": { "runs": [{ "text": "Album • Muse" }] },
+            "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREb_abso", "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ALBUM" } } } },
+            "thumbnailOverlay": { "musicItemThumbnailOverlayRenderer": { "content": { "musicPlayButtonRenderer": { "playNavigationEndpoint": { "watchEndpoint": { "videoId": "first_track_vid", "playlistId": "OLAK_abso" } } } } } },
+            "thumbnailRenderer": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [{ "url": "https://lh3.googleusercontent.com/ab=w60-h60-l90-rj", "width": 60, "height": 60 }] } } }
+        });
+        let parsed_card = parse_two_row_item(&album_card).unwrap();
+        assert_eq!(parsed_card.kind, YtmItemKind::Album);
+        assert_eq!(parsed_card.browse_id.as_deref(), Some("MPREb_abso"));
+        assert!(parsed_card.video_id.is_none());
+        assert!(parsed_card.thumb_url.contains("=w544-h544-l90-rj"));
+
+        // Personal editable playlist header + track cover fallback
+        let pl_json = serde_json::json!({
+            "header": {
+                "musicEditablePlaylistDetailHeaderRenderer": {
+                    "header": {
+                        "musicDetailHeaderRenderer": {
+                            "title": { "runs": [{ "text": "Still listening" }] },
+                            "thumbnail": { "thumbnails": [{ "url": "https://lh3.googleusercontent.com/pl=w120-h120", "width": 120, "height": 120 }] }
+                        }
+                    }
+                }
+            },
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{ "tabRenderer": { "content": { "sectionListRenderer": { "contents": [{
+                        "musicPlaylistShelfRenderer": {
+                            "contents": [{
+                                "musicResponsiveListItemRenderer": {
+                                    "flexColumns": [
+                                        { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Into Darkness" }] } } },
+                                        { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Thomas Bergersen" }] } } }
+                                    ],
+                                    "playlistItemData": { "videoId": "trk123" }
+                                }
+                            }]
+                        }
+                    }] } } } }]
+                }
+            }
+        });
+        let pl_page = parse_ytm_browse_json(&pl_json);
+        assert_eq!(pl_page.header_title.as_deref(), Some("Still listening"));
+        assert!(pl_page.header_thumb.as_deref().unwrap().contains("=w544-h544"));
+        assert_eq!(pl_page.tracks.len(), 1);
+
+        // Rich Artist Profile (immersive header + Top Songs + Albums + Description shelf)
+        let artist_json = serde_json::json!({
+            "header": {
+                "musicImmersiveHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Muse" }] },
+                    "description": { "runs": [{ "text": "English rock band formed in 1994." }] },
+                    "subscriptionButton": { "subscribeButtonRenderer": { "subscriberCountText": { "runs": [{ "text": "14.2M subscribers" }] } } },
+                    "playButton": { "buttonRenderer": { "navigationEndpoint": { "watchEndpoint": { "playlistId": "OLAK_top" } } } },
+                    "startRadioButton": { "buttonRenderer": { "navigationEndpoint": { "watchPlaylistEndpoint": { "playlistId": "RDEM_muse" } } } },
+                    "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [{ "url": "https://lh3.googleusercontent.com/muse=w544-h544", "width": 544, "height": 544 }] } } }
+                }
+            },
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{ "tabRenderer": { "content": { "sectionListRenderer": { "contents": [
+                        {
+                            "musicShelfRenderer": {
+                                "title": { "runs": [{ "text": "Songs" }] },
+                                "contents": [{
+                                    "musicResponsiveListItemRenderer": {
+                                        "flexColumns": [
+                                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Starlight" }] } } },
+                                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Muse" }] } } }
+                                        ],
+                                        "overlay": { "musicItemThumbnailOverlayRenderer": { "content": { "musicPlayButtonRenderer": { "playNavigationEndpoint": { "watchEndpoint": { "videoId": "Pgum6OT_VH8" } } } } } }
+                                    }
+                                }]
+                            }
+                        },
+                        {
+                            "musicCarouselShelfRenderer": {
+                                "header": { "musicCarouselShelfBasicHeaderRenderer": { "title": { "runs": [{ "text": "Albums" }] } } },
+                                "contents": [{
+                                    "musicTwoRowItemRenderer": {
+                                        "title": { "runs": [{ "text": "Black Holes and Revelations" }] },
+                                        "subtitle": { "runs": [{ "text": "2006" }] },
+                                        "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREb_bh", "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ALBUM" } } } }
+                                    }
+                                }]
+                            }
+                        },
+                        {
+                            "musicDescriptionShelfRenderer": {
+                                "description": { "runs": [{ "text": "Full Teignmouth biography." }] }
+                            }
+                        }
+                    ] } } } }]
+                }
+            }
+        });
+        let art_page = parse_ytm_browse_json(&artist_json);
+        assert!(art_page.is_artist_profile);
+        assert_eq!(art_page.header_subscribers.as_deref(), Some("14.2M subscribers"));
+        assert_eq!(art_page.header_radio_playlist_id.as_deref(), Some("RDEM_muse"));
+        assert!(art_page.header_description.as_deref().unwrap().contains("Teignmouth"));
+        assert_eq!(art_page.tracks.len(), 1);
+        assert!(art_page.shelves.iter().any(|s| s.title == "Albums"));
     }
 }

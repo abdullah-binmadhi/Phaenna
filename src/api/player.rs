@@ -212,15 +212,41 @@ pub fn build_mpv_audio_filter_chain(
     }
 }
 
-/// Build an anti-clipping FFmpeg `af` chain for YouTube Music playback:
-/// automatically applies negative headroom matching peak EQ boost (`-2 dB` margin)
-/// and finishes with a transparent lookahead brickwall limiter (`alimiter`) so
-/// inter-sample Opus/AAC peaks and EQ boosts never crackle or clip.
+/// Compute effective Music preamp gain (dB) after automatic peak-boost compensation.
+pub fn effective_music_preamp_db(cfg: &crate::config::MusicSettingsConfig) -> i8 {
+    if cfg.eq_bypass {
+        return cfg.preamp_db.clamp(-12, 6);
+    }
+    let bands = cfg.active_eq_bands();
+    let max_boost = bands.iter().copied().filter(|&b| b > 0).max().unwrap_or(0);
+    (cfg.preamp_db as i32 - max_boost as i32).clamp(-18, 6) as i8
+}
+
+/// Build an audiophile 64-bit float (`dblp`) FFmpeg `af` chain for YouTube Music playback:
+/// compensates peak EQ boosts accurately without dulling clean Flat tracks, optionally runs
+/// DynamicSoft leveling / spatial crossfeed, and finishes with an ultra-transparent high-ceiling
+/// lookahead true-peak limiter (`limit=0.985`, `asc=true`, `latency=true`).
 pub fn build_music_audio_filter_chain(cfg: &crate::config::MusicSettingsConfig) -> Option<String> {
     let mut nodes: Vec<String> = Vec::new();
-    let bands = cfg.eq_preset.band_gains_db();
+    let bands = if cfg.eq_bypass {
+        [0; 10]
+    } else {
+        cfg.active_eq_bands()
+    };
     let max_boost = bands.iter().copied().filter(|&b| b > 0).max().unwrap_or(0);
-    let safe_preamp = (cfg.preamp_db as i32 - max_boost as i32 - if cfg.anti_clip_limiter { 2 } else { 0 }).clamp(-18, 0);
+    let safe_preamp = (cfg.preamp_db as i32 - max_boost as i32).clamp(-18, 6);
+
+    let has_dsp = safe_preamp != 0
+        || bands.iter().any(|&g| g != 0)
+        || cfg.normalization == crate::config::MusicNormMode::DynamicSoft
+        || cfg.channel_mode != AudioChannelMode::Stereo
+        || cfg.anti_clip_limiter;
+    if !has_dsp {
+        return None;
+    }
+
+    // Keep all DSP arithmetic in 64-bit double float to prevent integer quantization haze.
+    nodes.push("aformat=sample_fmts=dblp".to_string());
 
     if safe_preamp != 0 {
         nodes.push(format!("volume={safe_preamp}dB"));
@@ -232,7 +258,7 @@ pub fn build_music_audio_filter_chain(cfg: &crate::config::MusicSettingsConfig) 
         }
     }
     if cfg.normalization == crate::config::MusicNormMode::DynamicSoft {
-        nodes.push("dynaudnorm=f=200:g=21:p=0.88:m=10".to_string());
+        nodes.push("dynaudnorm=f=200:g=21:p=0.92:m=8".to_string());
     }
     match cfg.channel_mode {
         AudioChannelMode::Stereo => {}
@@ -241,14 +267,14 @@ pub fn build_music_audio_filter_chain(cfg: &crate::config::MusicSettingsConfig) 
         AudioChannelMode::WideStage => nodes.push("extrastereo=m=1.35".to_string()),
     }
     if cfg.anti_clip_limiter {
-        // Transparent brickwall peak guard at -0.7 dBFS so no digital clipping hits PipeWire/DAC.
-        nodes.push("alimiter=limit=0.92:attack=5:release=60:level=disabled".to_string());
+        // High-ceiling (-0.13 dBFS) latency-compensated lookahead true-peak limiter with ASC:
+        // leaves crisp transients untouched while blocking inter-sample >0 dBFS clipping crackle.
+        nodes.push(
+            "alimiter=limit=0.985:attack=0.5:release=40:asc=true:asc_level=0.7:latency=true:level=false"
+                .to_string(),
+        );
     }
-    if nodes.is_empty() {
-        None
-    } else {
-        Some(format!("lavfi=[{}]", nodes.join(",")))
-    }
+    Some(format!("lavfi=[{}]", nodes.join(",")))
 }
 
 const YOUTUBE_INPUT_CONF: &str = r#"# Phaenna YouTube-Parity Player Keybindings (works windowed & fullscreen)
@@ -2203,17 +2229,23 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     let mut flags = if opts.audio_headless {
         vec![
             "cache=yes".to_string(),
+            "demuxer-readahead-secs=25".to_string(),
             format!("demuxer-max-bytes={max_buf}"),
             format!("demuxer-max-back-bytes={back_buf}"),
             format!("force-media-title={}", opts.title),
+            "ao=pipewire,pulse,alsa".to_string(),
+            "audio-format=float".to_string(),
+            "audio-normalize-downmix=no".to_string(),
+            "audio-stream-silence=yes".to_string(),
             "vid=no".to_string(),
             "audio-display=no".to_string(),
             "video-sync=audio".to_string(),
             "interpolation=no".to_string(),
             "gapless-audio=yes".to_string(),
-            "audio-buffer=0.5".to_string(),
+            "audio-buffer=0.35".to_string(),
             "replaygain=track".to_string(),
-            "replaygain-preamp=-2".to_string(),
+            "replaygain-preamp=0".to_string(),
+            "replaygain-clip=no".to_string(),
             "volume-max=100".to_string(),
             "audio-pitch-correction=yes".to_string(),
         ]
@@ -2460,7 +2492,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             flags.push(format!("ytdl-format={}", opts.quality_format));
             let vcodec_order = eff_master.codec_priority.format_sort_vcodec();
             let sort_spec = if opts.audio_headless {
-                "lang,abr,asr".to_string()
+                "abr,asr,lang".to_string()
             } else {
                 match opts.dub_preference {
                     // Keep `lang` ahead of `abr` so YouTube's `language_preference=10` (Original)
@@ -3145,10 +3177,14 @@ mod tests {
         assert!(args.iter().any(|a| a == "--force-window=no"));
         assert!(args.iter().any(|a| a == "--vid=no"));
         assert!(args.iter().any(|a| a == "--audio-display=no"));
+        assert!(args.iter().any(|a| a == "--ao=pipewire,pulse,alsa"));
+        assert!(args.iter().any(|a| a == "--audio-format=float"));
+        assert!(args.iter().any(|a| a == "--audio-stream-silence=yes"));
         assert!(args.iter().any(|a| a == "--gapless-audio=yes"));
-        assert!(args.iter().any(|a| a == "--audio-buffer=0.5"));
+        assert!(args.iter().any(|a| a == "--audio-buffer=0.35"));
         assert!(args.iter().any(|a| a == "--replaygain=track"));
-        assert!(args.iter().any(|a| a == "--replaygain-preamp=-2"));
+        assert!(args.iter().any(|a| a == "--replaygain-preamp=0"));
+        assert!(args.iter().any(|a| a == "--replaygain-clip=no"));
         assert!(args.iter().any(|a| a == "--volume-max=100"));
         assert!(args.iter().any(|a| a == "--video-sync=audio"));
         assert!(!args.iter().any(|a| a.starts_with("--glsl-shaders=")));
@@ -3162,11 +3198,15 @@ mod tests {
 
     #[test]
     fn test_music_audio_filter_chain_prevents_clipping() {
-        use crate::config::{AudioChannelMode, AudioEqPreset, MusicNormMode, MusicSettingsConfig};
+        use crate::config::{
+            AudioChannelMode, AudioEqPreset, MusicNormMode, MusicSettingsConfig,
+            SavedMusicEqPreset,
+        };
 
         let def_chain = build_music_audio_filter_chain(&MusicSettingsConfig::default()).unwrap();
-        assert!(def_chain.contains("volume=-2dB"));
-        assert!(def_chain.contains("alimiter=limit=0.92:attack=5:release=60:level=disabled"));
+        assert!(def_chain.contains("aformat=sample_fmts=dblp"));
+        assert!(!def_chain.contains("volume="));
+        assert!(def_chain.contains("alimiter=limit=0.985:attack=0.5:release=40:asc=true"));
 
         let bass_cfg = MusicSettingsConfig {
             eq_preset: AudioEqPreset::BassBoost,
@@ -3175,13 +3215,30 @@ mod tests {
             ..Default::default()
         };
         let bass_chain = build_music_audio_filter_chain(&bass_cfg).unwrap();
-        // BassBoost max peak (+6 dB) + default -2 dB safety headroom => volume=-8dB
-        assert!(bass_chain.contains("volume=-8dB"), "got {bass_chain}");
+        // BassBoost max peak (+6 dB) -> exact -6 dB headroom compensation (no extra -2 dB dullness)
+        assert!(bass_chain.contains("volume=-6dB"), "got {bass_chain}");
         assert!(bass_chain.contains("equalizer=f=31:"));
         assert!(bass_chain.contains("dynaudnorm="));
         assert!(bass_chain.contains("crossfeed="));
         assert!(bass_chain.contains("alimiter="));
 
+        // Saved custom EQ preset takes priority and applies its own bands cleanly
+        let custom_cfg = MusicSettingsConfig {
+            eq_preset: AudioEqPreset::Custom,
+            preamp_db: -1,
+            active_saved_eq: Some("Studio Punch".to_string()),
+            saved_eq_presets: vec![SavedMusicEqPreset {
+                name: "Studio Punch".to_string(),
+                bands: [4, 2, 0, 0, 0, 1, 2, 3, 2, 1],
+                preamp_db: -1,
+            }],
+            ..Default::default()
+        };
+        let custom_chain = build_music_audio_filter_chain(&custom_cfg).unwrap();
+        assert!(custom_chain.contains("volume=-5dB"), "got {custom_chain}");
+        assert!(custom_chain.contains("equalizer=f=31:t=q:w=1.4:g=4"));
+
+        // Pure direct pass-through when Flat + preamp 0 + limiter disabled
         let raw_cfg = MusicSettingsConfig {
             anti_clip_limiter: false,
             normalization: MusicNormMode::Off,

@@ -45,6 +45,7 @@ pub fn render_app(frame: &mut Frame, state: &mut AppState) {
         ActiveOverlay::PlayOptions => studio::render_studio_modal(frame, state),
         ActiveOverlay::Settings => settings::render_settings_modal(frame, state),
         ActiveOverlay::MusicSettings => music::render_music_settings_modal(frame, state),
+        ActiveOverlay::MusicEq => music::render_music_eq_modal(frame, state),
         ActiveOverlay::MusicAlbum => music::render_album_popup_modal(frame, state),
         ActiveOverlay::Help => help::render_help_modal(frame, state),
         ActiveOverlay::Analytics => analytics::render_analytics_modal(frame, state),

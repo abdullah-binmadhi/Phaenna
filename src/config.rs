@@ -2067,7 +2067,9 @@ impl MusicAudioQuality {
 
     pub const fn ytdl_format(self) -> &'static str {
         match self {
-            Self::HiFiOpus => "bestaudio[acodec^=opus]/bestaudio/best",
+            Self::HiFiOpus => {
+                "bestaudio[abr>=200][acodec^=opus]/bestaudio[acodec^=opus]/bestaudio[abr>=192]/bestaudio/best"
+            }
             Self::AacHigh => "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
             Self::DataSaver => "bestaudio[abr<=?96]/bestaudio/best",
         }
@@ -2094,11 +2096,21 @@ impl MusicNormMode {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::ReplayGain => "ReplayGain (-14 LUFS Match)",
+            Self::ReplayGain => "ReplayGain (Clip-Safe Match)",
             Self::DynamicSoft => "Soft Dynamic Leveling",
-            Self::Off => "Off (Headroom + Limiter Only)",
+            Self::Off => "Off (Studio Direct / Bit-Accurate)",
         }
     }
+}
+
+/// User-saved 10-band Equalizer + Preamp preset persisted inside `[music]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedMusicEqPreset {
+    pub name: String,
+    #[serde(default)]
+    pub bands: [i8; 10],
+    #[serde(default)]
+    pub preamp_db: i8,
 }
 
 /// Separate configuration profile for the YouTube Music Spotify-style workspace & audio engine.
@@ -2112,6 +2124,14 @@ pub struct MusicSettingsConfig {
     pub anti_clip_limiter: bool,
     #[serde(default)]
     pub eq_preset: AudioEqPreset,
+    #[serde(default)]
+    pub custom_eq_bands: [i8; 10],
+    #[serde(default)]
+    pub eq_bypass: bool,
+    #[serde(default)]
+    pub active_saved_eq: Option<String>,
+    #[serde(default)]
+    pub saved_eq_presets: Vec<SavedMusicEqPreset>,
     #[serde(default)]
     pub preamp_db: i8,
     #[serde(default)]
@@ -2133,6 +2153,10 @@ impl Default for MusicSettingsConfig {
             normalization: MusicNormMode::default(),
             anti_clip_limiter: true,
             eq_preset: AudioEqPreset::Flat,
+            custom_eq_bands: [0; 10],
+            eq_bypass: false,
+            active_saved_eq: None,
+            saved_eq_presets: Vec::new(),
             preamp_db: 0,
             channel_mode: AudioChannelMode::Stereo,
             show_right_drawer: true,
@@ -2140,6 +2164,40 @@ impl Default for MusicSettingsConfig {
             autoplay_mix: true,
             default_video_mode: false,
         }
+    }
+}
+
+impl MusicSettingsConfig {
+    /// Active 10-band Music EQ gains respecting named saved profile, Custom curve, or preset.
+    pub fn active_eq_bands(&self) -> [i8; 10] {
+        if let Some(ref saved_name) = self.active_saved_eq {
+            if let Some(found) = self
+                .saved_eq_presets
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(saved_name))
+            {
+                return found.bands;
+            }
+        }
+        if self.eq_preset == AudioEqPreset::Custom {
+            self.custom_eq_bands
+        } else {
+            self.eq_preset.band_gains_db()
+        }
+    }
+
+    /// Concise badge label for the bottom player bar & Music EQ header.
+    pub fn eq_badge_label(&self) -> String {
+        if self.eq_bypass {
+            return "BYP".to_string();
+        }
+        if let Some(ref name) = self.active_saved_eq {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                return trimmed.chars().take(8).collect();
+            }
+        }
+        self.eq_preset.short_label().to_string()
     }
 }
 
@@ -2735,7 +2793,15 @@ mod tests {
                 audio_quality: MusicAudioQuality::AacHigh,
                 normalization: MusicNormMode::DynamicSoft,
                 anti_clip_limiter: false,
-                eq_preset: AudioEqPreset::Jazz,
+                eq_preset: AudioEqPreset::Custom,
+                custom_eq_bands: [3, 2, 0, -1, 0, 2, 3, 2, 1, 0],
+                eq_bypass: false,
+                active_saved_eq: Some("Warm HiFi".to_string()),
+                saved_eq_presets: vec![SavedMusicEqPreset {
+                    name: "Warm HiFi".to_string(),
+                    bands: [3, 2, 0, -1, 0, 2, 3, 2, 1, 0],
+                    preamp_db: -2,
+                }],
                 preamp_db: -4,
                 channel_mode: AudioChannelMode::WideStage,
                 show_right_drawer: false,
@@ -2750,7 +2816,12 @@ mod tests {
         assert_eq!(loaded_music.music.audio_quality, MusicAudioQuality::AacHigh);
         assert_eq!(loaded_music.music.normalization, MusicNormMode::DynamicSoft);
         assert!(!loaded_music.music.anti_clip_limiter);
-        assert_eq!(loaded_music.music.eq_preset, AudioEqPreset::Jazz);
+        assert_eq!(loaded_music.music.eq_preset, AudioEqPreset::Custom);
+        assert_eq!(
+            loaded_music.music.active_eq_bands(),
+            [3, 2, 0, -1, 0, 2, 3, 2, 1, 0]
+        );
+        assert_eq!(loaded_music.music.saved_eq_presets.len(), 1);
         assert_eq!(loaded_music.music.preamp_db, -4);
         assert_eq!(loaded_music.music.channel_mode, AudioChannelMode::WideStage);
         assert!(!loaded_music.music.show_right_drawer);
