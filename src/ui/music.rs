@@ -101,9 +101,79 @@ pub fn music_layout_dims(total_w: u16, drawer_open: bool) -> MusicLayoutDims {
 
 /// Compute number of cover-grid columns fitting cleanly inside the Spotify main stage.
 pub fn spotify_grid_cols(stage_width: u16) -> usize {
-    let card_w_target: u16 = 18;
+    let card_w_target: u16 = 22;
     let card_gap: u16 = 1;
     ((stage_width.saturating_sub(2)) / (card_w_target + card_gap)).clamp(2, 5) as usize
+}
+
+/// Word-wrap `text` into at most `max_lines` lines of `width` chars without mid-word cuts or concatenation.
+fn wrap_words_bounded(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut overflowed = false;
+
+    for word in words {
+        let wlen = word.chars().count();
+        if cur.is_empty() {
+            if wlen <= width {
+                cur.push_str(word);
+            } else {
+                cur = truncate_str(word, width);
+            }
+            continue;
+        }
+        let cur_len = cur.chars().count();
+        if cur_len + 1 + wlen <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else if lines.len() + 1 < max_lines {
+            lines.push(std::mem::take(&mut cur));
+            if wlen <= width {
+                cur.push_str(word);
+            } else {
+                cur = truncate_str(word, width);
+            }
+        } else {
+            overflowed = true;
+            break;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if overflowed {
+        if let Some(last) = lines.last_mut() {
+            let replacement = {
+                let mut trimmed_words: Vec<&str> = last.split_whitespace().collect();
+                let mut out = None;
+                while !trimmed_words.is_empty() {
+                    let joined = trimmed_words.join(" ");
+                    if joined.chars().count() < width {
+                        out = Some(format!("{joined}…"));
+                        break;
+                    }
+                    trimmed_words.pop();
+                }
+                out
+            };
+            *last = replacement.unwrap_or_else(|| truncate_str(last, width));
+        }
+    }
+    lines
+}
+
+fn truncate_words_clean(text: &str, width: usize) -> String {
+    wrap_words_bounded(text, width, 1)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn render_vertical_scrollbar(
@@ -673,24 +743,22 @@ fn render_cover_shelves_grid(
     page: &YtmPage,
     modal_rect: Option<Rect>,
 ) {
-    let theme = state.base_theme().clone();
+    let theme = *state.base_theme();
     let spotify_green = Color::Rgb(30, 215, 96);
     let cols = spotify_grid_cols(area.width);
     let card_gap: u16 = 1;
     let total_gaps = card_gap * (cols.saturating_sub(1) as u16);
+    let card_w = (area.width.saturating_sub(total_gaps) / (cols as u16)).clamp(18, 34);
+    let row_used = card_w * (cols as u16) + total_gaps;
+    let left_pad = area.width.saturating_sub(row_used) / 2;
 
-    // Tall crisp 1:1 card height: 1px top pad + square art + 1 title + 1 sub + 1 border/pad
-    let cover_h: u16 = if area.height >= 24 {
-        7
-    } else if area.height >= 16 {
-        5
-    } else {
-        4
-    };
-    let card_h: u16 = cover_h + 4;
-    let slot_w = (area.width.saturating_sub(total_gaps) / (cols as u16)).max(14);
-    let card_w_cap = (cover_h * 2 + 5).clamp(16, 22);
-    let card_w = slot_w.min(card_w_cap);
+    // Proportional 1:1 card frame filling the stage cleanly: 2 border rows + art + 2 title + 1 subtitle
+    let inner_w = card_w.saturating_sub(2);
+    let max_cov_h = (area.height.saturating_sub(2) / 2)
+        .saturating_sub(5)
+        .clamp(5, 12);
+    let cover_h: u16 = (inner_w / 2).clamp(5, max_cov_h);
+    let card_h: u16 = cover_h + 5;
 
     struct ShelfRowBlock {
         shelf_title: Option<String>,
@@ -780,9 +848,7 @@ fn render_cover_shelves_grid(
         }
 
         for (c_i, (s_idx, item)) in rb.items.iter().enumerate() {
-            let cx = area.x
-                + (c_i as u16) * (slot_w + card_gap)
-                + slot_w.saturating_sub(card_w) / 2;
+            let cx = area.x + left_pad + (c_i as u16) * (card_w + card_gap);
             let card_rect = Rect::new(cx, cur_y, card_w, card_h);
             let is_sel = *s_idx == state.music.cursor;
             let is_playing = item
@@ -826,14 +892,14 @@ fn render_cover_shelves_grid(
             let c_inner = card_blk.inner(card_rect);
             frame.render_widget(card_blk, card_rect);
 
-            if c_inner.width < 6 || c_inner.height < 3 {
+            if c_inner.width < 6 || c_inner.height < 4 {
                 continue;
             }
 
-            let art_h = c_inner.height.saturating_sub(2);
+            let art_h = c_inner.height.saturating_sub(3);
             let art_rect = Rect::new(c_inner.x, c_inner.y, c_inner.width, art_h);
-            let title_rect = Rect::new(c_inner.x, c_inner.y + art_h, c_inner.width, 1);
-            let sub_rect = Rect::new(c_inner.x, c_inner.y + art_h + 1, c_inner.width, 1);
+            let title_rect = Rect::new(c_inner.x, c_inner.y + art_h, c_inner.width, 2);
+            let sub_rect = Rect::new(c_inner.x, c_inner.y + art_h + 2, c_inner.width, 1);
 
             if !key.is_empty() && !rect_intersects_optional(art_rect, modal_rect) {
                 render_thumbnail_cover(
@@ -853,19 +919,23 @@ fn render_cover_shelves_grid(
             }
 
             let play_pfx = if is_playing { "▶ " } else { "" };
-            let title_line = truncate_str(
+            let title_lines: Vec<Line> = wrap_words_bounded(
                 &format!("{play_pfx}{}", item.title),
                 title_rect.width as usize,
-            );
-            frame.render_widget(
-                Paragraph::new(title_line).style(
+                2,
+            )
+            .into_iter()
+            .map(|l| {
+                Line::from(Span::styled(
+                    l,
                     Style::default()
                         .fg(if is_playing { spotify_green } else { Color::White })
                         .bg(card_bg)
                         .add_modifier(Modifier::BOLD),
-                ),
-                title_rect,
-            );
+                ))
+            })
+            .collect();
+            frame.render_widget(Paragraph::new(title_lines), title_rect);
 
             let kind_tag = match item.kind {
                 YtmItemKind::Album => "Album",
@@ -880,7 +950,7 @@ fn render_cover_shelves_grid(
                 kind_tag.to_string()
             };
             frame.render_widget(
-                Paragraph::new(truncate_str(&sub_txt, sub_rect.width as usize))
+                Paragraph::new(truncate_words_clean(&sub_txt, sub_rect.width as usize))
                     .style(Style::default().fg(theme.text_dim).bg(card_bg)),
                 sub_rect,
             );
@@ -1436,12 +1506,13 @@ fn render_info_tab(
         } else {
             "Direct"
         };
-        let len_line = format!("{dur} · EQ:{eq_badge} ({eff_preamp:+}dB) · {audio_mode}");
+        let len_line = format!("{dur} · EQ:{eq_badge} ({eff_preamp:+}dB)");
         let rows = vec![
             ("Artist", artist, Color::White),
             ("Album", album, pal.text_dim),
             ("Songs", songs_info, spotify_green),
             ("Length", len_line, pal.text_dim),
+            ("Audio", audio_mode.to_string(), pal.accent),
         ];
         (tr.thumb_cache_key(), tr.kind.badge(), tr.title.clone(), rows)
     } else {
@@ -1457,8 +1528,8 @@ fn render_info_tab(
         )
     };
 
-    let action_h: u16 = if area.height >= 14 { 2 } else { 1 };
-    let meta_h: u16 = 6; // kind+title + 4 info rows + 1 gap
+    let action_h: u16 = 1;
+    let meta_h: u16 = (meta_rows.len() as u16) + 2; // kind+title + metadata rows + gap
     let max_cov_h = area.height.saturating_sub(meta_h + action_h + 1).max(4);
     let cov_h = (area.width / 2).saturating_sub(1).clamp(5, 13).min(max_cov_h);
     let cov_w = (cov_h * 2 + 2).min(area.width);
@@ -1510,7 +1581,7 @@ fn render_info_tab(
             let val_w = w.saturating_sub(key_lbl.chars().count()).max(4);
             lines.push(Line::from(vec![
                 Span::styled(key_lbl, Style::default().fg(pal.text_dim)),
-                Span::styled(truncate_str(&val, val_w), Style::default().fg(col)),
+                Span::styled(truncate_words_clean(&val, val_w), Style::default().fg(col)),
             ]));
         }
         frame.render_widget(Paragraph::new(lines), info_rect);
@@ -1572,22 +1643,6 @@ fn render_info_tab(
                 pal.accent,
             );
         }
-    }
-    if is_preview || cur_track.is_some() {
-        push_pill(
-            &mut pills,
-            " Up Next -> ",
-            MusicHit::SelectRightTab(YtmRightPaneTab::UpNext),
-            pal.text,
-            Color::Rgb(40, 44, 58),
-        );
-        push_pill(
-            &mut pills,
-            " Lyrics -> ",
-            MusicHit::SelectRightTab(YtmRightPaneTab::Lyrics),
-            pal.text,
-            Color::Rgb(40, 44, 58),
-        );
     }
     render_info_action_pills(frame, act_rect, state, pills);
 }
@@ -2517,8 +2572,9 @@ fn render_lyrics_view(
         is_focus: bool,
     }
 
-    let pos_ms = (state.active_playback_pos.max(0.0) * 1000.0) as u64;
-    let active_idx = state.music.active_lyric_index(state.active_playback_pos);
+    let effective_pos = state.effective_playback_pos_secs();
+    let pos_ms = (effective_pos.max(0.0) * 1000.0) as u64;
+    let active_idx = state.music.active_lyric_index(effective_pos);
 
     // Pre-pass: check if scrollbar is needed at full width - 1
     let probe_w = (body_area.width.saturating_sub(3) as usize).max(8);
@@ -2625,16 +2681,14 @@ fn render_lyrics_view(
                     spans.push(Span::styled(
                         tip,
                         Style::default()
-                            .fg(Color::Rgb(175, 255, 210))
+                            .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
                 if !unsung.is_empty() {
                     spans.push(Span::styled(
                         unsung,
-                        Style::default()
-                            .fg(Color::Rgb(225, 230, 238))
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Rgb(185, 195, 210)),
                     ));
                 }
             } else if is_past {
@@ -4895,7 +4949,7 @@ mod tests {
         let closed = music_layout_dims(140, false);
         assert_eq!(closed.drawer_w, 0);
         assert_eq!(closed.stage_w, 117);
-        assert_eq!(spotify_grid_cols(closed.stage_w.saturating_sub(2)), 5);
+        assert_eq!(spotify_grid_cols(closed.stage_w.saturating_sub(2)), 4);
     }
 
     #[test]
@@ -5061,10 +5115,22 @@ mod tests {
         assert!(info_text.contains("Census Designated"));
         assert!(info_text.contains("Track 1 of 18"));
         assert!(info_text.contains("Open Album"));
+        assert!(!info_text.contains("Up Next ->"));
+        assert!(!info_text.contains("Lyrics ->"));
         assert!(st
             .music
             .hitboxes
             .iter()
             .any(|(_, h)| *h == MusicHit::OpenCurrentAlbum));
+    }
+
+    #[test]
+    fn test_wrap_words_bounded_prevents_midword_cutoff_and_concatenation() {
+        let lines = wrap_words_bounded("Black Holes and Revelations", 18, 2);
+        assert_eq!(lines, vec!["Black Holes and", "Revelations"]);
+        assert_eq!(truncate_words_clean("9.74K subscribers", 20), "9.74K subscribers");
+        let clipped = truncate_words_clean("Album · Very Long Artist Name", 20);
+        assert!(!clipped.ends_with("Arti…"));
+        assert!(clipped.ends_with('…'));
     }
 }

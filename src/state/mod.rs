@@ -1066,6 +1066,7 @@ pub struct AppState {
     pub active_playback_title: Option<String>,
     pub active_playback_pos: f64,
     pub active_playback_dur: f64,
+    pub active_playback_synced_at: Option<Instant>,
     pub active_session_id: u64,
     pub sponsor_skips_session: u32,
     pub live_playback: LivePlaybackControlState,
@@ -1286,6 +1287,7 @@ impl AppState {
             active_playback_title: None,
             active_playback_pos: 0.0,
             active_playback_dur: 0.0,
+            active_playback_synced_at: None,
             active_session_id: 0,
             sponsor_skips_session: 0,
             live_playback: init_live_playback,
@@ -1541,6 +1543,28 @@ impl AppState {
             }
         }
         self.record_telemetry_sample_if_due();
+    }
+
+    /// Live playback position smoothly interpolated between IPC ticks for karaoke sync.
+    pub fn effective_playback_pos_secs(&self) -> f64 {
+        let base = self.active_playback_pos.max(0.0);
+        if !self.has_live_ipc()
+            || self.live_playback.paused
+            || self.live_playback.paused_for_cache
+        {
+            return base;
+        }
+        let Some(ts) = self.active_playback_synced_at else {
+            return base;
+        };
+        let speed = self.live_playback.speed.clamp(0.25, 4.0);
+        let delta = (ts.elapsed().as_secs_f64() * speed).min(0.6);
+        let pos = base + delta;
+        if self.active_playback_dur > 0.0 {
+            pos.min(self.active_playback_dur)
+        } else {
+            pos
+        }
     }
 
     pub fn log_studio_event(&mut self, kind: &'static str, summary: impl Into<String>) {

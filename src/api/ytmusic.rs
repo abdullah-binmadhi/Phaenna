@@ -1123,6 +1123,32 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
         }
     }
 
+    // Inherit album / artist header metadata for tracks inside Album / Artist popups
+    let fallback_artist = if page.is_artist_profile {
+        page.header_title.as_deref()
+    } else {
+        page.header_artist.as_deref()
+    };
+    let is_album_or_ep = !page.is_artist_profile
+        && (page.header_year.is_some()
+            || page.header_subtitle.as_deref().is_some_and(|s| {
+                let low = s.to_ascii_lowercase();
+                low.starts_with("album") || low.starts_with("ep") || low.starts_with("single")
+            }));
+    for tr in &mut page.tracks {
+        if tr.artist.trim().is_empty() {
+            if let Some(art) = fallback_artist {
+                tr.artist = art.to_string();
+                if tr.artist_browse_id.is_none() {
+                    tr.artist_browse_id = page.header_artist_browse_id.clone();
+                }
+            }
+        }
+        if is_album_or_ep && tr.album.is_none() {
+            tr.album = page.header_title.clone();
+        }
+    }
+
     page
 }
 
@@ -1529,6 +1555,238 @@ pub async fn fetch_ytm_lyrics(
     Ok(parse_ytm_lyrics_json(&val))
 }
 
+fn parse_lrc_timestamp_ms(tag: &str) -> Option<u64> {
+    let parts: Vec<&str> = tag.split(':').collect();
+    let (mins, secs_part) = match parts.as_slice() {
+        [m, s] => (m.trim().parse::<u64>().ok()?, *s),
+        [h, m, s] => {
+            let hh = h.trim().parse::<u64>().ok()?;
+            let mm = m.trim().parse::<u64>().ok()?;
+            (hh * 60 + mm, *s)
+        }
+        _ => return None,
+    };
+    let (sec_str, frac_str) = secs_part.split_once('.').unwrap_or((secs_part, "0"));
+    let secs = sec_str.trim().parse::<u64>().ok()?;
+    let frac_digits: String = frac_str
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .take(3)
+        .collect();
+    let ms = match frac_digits.len() {
+        0 => 0,
+        1 => frac_digits.parse::<u64>().ok()? * 100,
+        2 => frac_digits.parse::<u64>().ok()? * 10,
+        _ => frac_digits.parse::<u64>().ok()?,
+    };
+    Some((mins * 60 + secs) * 1000 + ms)
+}
+
+/// Parse standard `[mm:ss.xx]` synced LRC text into millisecond-accurate `YtmLyrics`.
+pub fn parse_lrc_lyrics(lrc_text: &str, source: Option<String>) -> YtmLyrics {
+    let mut offset_ms: i64 = 0;
+    let mut raw_entries: Vec<(u64, String)> = Vec::new();
+
+    for raw_line in lrc_text.lines() {
+        let mut rest = raw_line.trim();
+        if rest.is_empty() {
+            continue;
+        }
+        let mut timestamps: Vec<u64> = Vec::new();
+        while rest.starts_with('[') {
+            let Some(close_idx) = rest.find(']') else {
+                break;
+            };
+            let tag = &rest[1..close_idx];
+            if let Some(off_str) = tag.strip_prefix("offset:") {
+                if let Ok(v) = off_str.trim().parse::<i64>() {
+                    offset_ms = v;
+                }
+                rest = rest[close_idx + 1..].trim();
+                continue;
+            }
+            if let Some(ms) = parse_lrc_timestamp_ms(tag) {
+                timestamps.push(ms);
+                rest = rest[close_idx + 1..].trim();
+            } else {
+                // Metadata tag such as [ar:...], [ti:...], [al:...]
+                rest = "";
+                break;
+            }
+        }
+        if timestamps.is_empty() {
+            continue;
+        }
+        for ts in timestamps {
+            let adj = (ts as i64 - offset_ms).max(0) as u64;
+            raw_entries.push((adj, rest.to_string()));
+        }
+    }
+
+    raw_entries.sort_by_key(|(ts, _)| *ts);
+
+    let mut lines: Vec<YtmLyricLine> = Vec::new();
+    for i in 0..raw_entries.len() {
+        let (start_ms, ref text) = raw_entries[i];
+        if text.trim().is_empty() {
+            // Blank timestamp marks an instrumental break / end of previous sung line
+            if let Some(prev) = lines.last_mut() {
+                if prev.end_ms.is_none() && start_ms > prev.start_ms.unwrap_or(0) {
+                    prev.end_ms = Some(start_ms);
+                }
+            }
+            continue;
+        }
+        let next_ts = raw_entries.get(i + 1).map(|(t, _)| *t);
+        let end_ms = next_ts
+            .filter(|&nt| nt > start_ms)
+            .unwrap_or_else(|| start_ms.saturating_add(4500));
+        lines.push(YtmLyricLine {
+            text: text.clone(),
+            start_ms: Some(start_ms),
+            end_ms: Some(end_ms),
+        });
+    }
+
+    let is_timed = !lines.is_empty();
+    YtmLyrics {
+        lines,
+        source: if is_timed { source } else { None },
+        is_timed,
+    }
+}
+
+fn clean_track_title_for_lyrics(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    for (open, close) in [('(', ')'), ('[', ']')] {
+        loop {
+            let Some(i) = s.rfind(open) else { break };
+            let Some(j_rel) = s[i..].find(close) else { break };
+            let inner = s[i + 1..i + j_rel].to_ascii_lowercase();
+            let strip = inner.contains("official")
+                || inner.contains("lyric")
+                || inner.contains("audio")
+                || inner.contains("video")
+                || inner.contains("visualizer")
+                || inner.contains("remaster")
+                || inner.contains("feat.")
+                || inner.contains("ft.");
+            if strip {
+                s.replace_range(i..=i + j_rel, "");
+                s = s.trim().to_string();
+            } else {
+                break;
+            }
+        }
+    }
+    s
+}
+
+/// Fetch real-time millisecond-synced LRC lyrics from `lrclib.net` as fallback when YouTube Music
+/// only provides plain unsynced lyrics.
+pub async fn fetch_lrclib_synced_lyrics(
+    client: &reqwest::Client,
+    title: &str,
+    artist: &str,
+    album: Option<&str>,
+    duration_secs: Option<u64>,
+) -> Option<YtmLyrics> {
+    let clean_title = clean_track_title_for_lyrics(title);
+    let clean_artist = artist
+        .split([',', '&', '•'])
+        .next()
+        .map(str::trim)
+        .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("YouTube Music"))
+        .unwrap_or("");
+    if clean_title.is_empty() {
+        return None;
+    }
+
+    if !clean_artist.is_empty() {
+        let mut params = vec![
+            ("track_name", clean_title.clone()),
+            ("artist_name", clean_artist.to_string()),
+        ];
+        if let Some(alb) = album.map(str::trim).filter(|a| !a.is_empty()) {
+            params.push(("album_name", alb.to_string()));
+        }
+        if let Some(dur) = duration_secs.filter(|&d| d > 0) {
+            params.push(("duration", dur.to_string()));
+        }
+        if let Ok(resp) = client
+            .get("https://lrclib.net/api/get")
+            .header(USER_AGENT, "Phaenna/1.0")
+            .query(&params)
+            .timeout(std::time::Duration::from_secs(6))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<Value>().await {
+                    if let Some(synced) = val
+                        .get("syncedLyrics")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        let parsed =
+                            parse_lrc_lyrics(synced, Some("Source: LRCLIB (Synced)".to_string()));
+                        if parsed.is_timed {
+                            return Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback search endpoint when exact album/duration match didn't hit
+    let search_params: Vec<(&str, String)> = if !clean_artist.is_empty() {
+        vec![
+            ("track_name", clean_title.clone()),
+            ("artist_name", clean_artist.to_string()),
+        ]
+    } else {
+        vec![("q", clean_title.clone())]
+    };
+    let resp = client
+        .get("https://lrclib.net/api/search")
+        .header(USER_AGENT, "Phaenna/1.0")
+        .query(&search_params)
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let arr = resp.json::<Value>().await.ok()?;
+    let items = arr.as_array()?;
+    let mut best: Option<(u64, &str)> = None;
+    for entry in items {
+        let Some(synced) = entry
+            .get("syncedLyrics")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let entry_dur = entry.get("duration").and_then(Value::as_f64).map(|d| d.round() as u64);
+        let diff = match (duration_secs, entry_dur) {
+            (Some(target), Some(cand)) => target.abs_diff(cand),
+            _ => 0,
+        };
+        if duration_secs.is_some() && entry_dur.is_some() && diff > 12 {
+            continue;
+        }
+        if best.is_none_or(|(b_diff, _)| diff < b_diff) {
+            best = Some((diff, synced));
+        }
+    }
+    let (_, best_lrc) = best?;
+    let parsed = parse_lrc_lyrics(best_lrc, Some("Source: LRCLIB (Synced)".to_string()));
+    parsed.is_timed.then_some(parsed)
+}
+
 pub async fn submit_ytm_like(
     client: &reqwest::Client,
     session: &GoogleAccountSession,
@@ -1723,6 +1981,15 @@ mod tests {
         assert_eq!(lyrics.lines.len(), 1);
         assert_eq!(lyrics.lines[0].start_ms, Some(12000));
         assert_eq!(lyrics.source.as_deref(), Some("Source: LyricFind"));
+
+        let lrc = "[ar:Jane Remover]\n[00:18.91]Teeth stained yellow\n[00:23.77]For a glass love so hard\n[00:27.83]\n[00:30.88]Oh, and I'll be the one";
+        let lrc_parsed = parse_lrc_lyrics(lrc, Some("Source: LRCLIB (Synced)".to_string()));
+        assert!(lrc_parsed.is_timed);
+        assert_eq!(lrc_parsed.lines.len(), 3);
+        assert_eq!(lrc_parsed.lines[0].start_ms, Some(18910));
+        assert_eq!(lrc_parsed.lines[0].end_ms, Some(23770));
+        assert_eq!(lrc_parsed.lines[1].end_ms, Some(27830));
+        assert_eq!(lrc_parsed.lines[2].start_ms, Some(30880));
     }
 
     #[test]
@@ -1766,6 +2033,61 @@ mod tests {
         assert_eq!(
             page.header_track_summary.as_deref(),
             Some("11 songs · 45 minutes")
+        );
+
+        // Album page with track rows omitting artist/album inherits header_artist & header_title
+        let alb_tracks_json = serde_json::json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicResponsiveHeaderRenderer": {
+                                            "title": { "runs": [{ "text": "Census Designated" }] },
+                                            "subtitle": { "runs": [
+                                                { "text": "Album" },
+                                                { "text": " • " },
+                                                { "text": "2023" }
+                                            ] },
+                                            "straplineTextOne": { "runs": [
+                                                { "text": "Jane Remover", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCjane", "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" } } } } }
+                                            ] }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }],
+                    "secondaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [{
+                                "musicShelfRenderer": {
+                                    "contents": [{
+                                        "musicResponsiveListItemRenderer": {
+                                            "flexColumns": [
+                                                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Lips" }] } } }
+                                            ],
+                                            "fixedColumns": [
+                                                { "musicResponsiveListItemFixedColumnRenderer": { "text": { "runs": [{ "text": "5:11" }] } } }
+                                            ],
+                                            "playlistItemData": { "videoId": "lips_vid" }
+                                        }
+                                    }]
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        let alb_tracks_page = parse_ytm_browse_json(&alb_tracks_json);
+        assert_eq!(alb_tracks_page.tracks.len(), 1);
+        assert_eq!(alb_tracks_page.tracks[0].artist, "Jane Remover");
+        assert_eq!(
+            alb_tracks_page.tracks[0].album.as_deref(),
+            Some("Census Designated")
         );
 
         // Collection card with overlay videoId must drop video_id so clicking never interrupts playback

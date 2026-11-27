@@ -33,8 +33,9 @@ use crate::api::ytdlp::{
     fetch_video_details_with_ladder, resolve_stream_ladder, search_youtube,
 };
 use crate::api::ytmusic::{
-    fetch_ytm_browse, fetch_ytm_home, fetch_ytm_lyrics, fetch_ytm_search, fetch_ytm_up_next,
-    submit_ytm_like, YtmItemKind, YtmShelfItem, YtmTrack,
+    fetch_lrclib_synced_lyrics, fetch_ytm_browse, fetch_ytm_home, fetch_ytm_lyrics,
+    fetch_ytm_search, fetch_ytm_up_next, submit_ytm_like, YtmItemKind, YtmPage, YtmShelfItem,
+    YtmTrack,
 };
 use crate::config::{
     next_dub_lang, AudioEqPreset, Config, ManualMasteringConfig, MotionMode, PerformanceMode,
@@ -400,6 +401,21 @@ async fn main() -> anyhow::Result<()> {
                 state.ticker_last_step_at = Instant::now();
                 needs_redraw = true;
             }
+        }
+
+        // Advance karaoke lyric sweep smoothly when synced lyrics are visible during live playback
+        if state.overlay == ActiveOverlay::None
+            && state.categories.get(state.active_category).is_some_and(|(c, _)| *c == Category::Music)
+            && state.music.right_drawer_open
+            && state.music.right_tab == YtmRightPaneTab::Lyrics
+            && state.music.lyrics.as_ref().is_some_and(|l| l.is_timed)
+            && state.has_live_ipc()
+            && !state.live_playback.paused
+            && !state.live_playback.paused_for_cache
+            && state.ticker_last_step_at.elapsed() >= Duration::from_millis(90)
+        {
+            state.ticker_last_step_at = Instant::now();
+            needs_redraw = true;
         }
 
         if needs_redraw {
@@ -2156,6 +2172,7 @@ async fn handle_app_message(
             state.active_session_id = session_id;
             state.active_playback_pos = 0.0;
             state.active_playback_dur = 0.0;
+            state.active_playback_synced_at = None;
             state.sponsor_skips_session = 0;
             state.live_playback.audio_eq_bypass = false;
             state.log_studio_event(
@@ -2204,6 +2221,18 @@ async fn handle_app_message(
         AppMessage::PlaybackTelemetryUpdated { session_id, event } => {
             if session_id == state.active_session_id {
                 let ev_copy = event.clone();
+                if matches!(
+                    ev_copy,
+                    LiveIpcEvent::Paused(true) | LiveIpcEvent::PausedForCache(true)
+                ) {
+                    state.active_playback_pos = state.effective_playback_pos_secs();
+                    state.active_playback_synced_at = None;
+                } else if matches!(
+                    ev_copy,
+                    LiveIpcEvent::Paused(false) | LiveIpcEvent::PausedForCache(false)
+                ) {
+                    state.active_playback_synced_at = Some(Instant::now());
+                }
                 state.apply_live_ipc_event(event);
                 if matches!(ev_copy, LiveIpcEvent::PausedForCache(true)) {
                     maybe_trigger_auto_abr_downshift(state);
@@ -2247,6 +2276,7 @@ async fn handle_app_message(
         } => {
             state.active_playback_pos = pos;
             state.active_playback_dur = duration;
+            state.active_playback_synced_at = Some(Instant::now());
             state.record_telemetry_sample_if_due();
             state.progress_map.insert(video_id.clone(), (pos, duration));
             if let Some(meta) = state.continue_watching_meta.get_mut(video_id.trim_start_matches("RD")) {
@@ -2428,6 +2458,7 @@ async fn handle_app_message(
                 state.active_playback_title = None;
                 state.active_playback_pos = 0.0;
                 state.active_playback_dur = 0.0;
+                state.active_playback_synced_at = None;
                 state.reset_live_playback();
 
                 // Restore any fullscreen/maximized terminal that yielded so mpv could appear in front
@@ -2711,6 +2742,28 @@ async fn handle_app_message(
                 .current_track()
                 .is_some_and(|t| t.video_id == video_id);
             if cur_matches {
+                // Backfill missing artist / album metadata on the currently active track from Up Next panel
+                if let Some(rich) = queue.tracks.iter().find(|t| t.video_id == video_id) {
+                    let q_idx = state.music.queue_index;
+                    if let Some(cur) = state.music.queue.get_mut(q_idx) {
+                        if cur.artist.trim().is_empty() && !rich.artist.trim().is_empty() {
+                            cur.artist = rich.artist.clone();
+                        }
+                        if cur.artist_browse_id.is_none() {
+                            cur.artist_browse_id = rich.artist_browse_id.clone();
+                        }
+                        if cur.album.is_none() {
+                            cur.album = rich.album.clone();
+                        }
+                        if cur.album_browse_id.is_none() {
+                            cur.album_browse_id = rich.album_browse_id.clone();
+                        }
+                        if cur.duration_secs.is_none() {
+                            cur.duration_secs = rich.duration_secs;
+                            cur.duration_text = rich.duration_text.clone();
+                        }
+                    }
+                }
                 if !queue.tracks.is_empty() && state.config.music.autoplay_mix {
                     // Preserve already-built prefix up to queue_index; append unique radio/playlist tracks
                     let mut existing_ids: HashSet<String> =
@@ -2727,19 +2780,53 @@ async fn handle_app_message(
                 state.music.queue_continuation = queue.continuation;
                 state.music.lyrics_browse_id = queue.lyrics_browse_id.clone();
                 state.music.related_browse_id = queue.related_browse_id;
-                if let Some(ref l_id) = queue.lyrics_browse_id {
+                let track_meta = state.music.current_track().cloned();
+                let need_fetch = !state.music.lyrics.as_ref().is_some_and(|l| l.is_timed);
+                if need_fetch && (queue.lyrics_browse_id.is_some() || track_meta.is_some()) {
                     state.music.lyrics_loading = true;
                     let c = client.clone();
                     let sess = state.auth_vault.active_account().cloned();
                     let tx_l = tx.clone();
                     let vid = video_id.clone();
-                    let lid = l_id.clone();
+                    let lid_opt = queue.lyrics_browse_id.clone();
                     tokio::spawn(async move {
-                        if let Ok(lyrics) = fetch_ytm_lyrics(&c, sess.as_ref(), &lid).await {
+                        let ytm_lyr = if let Some(ref lid) = lid_opt {
+                            fetch_ytm_lyrics(&c, sess.as_ref(), lid).await.ok()
+                        } else {
+                            None
+                        };
+                        let resolved = if ytm_lyr.as_ref().is_some_and(|l| l.is_timed) {
+                            ytm_lyr
+                        } else if let Some(ref tr) = track_meta {
+                            if let Some(synced) = fetch_lrclib_synced_lyrics(
+                                &c,
+                                &tr.title,
+                                &tr.artist,
+                                tr.album.as_deref(),
+                                tr.duration_secs,
+                            )
+                            .await
+                            {
+                                Some(synced)
+                            } else {
+                                ytm_lyr.filter(|l| !l.lines.is_empty())
+                            }
+                        } else {
+                            ytm_lyr.filter(|l| !l.lines.is_empty())
+                        };
+                        if let Some(lyrics) = resolved {
                             let _ = tx_l
                                 .send(AppMessage::MusicLyricsLoaded {
                                     video_id: vid,
                                     lyrics,
+                                })
+                                .await;
+                        } else {
+                            // Clear loading flag if neither YTM nor LRCLIB had lyrics
+                            let _ = tx_l
+                                .send(AppMessage::MusicLyricsLoaded {
+                                    video_id: vid,
+                                    lyrics: crate::api::ytmusic::YtmLyrics::default(),
                                 })
                                 .await;
                         }
@@ -2755,7 +2842,11 @@ async fn handle_app_message(
                 .current_track()
                 .is_some_and(|t| t.video_id == video_id)
             {
-                state.music.lyrics = Some(lyrics);
+                state.music.lyrics = if lyrics.lines.is_empty() {
+                    None
+                } else {
+                    Some(lyrics)
+                };
                 state.music.lyrics_loading = false;
                 state.music.lyrics_manual_scroll = false;
                 state.music.lyrics_scroll = 0;
@@ -3375,6 +3466,28 @@ async fn handle_overlay_post_comment(
     });
 }
 
+async fn read_pipe_ring<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut ring: Vec<u8> = Vec::with_capacity(8192);
+    let Some(mut r) = pipe else {
+        return ring;
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                ring.extend_from_slice(&buf[..n]);
+                if ring.len() > 16384 {
+                    let drop_n = ring.len() - 12288;
+                    ring.drain(..drop_n);
+                }
+            }
+        }
+    }
+    ring
+}
+
 async fn start_nonblocking_playback(
     video: &VideoItem,
     start_override: Option<f64>,
@@ -3626,28 +3739,23 @@ async fn start_nonblocking_playback_with_live_opts(
                 );
             }
             let tx_watch = tx.clone();
+            let stdout_pipe = child.stdout.take();
             let stderr_pipe = child.stderr.take();
             tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut ring: Vec<u8> = Vec::with_capacity(8192);
-                if let Some(mut err) = stderr_pipe {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match err.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                ring.extend_from_slice(&buf[..n]);
-                                if ring.len() > 16384 {
-                                    let drop_n = ring.len() - 12288;
-                                    ring.drain(..drop_n);
-                                }
-                            }
-                        }
-                    }
-                }
+                let (out_ring, err_ring) =
+                    tokio::join!(read_pipe_ring(stdout_pipe), read_pipe_ring(stderr_pipe));
                 if let Ok(status) = child.wait().await {
-                    let err_str = String::from_utf8_lossy(&ring);
-                    if let Some(msg) = classify_player_crash_stderr(&err_str, status.code()) {
+                    let mut combined = String::new();
+                    if !out_ring.is_empty() {
+                        combined.push_str(&String::from_utf8_lossy(&out_ring));
+                    }
+                    if !err_ring.is_empty() {
+                        if !combined.is_empty() && !combined.ends_with('\n') {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&String::from_utf8_lossy(&err_ring));
+                    }
+                    if let Some(msg) = classify_player_crash_stderr(&combined, status.code()) {
                         let _ = tx_watch.send(AppMessage::ShowToast(msg)).await;
                     }
                 }
@@ -3967,13 +4075,51 @@ fn open_music_album_popup(
     });
 }
 
-fn prepare_album_queue(tracks: &[YtmTrack], header_playlist_id: Option<&str>) -> Vec<YtmTrack> {
-    let mut q = tracks.to_vec();
-    if let Some(pid) = header_playlist_id {
-        for tr in &mut q {
-            if tr.playlist_id.is_none() {
+fn prepare_popup_queue(
+    page: &YtmPage,
+    popup_browse_id: &str,
+    pid_override: Option<&str>,
+) -> Vec<YtmTrack> {
+    let mut q = page.tracks.to_vec();
+    let fallback_artist = if page.is_artist_profile {
+        page.header_title.as_deref()
+    } else {
+        page.header_artist.as_deref()
+    };
+    let album_bid = (!page.is_artist_profile && popup_browse_id.starts_with("MPREb"))
+        .then(|| popup_browse_id.to_string());
+    let album_title = if album_bid.is_some()
+        || (!page.is_artist_profile
+            && (page.header_year.is_some()
+                || page.header_subtitle.as_deref().is_some_and(|s| {
+                    let low = s.to_ascii_lowercase();
+                    low.starts_with("album") || low.starts_with("ep") || low.starts_with("single")
+                })))
+    {
+        page.header_title.clone()
+    } else {
+        None
+    };
+
+    for tr in &mut q {
+        if tr.playlist_id.is_none() {
+            if let Some(pid) = pid_override {
                 tr.playlist_id = Some(pid.to_string());
             }
+        }
+        if tr.artist.trim().is_empty() {
+            if let Some(art) = fallback_artist {
+                tr.artist = art.to_string();
+            }
+        }
+        if tr.artist_browse_id.is_none() {
+            tr.artist_browse_id = page.header_artist_browse_id.clone();
+        }
+        if tr.album.is_none() {
+            tr.album = album_title.clone();
+        }
+        if tr.album_browse_id.is_none() {
+            tr.album_browse_id = album_bid.clone();
         }
     }
     q
@@ -4085,6 +4231,7 @@ async fn play_music_track_at(
             state.active_playback_title = Some(title_str);
             state.active_playback_pos = 0.0;
             state.active_playback_dur = track.duration_secs.unwrap_or(0) as f64;
+            state.active_playback_synced_at = None;
             state.live_playback.paused = false;
             state.live_playback.is_live_stream = false;
             let vid_item = shelf_item_to_video_item(&track);
@@ -4188,7 +4335,7 @@ async fn activate_music_item(
             .music
             .current_page()
             .filter(|p| !p.tracks.is_empty())
-            .map(|p| prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref()))
+            .map(|p| prepare_popup_queue(p, "", p.header_playlist_id.as_deref()))
             .unwrap_or_default();
 
         if let Some(pos) = tracks_on_page
@@ -4625,7 +4772,11 @@ async fn activate_album_popup_cursor(
     match target {
         Some((YtmAlbumPopupHit::PlayTrack(t_idx), _)) => {
             if let Some(p) = state.music.album_popup.page.as_ref() {
-                let q = prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref());
+                let q = prepare_popup_queue(
+                    p,
+                    &state.music.album_popup.browse_id,
+                    p.header_playlist_id.as_deref(),
+                );
                 if t_idx < q.len() {
                     state.music.queue = q;
                     play_music_track_at(t_idx, None, false, state, pool, tx, client).await;
@@ -4696,7 +4847,11 @@ async fn apply_album_popup_hit(
         }
         YtmAlbumPopupHit::PlayAll => {
             if let Some(p) = state.music.album_popup.page.as_ref() {
-                let q = prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref());
+                let q = prepare_popup_queue(
+                    p,
+                    &state.music.album_popup.browse_id,
+                    p.header_playlist_id.as_deref(),
+                );
                 if !q.is_empty() {
                     state.music.shuffle = false;
                     state.music.queue = q;
@@ -4706,7 +4861,11 @@ async fn apply_album_popup_hit(
         }
         YtmAlbumPopupHit::ShuffleAll => {
             if let Some(p) = state.music.album_popup.page.as_ref() {
-                let q = prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref());
+                let q = prepare_popup_queue(
+                    p,
+                    &state.music.album_popup.browse_id,
+                    p.header_playlist_id.as_deref(),
+                );
                 if !q.is_empty() {
                     let start = (now_unix() as usize) % q.len();
                     state.music.shuffle = true;
@@ -4722,7 +4881,7 @@ async fn apply_album_popup_hit(
                     .header_radio_playlist_id
                     .as_deref()
                     .or(p.header_playlist_id.as_deref());
-                let q = prepare_album_queue(&p.tracks, rpid);
+                let q = prepare_popup_queue(p, &state.music.album_popup.browse_id, rpid);
                 if !q.is_empty() {
                     state.music.queue = q;
                     play_music_track_at(0, None, true, state, pool, tx, client).await;
@@ -4831,7 +4990,11 @@ async fn apply_album_popup_hit(
         }
         YtmAlbumPopupHit::PlayTrack(t_idx) => {
             if let Some(p) = state.music.album_popup.page.as_ref() {
-                let q = prepare_album_queue(&p.tracks, p.header_playlist_id.as_deref());
+                let q = prepare_popup_queue(
+                    p,
+                    &state.music.album_popup.browse_id,
+                    p.header_playlist_id.as_deref(),
+                );
                 if t_idx < q.len() {
                     state.music.queue = q;
                     play_music_track_at(t_idx, None, false, state, pool, tx, client).await;
@@ -5179,6 +5342,7 @@ async fn handle_music_mouse_event(
                         state.music.lyrics_manual_scroll = false;
                         if state.has_live_ipc() {
                             state.active_playback_pos = target;
+                            state.active_playback_synced_at = Some(Instant::now());
                             state.send_player_cmd(PlayerCommand::SeekAbsolute(target));
                         } else if state.music.current_track().is_some() {
                             play_music_track_at(
@@ -5207,6 +5371,7 @@ async fn handle_music_mouse_event(
                             if dur > 0.0 {
                                 let target = (rel.clamp(0.0, 1.0) * dur).clamp(0.0, dur);
                                 state.active_playback_pos = target;
+                                state.active_playback_synced_at = Some(Instant::now());
                                 state.send_player_cmd(PlayerCommand::SeekAbsolute(target));
                             }
                         }

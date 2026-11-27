@@ -2268,7 +2268,9 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     };
 
     if !opts.audio_headless {
-        flags.push("focus-on-open=yes".to_string());
+        if let Some(focus_flag) = caps.focus_on_open_flag() {
+            flags.push(focus_flag.to_string());
+        }
         #[cfg(target_os = "linux")]
         {
             flags.push(format!(
@@ -2684,14 +2686,14 @@ pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
     let child = Command::new(bin)
         .args(&args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| AppError::Player(format!("Failed to launch mpv: {}", e)))?;
     Ok(Some(child))
 }
 
-/// Inspect `mpv`/`ytdl_hook` `stderr` and process exit code to surface actionable toast errors on crash.
+/// Inspect `mpv`/`ytdl_hook` `stdout` + `stderr` and exit code to surface actionable toast errors on crash.
 pub fn classify_player_crash_stderr(stderr_text: &str, exit_code: Option<i32>) -> Option<String> {
     if stderr_text.contains("addOnDisposeCallback")
         || stderr_text.contains("Signature solving failed")
@@ -2722,16 +2724,28 @@ pub fn classify_player_crash_stderr(stderr_text: &str, exit_code: Option<i32>) -
     }
     if let Some(code) = exit_code {
         if code != 0 {
+            let is_generic_exit = |l: &str| l.starts_with("Exiting... (");
             let err_line = stderr_text
                 .lines()
                 .rev()
                 .map(str::trim)
                 .find(|l| {
-                    !l.is_empty()
-                        && (l.contains("ERROR:")
-                            || l.contains("[ytdl_hook]")
-                            || l.contains("Failed")
-                            || l.contains("Error"))
+                    if l.is_empty() || is_generic_exit(l) {
+                        return false;
+                    }
+                    let low = l.to_ascii_lowercase();
+                    l.contains("ERROR:")
+                        || l.contains("[ytdl_hook]")
+                        || low.contains("error")
+                        || low.contains("failed")
+                        || low.contains("removed")
+                })
+                .or_else(|| {
+                    stderr_text
+                        .lines()
+                        .rev()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty() && !is_generic_exit(l))
                 })
                 .or_else(|| stderr_text.lines().rev().map(str::trim).find(|l| !l.is_empty()));
             if let Some(line) = err_line {
@@ -3133,6 +3147,63 @@ mod tests {
         .unwrap();
         assert!(generic.contains("code 1"));
         assert!(generic.contains("ERROR: failed to open stream"));
+
+        let stdout_opt = classify_player_crash_stderr(
+            "Option --focus-on-open was removed: Replaced by --focus-on\nError parsing option focus-on-open (option not found)\nExiting... (Fatal error)",
+            Some(1),
+        )
+        .unwrap();
+        assert!(stdout_opt.contains("code 1"));
+        assert!(stdout_opt.contains("Error parsing option focus-on-open"));
+        assert!(!stdout_opt.contains("Exiting..."));
+
+        let host_caps = crate::services::platform::detect_player_capabilities();
+        let mut vid_opts = PlayOptions {
+            video_id: "dQw4w9WgXcQ".to_string(),
+            title: "Test Video".to_string(),
+            local_file: None,
+            quality_format: "bestvideo+bestaudio/best".to_string(),
+            cookies_path: None,
+            start_pos: None,
+            ipc_socket: None,
+            subtitles_enabled: false,
+            sub_lang: None,
+            sub_url: None,
+            sub_style: SubtitleStyleConfig::default(),
+            shader_mode: VideoShaderMode::Off,
+            mastering_profile: VideoMasteringProfile::StandardHd,
+            performance_mode: PerformanceMode::Balanced,
+            manual_mastering: ManualMasteringConfig::default(),
+            motion_mode: MotionMode::Off,
+            dub_preference: DubPreference::OriginalOnly,
+            dub_lang: "en".to_string(),
+            audio_multistreams: false,
+            audio_loudnorm: false,
+            audio_filter_chain: None,
+            is_live: false,
+            live_mode: LiveStreamMode::Off,
+            live_from_start: false,
+            live_auto_catchup: false,
+            network_mode: NetworkMode::Normal,
+            force_ipv4: false,
+            audio_headless: false,
+            auto_fullscreen: false,
+            auto_pip: false,
+            loading_art_dir: None,
+            loading_variant_idx: 0,
+            loading_channel: String::new(),
+            loading_quality: String::new(),
+            picture: PictureGrade::default(),
+            direct_stream: None,
+        };
+        let vid_args = build_mpv_args(&vid_opts);
+        if host_caps.has_focus_on {
+            assert!(vid_args.iter().any(|a| a == "--focus-on=open"));
+            assert!(!vid_args.iter().any(|a| a.starts_with("--focus-on-open")));
+        }
+        vid_opts.audio_headless = true;
+        let aud_args = build_mpv_args(&vid_opts);
+        assert!(!aud_args.iter().any(|a| a.starts_with("--focus-on")));
     }
 
     #[test]

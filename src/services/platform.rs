@@ -161,6 +161,8 @@ pub struct PlayerCapabilities {
     pub has_icc_auto: bool,
     pub has_target_colorspace_hint: bool,
     pub has_gpu_shader_cache_dir: bool,
+    pub has_focus_on: bool,
+    pub has_focus_on_open: bool,
     pub has_vulkan: bool,
     pub has_d3d11: bool,
     pub has_opengl: bool,
@@ -181,6 +183,8 @@ impl PlayerCapabilities {
             has_icc_auto: false,
             has_target_colorspace_hint: false,
             has_gpu_shader_cache_dir: false,
+            has_focus_on: false,
+            has_focus_on_open: false,
             has_vulkan: false,
             has_d3d11: cfg!(target_os = "windows"),
             has_opengl: true,
@@ -192,6 +196,17 @@ impl PlayerCapabilities {
             "gpu-next"
         } else {
             "gpu"
+        }
+    }
+
+    /// Return the supported open-focus flag for this `mpv` version, avoiding removed flags.
+    pub const fn focus_on_open_flag(&self) -> Option<&'static str> {
+        if self.has_focus_on {
+            Some("focus-on=open")
+        } else if self.has_focus_on_open {
+            Some("focus-on-open=yes")
+        } else {
+            None
         }
     }
 
@@ -532,7 +547,12 @@ pub fn parse_mpv_capabilities(
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let has_opt = |flag: &str| list_options.contains(flag);
+    let has_opt = |flag: &str| {
+        list_options.lines().any(|line| {
+            let tok = line.split_whitespace().next();
+            tok == Some(flag) && !line.contains("removed")
+        })
+    };
     let has_word = |hay: &str, token: &str| {
         hay.lines().any(|line| {
             line.split_whitespace()
@@ -552,6 +572,8 @@ pub fn parse_mpv_capabilities(
         has_icc_auto: has_opt("--icc-profile-auto"),
         has_target_colorspace_hint: has_opt("--target-colorspace-hint"),
         has_gpu_shader_cache_dir: has_opt("--gpu-shader-cache-dir"),
+        has_focus_on: has_opt("--focus-on"),
+        has_focus_on_open: has_opt("--focus-on-open"),
         has_vulkan: has_word(gpu_api_help, "vulkan"),
         has_d3d11: has_word(gpu_api_help, "d3d11"),
         has_opengl: has_word(gpu_api_help, "opengl"),
@@ -1083,7 +1105,7 @@ mod tests {
             "mpv v0.42.0 Copyright ...",
             "Valid values for option vo are:\n  gpu\n  gpu-next\n",
             "Available GPU APIs:\n  auto\n  vulkan\n  opengl\n",
-            " --glsl-shader-opts\n --gamut-mapping-mode\n --hdr-contrast-recovery\n --hdr-peak-percentile\n --libplacebo-opts\n --icc-profile-auto\n --target-colorspace-hint\n --gpu-shader-cache-dir\n",
+            " --glsl-shader-opts\n --gamut-mapping-mode\n --hdr-contrast-recovery\n --hdr-peak-percentile\n --libplacebo-opts\n --icc-profile-auto\n --target-colorspace-hint\n --gpu-shader-cache-dir\n --focus-on Choices: never open all (default: open)\n --focus-on-open removed [deprecated]\n",
         );
         assert_eq!(modern.version_str, "v0.42.0");
         assert!(modern.has_gpu_next);
@@ -1091,6 +1113,9 @@ mod tests {
         assert!(modern.has_perceptual_gamut);
         assert!(modern.has_hdr_contrast_recovery);
         assert!(modern.has_libplacebo_opts);
+        assert!(modern.has_focus_on);
+        assert!(!modern.has_focus_on_open);
+        assert_eq!(modern.focus_on_open_flag(), Some("focus-on=open"));
         assert_eq!(modern.effective_vo(), "gpu-next");
 
         let legacy = parse_mpv_capabilities(
@@ -1098,13 +1123,20 @@ mod tests {
             "mpv 0.34.1 Copyright ...",
             "  gpu\n",
             "  opengl\n",
-            " --gamut-mapping-mode\n",
+            " --gamut-mapping-mode\n --focus-on-open Flag (default: yes)\n",
         );
         assert_eq!(legacy.version_str, "0.34.1");
         assert!(!legacy.has_gpu_next);
         assert!(!legacy.has_shader_opts);
         assert!(!legacy.has_hdr_contrast_recovery);
+        assert!(!legacy.has_focus_on);
+        assert!(legacy.has_focus_on_open);
+        assert_eq!(legacy.focus_on_open_flag(), Some("focus-on-open=yes"));
         assert_eq!(legacy.effective_vo(), "gpu");
+        assert_eq!(
+            PlayerCapabilities::conservative_fallback().focus_on_open_flag(),
+            None
+        );
     }
 
     #[test]

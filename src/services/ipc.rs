@@ -1562,7 +1562,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                     }
                                 }
 
-                                if last_ui_tick.elapsed() >= Duration::from_millis(900) {
+                                if last_ui_tick.elapsed() >= Duration::from_millis(150) {
                                     last_ui_tick = std::time::Instant::now();
                                     let _ = config
                                         .tx
