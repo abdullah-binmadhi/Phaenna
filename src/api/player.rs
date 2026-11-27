@@ -1196,8 +1196,13 @@ local chat_status_until = 0
 local chat_compose = false
 local chat_compose_buf = ""
 local chat_compose_reply_mode = false
+local chat_compose_is_sub_reply = false
 local chat_compose_target_root_id = nil
 local chat_compose_target_author = nil
+local chat_last_click_id = nil
+local chat_last_click_time = 0
+local chat_last_pre_expanded = false
+local chat_last_dbl_at = 0
 local chat_timer = nil
 local chat_last_ass_sync = 0
 
@@ -1529,25 +1534,21 @@ local function render_chat_overlay()
                     fold_pill = chat_expanded[c.id] and " {\\1c&H24BFFB&\\b1}[-]{\\b0}" or string.format(" {\\1c&H24BFFB&\\b1}[+%d]{\\b0}", rep_n)
                 end
 
-                local action_pills = ""
-                if is_sel then
-                    action_pills = " {\\1c&H99D334&\\b1}[Reply]{\\b0} {\\1c&HFFE87C&\\b1}[TR]{\\b0}"
-                end
-
                 local sel_mark = is_sel and "{\\1c&HF8BD38&}▸ " or ""
                 local rx_text = tx + indent_px
                 table.insert(parts, string.format(
-                    "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs14}%s%s{\\b1\\1c%s}%s{\\b0}%s{\\1c&HAAA49E&\\fs12}%s%s%s",
-                    rx_text, cur_y, sel_mark, sub_rail, acol, author, badge, meta_tail, fold_pill, action_pills
+                    "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs14}%s%s{\\b1\\1c%s}%s{\\b0}%s{\\1c&HAAA49E&\\fs12}%s%s",
+                    rx_text, cur_y, sel_mark, sub_rail, acol, author, badge, meta_tail, fold_pill
                 ))
 
-                -- Specific action pill hitboxes on the header line
+                -- Right-aligned action pills with deterministic clickable bounds on selected row
                 if is_sel then
-                    add_hitbox(x1 - 122, cur_y - 2, x1 - 62, cur_y + 18, "reply_row", { index = idx, row = row })
-                    add_hitbox(x1 - 60, cur_y - 2, x1 - 8, cur_y + 18, "translate_row", { index = idx, row = row })
-                end
-                if row.kind == "root" and row.has_children then
-                    add_hitbox(rx_text, cur_y - 2, x1 - 124, cur_y + 18, "toggle_fold", { index = idx, root = row.root })
+                    table.insert(parts, string.format(
+                        "{\\an9\\pos(%d,%d)\\bord1.6\\shad1.4\\3c&H000000&\\fs12\\b1\\1c&H99D334&}[Reply] {\\1c&HFFE87C&}[TR]",
+                        x1 - 8, cur_y + 1
+                    ))
+                    add_hitbox(x1 - 92, cur_y - 2, x1 - 42, cur_y + 18, "reply_row", { index = idx, row = row })
+                    add_hitbox(x1 - 40, cur_y - 2, x1 - 6, cur_y + 18, "translate_row", { index = idx, row = row })
                 end
                 cur_y = cur_y + 19
 
@@ -1650,7 +1651,7 @@ local function render_chat_overlay()
         add_hitbox(x0 + 6, box_y, x1 - 6, box_y + 78, "compose_box", nil)
     else
         table.insert(parts, string.format(
-            "{\\an7\\pos(%d,692)\\bord1.5\\shad1.2\\3c&H000000&\\fs12\\1c&HB8B0A6&}[↑↓/Wheel] Scroll · [Click] Select/Expand · [Alt+r] VOD · [Alt+l] Side · [-/+] Vol",
+            "{\\an7\\pos(%d,692)\\bord1.5\\shad1.2\\3c&H000000&\\fs12\\1c&HB8B0A6&}[Click] Replies · [DblClick] Reply · [↑↓/Wheel] Scroll · [-/+] Vol",
             tx
         ))
     end
@@ -1698,12 +1699,14 @@ local function sync_compose_target_from_cursor()
         chat_compose_target_root_id = row.root.id
         local c = row.comment or row.root
         chat_compose_target_author = c and c.author or nil
+        chat_compose_is_sub_reply = (row.kind == "reply")
         if row.kind == "reply" then
             chat_compose_reply_mode = true
         end
     else
         chat_compose_target_root_id = nil
         chat_compose_target_author = nil
+        chat_compose_is_sub_reply = false
         chat_compose_reply_mode = false
     end
 end
@@ -1722,7 +1725,7 @@ local function submit_chat_compose()
     local parent_id = ""
     if chat_compose_reply_mode and chat_compose_target_root_id then
         parent_id = tostring(chat_compose_target_root_id)
-        if chat_compose_target_author and chat_compose_target_author ~= "" then
+        if chat_compose_is_sub_reply and chat_compose_target_author and chat_compose_target_author ~= "" then
             local clean_at = chat_compose_target_author:gsub("^@", "")
             if not text:find("^@") then
                 text = "@" .. clean_at .. " " .. text
@@ -1952,15 +1955,35 @@ local function handle_chat_left_click(is_dbl)
             for _, hb in ipairs(chat_hitboxes) do
                 if hb.action == "select_row" and point_in_rect(vx, vy, hb) and hb.payload then
                     local next_idx = hb.payload.index or chat_cursor
-                    if is_dbl or (chat_cursor == next_idx) then
-                        if hb.payload.row and hb.payload.row.kind == "root" and hb.payload.row.has_children then
-                            trigger_fold_root(hb.payload.row.root)
-                        elseif hb.payload.row and hb.payload.row.kind == "reply" then
-                            open_chat_compose(true)
+                    local row = hb.payload.row
+                    local row_id = row and tostring(row.id or next_idx) or tostring(next_idx)
+                    local now = mp.get_time()
+                    if is_dbl and (now - chat_last_dbl_at) < 0.14 then
+                        return
+                    end
+                    local double_hit = is_dbl
+                        or (chat_last_click_id == row_id and (now - chat_last_click_time) < 0.45)
+
+                    chat_cursor = next_idx
+                    if double_hit then
+                        chat_last_click_id = nil
+                        chat_last_click_time = 0
+                        chat_last_dbl_at = now
+                        if row and row.kind == "root" and row.has_children and row.root then
+                            if chat_last_pre_expanded then
+                                chat_expanded[row.root.id] = true
+                            end
                         end
+                        open_chat_compose(true)
                     else
-                        chat_cursor = next_idx
-                        render_chat_overlay()
+                        chat_last_click_id = row_id
+                        chat_last_click_time = now
+                        chat_last_pre_expanded = (row and row.root and chat_expanded[row.root.id]) and true or false
+                        if row and row.kind == "root" and row.has_children then
+                            trigger_fold_root(row.root)
+                        else
+                            render_chat_overlay()
+                        end
                     end
                     return
                 end

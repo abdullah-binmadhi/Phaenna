@@ -7908,9 +7908,26 @@ async fn handle_mouse_event(
                             );
                             if is_dbl {
                                 state.detail_last_node_click = None;
-                                toggle_comment_tree_node(state, tx, client);
+                                if let Some(flat_row) = state.build_comment_tree().get(nh.flat_idx)
+                                {
+                                    if flat_row.depth == 0 && flat_row.has_children {
+                                        if let Some(c) =
+                                            state.detail_comments.get_mut(flat_row.root_idx)
+                                        {
+                                            c.replies_expanded = true;
+                                        }
+                                    }
+                                }
+                                begin_reply_to_selected_node(state);
                             } else {
-                                state.detail_last_node_click = Some((nh.node_id, Instant::now()));
+                                state.detail_last_node_click =
+                                    Some((nh.node_id.clone(), Instant::now()));
+                                if let Some(flat_row) = state.build_comment_tree().get(nh.flat_idx)
+                                {
+                                    if flat_row.depth == 0 && flat_row.has_children {
+                                        toggle_comment_tree_node(state, tx, client);
+                                    }
+                                }
                             }
                         }
                         return true;
