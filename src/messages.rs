@@ -5,6 +5,7 @@ use crate::api::innertube::{SearchChannelCard, VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
+use crate::api::ytmusic::{YtmLyrics, YtmPage, YtmUpNextQueue};
 use crate::db::cache::{VideoItem, VideoStatsUpdate};
 use crate::services::auth::GoogleAccountSession;
 use crate::services::cast::CastDevice;
@@ -209,4 +210,27 @@ pub enum AppMessage {
     RemotePlayVideo(String),
     RemotePlayFromPos(String, f64),
     RemoteToggleSubtitle(String),
+
+    // YouTube Music Tab & Audio Queue
+    MusicPageLoaded {
+        section: crate::state::YtmSection,
+        append: bool,
+        page: YtmPage,
+        title: Option<String>,
+    },
+    MusicPageFailed {
+        section: crate::state::YtmSection,
+        error: String,
+    },
+    MusicUpNextLoaded {
+        video_id: String,
+        queue: YtmUpNextQueue,
+    },
+    MusicLyricsLoaded {
+        video_id: String,
+        lyrics: YtmLyrics,
+    },
+    MusicTrackEof {
+        session_id: u64,
+    },
 }

@@ -264,6 +264,11 @@ pub enum PlayerCommand {
     SetLoop(bool),
     JumpToLiveEdge,
     SetNetworkMode(NetworkMode),
+    SwitchAudioTrack {
+        url: String,
+        title: String,
+        video_id: String,
+    },
     HotSwitchStream {
         primary_url: String,
         audio_url: Option<String>,
@@ -651,6 +656,12 @@ impl PlayerCommand {
             Self::ReloadSubtitles => {
                 vec![json!({"command": ["rescan-external-files"]}).to_string()]
             }
+            Self::SwitchAudioTrack { url, title, .. } => {
+                vec![
+                    json!({"command": ["set_property", "force-media-title", title]}).to_string(),
+                    json!({"command": ["loadfile", url, "replace"]}).to_string(),
+                ]
+            }
             Self::UpdateSkipSegments(_) | Self::UndoLastSkip | Self::SetSponsorOsdToast(_) => {
                 Vec::new()
             }
@@ -943,6 +954,19 @@ fn is_file_loaded_event(line: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_end_file_reason(line: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("event").and_then(Value::as_str)? != "end-file" {
+        return None;
+    }
+    Some(
+        v.get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+    )
+}
+
 pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
     tokio::spawn(async move {
         let mut stream = None;
@@ -1206,6 +1230,13 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                         Some(cmd) => {
                             if matches!(cmd, PlayerCommand::HotSwitchStream { .. }) {
                                 pending_reset_start = true;
+                            } else if let PlayerCommand::SwitchAudioTrack { ref video_id, .. } = cmd
+                            {
+                                last_pos = 0.0;
+                                prev_pos = 0.0;
+                                last_dur = 0.0;
+                                marked_watched = false;
+                                let _ = video_id;
                             }
                             for raw in cmd.to_mpv_json_commands() {
                                 let line = format!("{raw}\n");
@@ -1221,6 +1252,15 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                     let Ok(Some(line)) = next_line else {
                         break;
                     };
+
+                    if parse_end_file_reason(&line).as_deref() == Some("eof") {
+                        let _ = config
+                            .tx
+                            .send(AppMessage::MusicTrackEof {
+                                session_id: config.session_id,
+                            })
+                            .await;
+                    }
 
                     if pending_reset_start && is_file_loaded_event(&line) {
                         pending_reset_start = false;

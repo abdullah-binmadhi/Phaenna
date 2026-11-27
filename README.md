@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/4659ad96-2629-4fd2-a739-0ab5614630d4
 
 ```text
 +----------------------------------------------------------------------------------+
-| PHAENNA | Continue Watching  Home Feed  Subscriptions  History  Watch Later      |
+| PHAENNA | Continue Watching  Home Feed  Shorts  Subscriptions  History  ♪ Music  |
 +----------------------------------------------------------------------------------+
 | +-----------------------+  +---------------------------------------------------+ |
 | | 16:9 SPOTLIGHT COVER  |  | FEATURED SPOTLIGHT (AMBILIGHT)                    | |
@@ -69,7 +69,8 @@ Web browsers compress, wash out, and muddy the videos you love. Phaenna restores
 - `c` Captions · `d` Switch Audio/Dub Track · `<` / `>` Playback Speed · `,` / `.` Frame Step
 - `0`–`9` Jump to `0%`–`90%` · `[` / `]` Previous & Next Chapter
 
-### Search Studio, Visuals & Companion Suite
+### Search Studio, YouTube Music & Companion Suite
+- **YouTube Music Tab (`7` or click `♪ Music`)**: Native `music.youtube.com` workspace inside Phaenna with `Home` mixes (*Listen again*, *Quick picks*), `Library`, `Liked Music`, `Charts`, filtered catalog `Search` (`All`, `Songs`, `Videos`, `Albums`, `Playlists`, `Artists`), full Album / Playlist / Artist drill-down (`Enter` / `Backspace`), **windowless gapless background `mpv` audio**, `1:1` Ambilight square album covers, `Shuffle` (`z`) & `Repeat` (`R`), live **Song ↔ Video** switch (`v`), `♥ Like` (`l`), interactive seek bar, and **Up Next / Time-Synced Lyrics** (`y`).
 - **Search Studio (`/`)**: Live YouTube autocomplete (`Tab`), precision scope/type/date/duration filters, paste any YouTube URL directly, and instant Play / Queue / Watch Later / Channel actions.
 - **Bento Detail Deck (`Enter`)**: 16:9 preview, live dislike telemetry, SponsorBlock timeline, wrapped synopsis, clickable **Chapters**, **Comment Translator** (`t` / `T` / `g`), and live **[f] Fullscreen** control.
 - **Isolated Browser Popup Google Sign-In (`L`)**: Launches an isolated popup window using your installed Chromium-based browser (`Chromium`, `Google Chrome`, `Brave`, `Microsoft Edge`, or `Vivaldi`) with temporary profile auto-cleanup — zero daily browser SQLite scraping.

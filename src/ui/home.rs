@@ -196,12 +196,21 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
     }
 }
 
+/// Format category label shown inside Phaenna's top bar and click hit-tester.
+pub fn top_bar_cat_label(cat: Category, count: usize) -> String {
+    if cat == Category::Music {
+        " ♪ Music ".to_string()
+    } else {
+        format!(" {} ({}) ", cat.label(), count)
+    }
+}
+
 /// Compute top bar shelf pill hitboxes `(start_x, end_x, category_index)`.
 pub fn top_bar_shelf_rects(categories: &[(Category, Vec<VideoItem>)]) -> Vec<(u16, u16, usize)> {
     let mut out = Vec::with_capacity(categories.len());
     let mut x = 10u16; // After " PHAENNA " brand chip
     for (idx, (cat, items)) in categories.iter().enumerate() {
-        let label = format!(" {} ({}) ", cat.label(), items.len());
+        let label = top_bar_cat_label(*cat, items.len());
         let w = label.chars().count() as u16;
         out.push((x, x + w, idx));
         x = x + w + 1;
@@ -468,6 +477,25 @@ pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: O
     state.home_channel_hitboxes.clear();
     let [top_area, hero_area, mut grid_area, _footer_area] = home_layout(frame.area());
     render_top_bar(frame, top_area, state);
+
+    let active_cat = state
+        .categories
+        .get(state.active_category)
+        .map(|(c, _)| *c)
+        .unwrap_or(Category::Recommended);
+
+    if active_cat == Category::Music {
+        state.live_playback.now_playing_hitboxes.clear();
+        let music_area = Rect::new(
+            hero_area.x,
+            hero_area.y,
+            grid_area.width,
+            hero_area.height + grid_area.height,
+        );
+        crate::ui::music::render_music_workspace(frame, music_area, state, modal_rect);
+        return;
+    }
+
     render_hero_stage(frame, hero_area, state, modal_rect);
 
     let show_now_playing = state.has_live_ipc() && grid_area.height >= 12;
@@ -479,12 +507,6 @@ pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: O
         state.live_playback.now_playing_hitboxes.clear();
         None
     };
-
-    let active_cat = state
-        .categories
-        .get(state.active_category)
-        .map(|(c, _)| *c)
-        .unwrap_or(Category::Recommended);
 
     if active_cat == Category::ContinueWatching && !state.continue_watching_grid_mode {
         render_continue_watching_deck(frame, grid_area, state, modal_rect);
@@ -520,7 +542,7 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 
     for (idx, (cat, items)) in state.categories.iter().enumerate() {
         let active = idx == state.active_category;
-        let label = format!(" {} ({}) ", cat.label(), items.len());
+        let label = top_bar_cat_label(*cat, items.len());
         let st = if active {
             Style::default()
                 .fg(Color::Black)

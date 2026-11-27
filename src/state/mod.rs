@@ -5,6 +5,9 @@ use crate::api::innertube::{SearchChannelCard, VideoComment, VideoVote};
 use crate::api::sponsorblock::SponsorSegment;
 use crate::api::subtitles::SubtitleTrack;
 use crate::api::ytdlp::ResolvedStreamLadder;
+use crate::api::ytmusic::{
+    YtmLyrics, YtmPage, YtmSearchFilter, YtmShelfItem, YtmTrack,
+};
 use crate::config::{
     Config, PerformanceMode, PicturePreset, Player, Quality, SponsorBlockMode, VideoShaderMode,
 };
@@ -225,10 +228,11 @@ pub enum Category {
     History,
     WatchLater,
     ContinueWatching,
+    Music,
 }
 
 impl Category {
-    pub fn all_shelves() -> [Category; 6] {
+    pub fn all_shelves() -> [Category; 7] {
         [
             Category::ContinueWatching,
             Category::Recommended,
@@ -236,6 +240,7 @@ impl Category {
             Category::Subscriptions,
             Category::History,
             Category::WatchLater,
+            Category::Music,
         ]
     }
 
@@ -247,6 +252,7 @@ impl Category {
             Category::Subscriptions => "Subscriptions",
             Category::History => "History",
             Category::WatchLater => "Watch Later",
+            Category::Music => "Music",
         }
     }
 
@@ -258,6 +264,7 @@ impl Category {
             Category::Subscriptions => SUBSCRIPTIONS,
             Category::History => HISTORY,
             Category::WatchLater => WATCH_LATER,
+            Category::Music => "music",
         }
     }
 
@@ -269,7 +276,360 @@ impl Category {
             Category::History => Some("https://www.youtube.com/feed/history"),
             Category::WatchLater => Some("https://www.youtube.com/playlist?list=WL"),
             Category::ContinueWatching => None,
+            Category::Music => Some("https://music.youtube.com"),
         }
+    }
+}
+
+/// Top-level navigation section inside the YouTube Music tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YtmSection {
+    Home,
+    Library,
+    Liked,
+    Charts,
+    Search,
+    Browse,
+}
+
+impl YtmSection {
+    pub const NAV_TABS: [Self; 5] = [
+        Self::Home,
+        Self::Library,
+        Self::Liked,
+        Self::Charts,
+        Self::Search,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Home => "Home",
+            Self::Library => "Library",
+            Self::Liked => "Liked",
+            Self::Charts => "Charts",
+            Self::Search => "Search",
+            Self::Browse => "Browse",
+        }
+    }
+}
+
+/// Repeat policy for the Music player queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YtmRepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl YtmRepeatMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::All => "All",
+            Self::One => "One",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+}
+
+/// Right-hand auxiliary pane inside Now Playing on the Music tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YtmRightPaneTab {
+    UpNext,
+    Lyrics,
+}
+
+/// Flattened display row rendered in the Music browse list.
+#[derive(Debug, Clone)]
+pub enum YtmBrowseRow {
+    ShelfHeader {
+        title: String,
+    },
+    Item {
+        item: YtmShelfItem,
+        selectable_idx: usize,
+        track_num: Option<usize>,
+    },
+}
+
+/// Mouse click target inside the Music tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MusicHit {
+    SelectSection(YtmSection),
+    GoBack,
+    FocusSearch,
+    SelectSearchFilter(YtmSearchFilter),
+    SelectItem(usize),
+    TogglePlayPause,
+    NextTrack,
+    PrevTrack,
+    ToggleShuffle,
+    CycleRepeat,
+    ToggleVideoMode,
+    ToggleLike,
+    SelectRightTab(YtmRightPaneTab),
+    SelectQueueTrack(usize),
+    SeekBar,
+}
+
+/// Full interactive state for the YouTube Music tab and background audio player.
+#[derive(Debug, Clone)]
+pub struct YtmMusicState {
+    pub section: YtmSection,
+    pub browse_stack: Vec<(YtmSection, String, YtmPage)>,
+    pub home_page: Option<YtmPage>,
+    pub library_page: Option<YtmPage>,
+    pub liked_page: Option<YtmPage>,
+    pub charts_page: Option<YtmPage>,
+    pub search_page: Option<YtmPage>,
+    pub browse_page: Option<YtmPage>,
+    pub browse_title: String,
+    pub search_query: String,
+    pub search_editing: bool,
+    pub search_filter: YtmSearchFilter,
+    pub cursor: usize,
+    pub scroll: usize,
+    pub loading: bool,
+    pub loading_label: String,
+    pub error: Option<String>,
+    pub queue: Vec<YtmTrack>,
+    pub queue_index: usize,
+    pub queue_continuation: Option<String>,
+    pub shuffle: bool,
+    pub repeat: YtmRepeatMode,
+    pub video_mode: bool,
+    pub active_audio_session_id: Option<u64>,
+    pub liked_ids: HashSet<String>,
+    pub right_tab: YtmRightPaneTab,
+    pub queue_cursor: usize,
+    pub lyrics_browse_id: Option<String>,
+    pub related_browse_id: Option<String>,
+    pub lyrics: Option<YtmLyrics>,
+    pub lyrics_loading: bool,
+    pub last_click: Option<(usize, Instant)>,
+    pub hitboxes: Vec<(Rect, MusicHit)>,
+    pub progress_bar_rect: Rect,
+}
+
+impl Default for YtmMusicState {
+    fn default() -> Self {
+        Self {
+            section: YtmSection::Home,
+            browse_stack: Vec::new(),
+            home_page: None,
+            library_page: None,
+            liked_page: None,
+            charts_page: None,
+            search_page: None,
+            browse_page: None,
+            browse_title: String::new(),
+            search_query: String::new(),
+            search_editing: false,
+            search_filter: YtmSearchFilter::All,
+            cursor: 0,
+            scroll: 0,
+            loading: false,
+            loading_label: String::new(),
+            error: None,
+            queue: Vec::new(),
+            queue_index: 0,
+            queue_continuation: None,
+            shuffle: false,
+            repeat: YtmRepeatMode::Off,
+            video_mode: false,
+            active_audio_session_id: None,
+            liked_ids: HashSet::new(),
+            right_tab: YtmRightPaneTab::UpNext,
+            queue_cursor: 0,
+            lyrics_browse_id: None,
+            related_browse_id: None,
+            lyrics: None,
+            lyrics_loading: false,
+            last_click: None,
+            hitboxes: Vec::new(),
+            progress_bar_rect: Rect::default(),
+        }
+    }
+}
+
+impl YtmMusicState {
+    /// Active page corresponding to the current `section`.
+    pub fn current_page(&self) -> Option<&YtmPage> {
+        match self.section {
+            YtmSection::Home => self.home_page.as_ref(),
+            YtmSection::Library => self.library_page.as_ref(),
+            YtmSection::Liked => self.liked_page.as_ref(),
+            YtmSection::Charts => self.charts_page.as_ref(),
+            YtmSection::Search => self.search_page.as_ref(),
+            YtmSection::Browse => self.browse_page.as_ref(),
+        }
+    }
+
+    /// Mutable slot for storing a loaded page for `section`.
+    pub fn page_slot_mut(&mut self, section: YtmSection) -> &mut Option<YtmPage> {
+        match section {
+            YtmSection::Home => &mut self.home_page,
+            YtmSection::Library => &mut self.library_page,
+            YtmSection::Liked => &mut self.liked_page,
+            YtmSection::Charts => &mut self.charts_page,
+            YtmSection::Search => &mut self.search_page,
+            YtmSection::Browse => &mut self.browse_page,
+        }
+    }
+
+    /// Flatten current shelves + direct track list into navigable rows.
+    pub fn build_rows(&self) -> (Vec<YtmBrowseRow>, Vec<YtmShelfItem>) {
+        let Some(page) = self.current_page() else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut rows = Vec::new();
+        let mut items = Vec::new();
+
+        for shelf in &page.shelves {
+            if shelf.items.is_empty() {
+                continue;
+            }
+            if !shelf.title.trim().is_empty() {
+                rows.push(YtmBrowseRow::ShelfHeader {
+                    title: shelf.title.clone(),
+                });
+            }
+            for item in &shelf.items {
+                let idx = items.len();
+                items.push(item.clone());
+                rows.push(YtmBrowseRow::Item {
+                    item: item.clone(),
+                    selectable_idx: idx,
+                    track_num: None,
+                });
+            }
+        }
+
+        if !page.tracks.is_empty() {
+            if !page.shelves.is_empty() {
+                rows.push(YtmBrowseRow::ShelfHeader {
+                    title: "Tracks".to_string(),
+                });
+            }
+            for (i, tr) in page.tracks.iter().enumerate() {
+                let mut subtitle_parts = vec![tr.artist.clone()];
+                if let Some(ref alb) = tr.album {
+                    subtitle_parts.push(alb.clone());
+                }
+                if let Some(ref dur) = tr.duration_text {
+                    subtitle_parts.push(dur.clone());
+                }
+                let item = YtmShelfItem {
+                    kind: tr.kind,
+                    title: tr.title.clone(),
+                    subtitle: subtitle_parts.join(" • "),
+                    video_id: Some(tr.video_id.clone()),
+                    browse_id: tr.album_browse_id.clone(),
+                    playlist_id: tr
+                        .playlist_id
+                        .clone()
+                        .or_else(|| page.header_playlist_id.clone()),
+                    params: None,
+                    thumb_url: if !tr.thumb_url.is_empty() {
+                        tr.thumb_url.clone()
+                    } else if let Some(ref ht) = page.header_thumb {
+                        ht.clone()
+                    } else {
+                        String::new()
+                    },
+                    duration_secs: tr.duration_secs,
+                };
+                let idx = items.len();
+                items.push(item.clone());
+                rows.push(YtmBrowseRow::Item {
+                    item,
+                    selectable_idx: idx,
+                    track_num: Some(i + 1),
+                });
+            }
+        }
+
+        (rows, items)
+    }
+
+    /// Return all selectable items on the current page.
+    pub fn selectable_items(&self) -> Vec<YtmShelfItem> {
+        self.build_rows().1
+    }
+
+    /// Currently active track in the Music queue.
+    pub fn current_track(&self) -> Option<&YtmTrack> {
+        self.queue.get(self.queue_index)
+    }
+
+    /// Compute next track index honoring Shuffle and Repeat mode (`manual` overrides Repeat::One).
+    pub fn next_queue_index(&self, manual: bool) -> Option<usize> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        if !manual && self.repeat == YtmRepeatMode::One {
+            return Some(self.queue_index);
+        }
+        if self.shuffle && self.queue.len() > 1 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as usize)
+                .unwrap_or(1);
+            let mut next =
+                (self.queue_index + 1 + (nanos % (self.queue.len() - 1))) % self.queue.len();
+            if next == self.queue_index {
+                next = (self.queue_index + 1) % self.queue.len();
+            }
+            return Some(next);
+        }
+        if self.queue_index + 1 < self.queue.len() {
+            Some(self.queue_index + 1)
+        } else if self.repeat == YtmRepeatMode::All {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    /// Compute previous track index honoring Repeat mode.
+    pub fn prev_queue_index(&self) -> Option<usize> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        if self.queue_index > 0 {
+            Some(self.queue_index - 1)
+        } else if self.repeat == YtmRepeatMode::All {
+            Some(self.queue.len() - 1)
+        } else {
+            Some(0)
+        }
+    }
+
+    /// Find the index of the active synced lyric line for `pos_secs`.
+    pub fn active_lyric_index(&self, pos_secs: f64) -> Option<usize> {
+        let lyrics = self.lyrics.as_ref()?;
+        if !lyrics.is_timed || lyrics.lines.is_empty() {
+            return None;
+        }
+        let pos_ms = (pos_secs.max(0.0) * 1000.0) as u64;
+        let mut active = None;
+        for (idx, line) in lyrics.lines.iter().enumerate() {
+            if let Some(start) = line.start_ms {
+                if pos_ms >= start {
+                    active = Some(idx);
+                } else {
+                    break;
+                }
+            }
+        }
+        active
     }
 }
 
@@ -467,6 +827,7 @@ pub struct AppState {
     // In-app Google Identity Hub & vault
     pub auth_vault: AuthVault,
     pub login_ui: LoginUiState,
+    pub music: YtmMusicState,
 
     // Loading & pagination flags
     pub loading_feeds: HashSet<String>,
@@ -672,6 +1033,7 @@ impl AppState {
                 .map(|p| AuthVault::load_or_default(&p))
                 .unwrap_or_default(),
             login_ui: LoginUiState::default(),
+            music: YtmMusicState::default(),
 
             loading_feeds: HashSet::new(),
             is_fetching_more: false,

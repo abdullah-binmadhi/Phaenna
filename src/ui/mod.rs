@@ -8,6 +8,7 @@ pub mod download;
 pub mod help;
 pub mod home;
 pub mod login;
+pub mod music;
 pub mod play_options;
 pub mod remote;
 pub mod search;

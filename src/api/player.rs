@@ -157,6 +157,7 @@ pub struct PlayOptions {
     pub live_auto_catchup: bool,
     pub network_mode: NetworkMode,
     pub force_ipv4: bool,
+    pub audio_headless: bool,
     pub auto_fullscreen: bool,
     pub auto_pip: bool,
     pub loading_art_dir: Option<String>,
@@ -1209,34 +1210,39 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         format!("force-media-title={}", opts.title),
     ];
 
-    if opts.quality_format.starts_with("bestaudio") {
+    if opts.quality_format.starts_with("bestaudio") || opts.audio_headless {
         flags.push("vid=no".to_string());
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        flags.push(format!(
-            "wayland-app-id={}",
-            crate::services::pip::PHAENNA_WAYLAND_APP_ID
-        ));
-        flags.push(format!(
-            "x11-name={}",
-            crate::services::pip::PHAENNA_WAYLAND_APP_ID
-        ));
-    }
-    if opts.auto_pip {
-        flags.push("fullscreen=no".to_string());
-        flags.push("ontop=yes".to_string());
-        flags.push("border=no".to_string());
-        flags.push("keepaspect-window=yes".to_string());
-        flags.push("window-scale=0.30".to_string());
-        flags.push("geometry=30%x30%-24-24".to_string());
-    } else if opts.auto_fullscreen {
-        flags.push("fullscreen=yes".to_string());
+    if opts.audio_headless {
+        flags.push("audio-display=no".to_string());
     }
 
-    if let Some(conf_path) = prepare_youtube_input_conf() {
-        flags.push(format!("input-conf={}", conf_path.to_string_lossy()));
+    if !opts.audio_headless {
+        #[cfg(target_os = "linux")]
+        {
+            flags.push(format!(
+                "wayland-app-id={}",
+                crate::services::pip::PHAENNA_WAYLAND_APP_ID
+            ));
+            flags.push(format!(
+                "x11-name={}",
+                crate::services::pip::PHAENNA_WAYLAND_APP_ID
+            ));
+        }
+        if opts.auto_pip {
+            flags.push("fullscreen=no".to_string());
+            flags.push("ontop=yes".to_string());
+            flags.push("border=no".to_string());
+            flags.push("keepaspect-window=yes".to_string());
+            flags.push("window-scale=0.30".to_string());
+            flags.push("geometry=30%x30%-24-24".to_string());
+        } else if opts.auto_fullscreen {
+            flags.push("fullscreen=yes".to_string());
+        }
+
+        if let Some(conf_path) = prepare_youtube_input_conf() {
+            flags.push(format!("input-conf={}", conf_path.to_string_lossy()));
+        }
     }
 
     let mut script_opt_parts: Vec<String> = Vec::new();
@@ -1246,60 +1252,62 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             sanitize_script_opt(&ytdlp_path.to_string_lossy())
         ));
     }
-    if let Some(lua_path) = prepare_loading_overlay_script() {
-        flags.push(format!("script={}", lua_path.to_string_lossy()));
-        let safe_title = sanitize_script_opt(&opts.title);
-        let mut safe_meta = if use_live_pipeline {
-            format!("PHAENNA LIVE | {}", opts.live_mode.short_badge())
-        } else {
-            format!(
-                "PHAENNA {} | {}",
-                opts.performance_mode.short_badge(),
-                opts.motion_mode.short_badge()
-            )
-        };
-        if opts.network_mode.is_congested() {
-            safe_meta.push_str(&format!(" | {}", opts.network_mode.short_badge()));
-        }
-        script_opt_parts.push(format!("phaenna_title={safe_title}"));
-        script_opt_parts.push(format!("phaenna_meta={safe_meta}"));
-        let safe_ch = sanitize_script_opt(&opts.loading_channel);
-        if !safe_ch.is_empty() {
-            script_opt_parts.push(format!("phaenna_channel={safe_ch}"));
-        }
-        let safe_q = sanitize_script_opt(&opts.loading_quality);
-        if !safe_q.is_empty() {
-            script_opt_parts.push(format!("phaenna_quality={safe_q}"));
-        }
-        if let Some(dir) = opts
-            .loading_art_dir
-            .as_deref()
-            .filter(|d| !d.trim().is_empty())
-        {
-            script_opt_parts.push(format!("phaenna_card_dir={}", sanitize_script_opt(dir)));
-            script_opt_parts.push(format!(
-                "phaenna_card_count={}",
-                crate::services::loading_art::Y2K_ART_COUNT
-            ));
-            script_opt_parts.push(format!(
-                "phaenna_card_idx={}",
-                opts.loading_variant_idx % crate::services::loading_art::Y2K_ART_COUNT
-            ));
-        }
-        script_opt_parts.push(format!("phaenna_auto_pip={}", if opts.auto_pip { "1" } else { "0" }));
-        script_opt_parts.push(format!("phaenna_perf={}", opts.performance_mode.short_badge()));
-        script_opt_parts.push(format!("phaenna_gov={}", eff_master.governor_mode.mpv_opt_value()));
-        script_opt_parts.push(format!("phaenna_grain={:.3}", eff_master.organic_grain.luma_strength()));
-        script_opt_parts.push(format!("phaenna_shader_opts={}", if caps.has_shader_opts { "1" } else { "0" }));
-        script_opt_parts.push(format!(
-            "phaenna_motion={}",
-            match opts.motion_mode {
-                MotionMode::Off => "off",
-                MotionMode::Cadence => "cadence",
-                MotionMode::Smooth120Hz => "smooth120",
+    if !opts.audio_headless {
+        if let Some(lua_path) = prepare_loading_overlay_script() {
+            flags.push(format!("script={}", lua_path.to_string_lossy()));
+            let safe_title = sanitize_script_opt(&opts.title);
+            let mut safe_meta = if use_live_pipeline {
+                format!("PHAENNA LIVE | {}", opts.live_mode.short_badge())
+            } else {
+                format!(
+                    "PHAENNA {} | {}",
+                    opts.performance_mode.short_badge(),
+                    opts.motion_mode.short_badge()
+                )
+            };
+            if opts.network_mode.is_congested() {
+                safe_meta.push_str(&format!(" | {}", opts.network_mode.short_badge()));
             }
-        ));
-        script_opt_parts.push(format!("phaenna_device={}", sanitize_script_opt(&dev.inspector_header())));
+            script_opt_parts.push(format!("phaenna_title={safe_title}"));
+            script_opt_parts.push(format!("phaenna_meta={safe_meta}"));
+            let safe_ch = sanitize_script_opt(&opts.loading_channel);
+            if !safe_ch.is_empty() {
+                script_opt_parts.push(format!("phaenna_channel={safe_ch}"));
+            }
+            let safe_q = sanitize_script_opt(&opts.loading_quality);
+            if !safe_q.is_empty() {
+                script_opt_parts.push(format!("phaenna_quality={safe_q}"));
+            }
+            if let Some(dir) = opts
+                .loading_art_dir
+                .as_deref()
+                .filter(|d| !d.trim().is_empty())
+            {
+                script_opt_parts.push(format!("phaenna_card_dir={}", sanitize_script_opt(dir)));
+                script_opt_parts.push(format!(
+                    "phaenna_card_count={}",
+                    crate::services::loading_art::Y2K_ART_COUNT
+                ));
+                script_opt_parts.push(format!(
+                    "phaenna_card_idx={}",
+                    opts.loading_variant_idx % crate::services::loading_art::Y2K_ART_COUNT
+                ));
+            }
+            script_opt_parts.push(format!("phaenna_auto_pip={}", if opts.auto_pip { "1" } else { "0" }));
+            script_opt_parts.push(format!("phaenna_perf={}", opts.performance_mode.short_badge()));
+            script_opt_parts.push(format!("phaenna_gov={}", eff_master.governor_mode.mpv_opt_value()));
+            script_opt_parts.push(format!("phaenna_grain={:.3}", eff_master.organic_grain.luma_strength()));
+            script_opt_parts.push(format!("phaenna_shader_opts={}", if caps.has_shader_opts { "1" } else { "0" }));
+            script_opt_parts.push(format!(
+                "phaenna_motion={}",
+                match opts.motion_mode {
+                    MotionMode::Off => "off",
+                    MotionMode::Cadence => "cadence",
+                    MotionMode::Smooth120Hz => "smooth120",
+                }
+            ));
+            script_opt_parts.push(format!("phaenna_device={}", sanitize_script_opt(&dev.inspector_header())));
+        }
     }
 
     if opts.local_file.is_none() {
@@ -1528,9 +1536,9 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         }
     }
 
-    // Bypass heavy 4K GLSL shader chains in LowLatency / BalancedLive to avoid frame drops on live streams.
+    // Bypass heavy 4K GLSL shader chains in LowLatency / BalancedLive or headless audio mode.
     let allow_shaders =
-        !use_live_pipeline || opts.live_mode == LiveStreamMode::SmoothDvr;
+        !opts.audio_headless && (!use_live_pipeline || opts.live_mode == LiveStreamMode::SmoothDvr);
     if allow_shaders {
         if let Some(shaders) = prepare_video_shaders_with_mastering(
             opts.shader_mode,
@@ -1549,24 +1557,26 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
         }
     }
 
-    let g = opts.picture.clamped();
-    if g.brightness != 0 {
-        flags.push(format!("brightness={}", g.brightness));
-    }
-    if g.contrast != 0 {
-        flags.push(format!("contrast={}", g.contrast));
-    }
-    if g.saturation != 0 {
-        flags.push(format!("saturation={}", g.saturation));
-    }
-    if g.gamma != 0 {
-        flags.push(format!("gamma={}", g.gamma));
-    }
-    if g.hue != 0 {
-        flags.push(format!("hue={}", g.hue));
-    }
-    if g.sharpness != 0 {
-        flags.push(format!("sharpen={:.2}", g.sharpness as f64 / 50.0));
+    if !opts.audio_headless {
+        let g = opts.picture.clamped();
+        if g.brightness != 0 {
+            flags.push(format!("brightness={}", g.brightness));
+        }
+        if g.contrast != 0 {
+            flags.push(format!("contrast={}", g.contrast));
+        }
+        if g.saturation != 0 {
+            flags.push(format!("saturation={}", g.saturation));
+        }
+        if g.gamma != 0 {
+            flags.push(format!("gamma={}", g.gamma));
+        }
+        if g.hue != 0 {
+            flags.push(format!("hue={}", g.hue));
+        }
+        if g.sharpness != 0 {
+            flags.push(format!("sharpen={:.2}", g.sharpness as f64 / 50.0));
+        }
     }
 
     flags
@@ -1589,7 +1599,14 @@ fn resolved_mpv_target(opts: &PlayOptions) -> String {
 
 /// Build arguments for standalone `mpv` (pure function for unit testing).
 pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
-    let mut args = vec!["--force-window=immediate".to_string()];
+    let mut args = if opts.audio_headless {
+        vec![
+            "--idle=yes".to_string(),
+            "--force-window=no".to_string(),
+        ]
+    } else {
+        vec!["--force-window=immediate".to_string()]
+    };
     if let Some(ref sock) = opts.ipc_socket {
         args.push(format!("--input-ipc-server={}", sock));
     }
@@ -1731,6 +1748,7 @@ mod tests {
             force_ipv4: false,
             auto_fullscreen: false,
             auto_pip: false,
+            audio_headless: false,
             loading_art_dir: None,
             loading_variant_idx: 0,
             loading_channel: String::new(),
@@ -1823,6 +1841,7 @@ mod tests {
             force_ipv4: false,
             auto_fullscreen: true,
             auto_pip: false,
+            audio_headless: false,
             loading_art_dir: None,
             loading_variant_idx: 0,
             loading_channel: String::new(),
@@ -1877,6 +1896,7 @@ mod tests {
             force_ipv4: false,
             auto_fullscreen: false,
             auto_pip: false,
+            audio_headless: false,
             loading_art_dir: None,
             loading_variant_idx: 0,
             loading_channel: String::new(),
@@ -1932,6 +1952,7 @@ mod tests {
             direct_stream: None,
             auto_fullscreen: false,
             auto_pip: false,
+            audio_headless: false,
             loading_art_dir: None,
             loading_variant_idx: 0,
             loading_channel: String::new(),
@@ -2057,5 +2078,54 @@ mod tests {
         .unwrap();
         assert!(generic.contains("code 1"));
         assert!(generic.contains("ERROR: failed to open stream"));
+    }
+
+    #[test]
+    fn test_audio_headless_mpv_flags() {
+        let opts = PlayOptions {
+            video_id: "dQw4w9WgXcQ".to_string(),
+            title: "Music Track".to_string(),
+            local_file: None,
+            quality_format: "bestaudio/best".to_string(),
+            cookies_path: None,
+            start_pos: None,
+            ipc_socket: Some("/tmp/phaenna-music.sock".to_string()),
+            subtitles_enabled: false,
+            sub_lang: None,
+            sub_url: None,
+            sub_style: SubtitleStyleConfig::default(),
+            shader_mode: VideoShaderMode::Reference4K,
+            mastering_profile: VideoMasteringProfile::StandardHd,
+            performance_mode: PerformanceMode::Quality,
+            manual_mastering: ManualMasteringConfig::default(),
+            motion_mode: MotionMode::Smooth120Hz,
+            dub_preference: DubPreference::OriginalOnly,
+            dub_lang: "en".to_string(),
+            audio_multistreams: true,
+            audio_loudnorm: true,
+            audio_filter_chain: None,
+            is_live: false,
+            live_mode: LiveStreamMode::BalancedLive,
+            live_from_start: false,
+            live_auto_catchup: true,
+            network_mode: NetworkMode::Normal,
+            force_ipv4: false,
+            auto_fullscreen: false,
+            auto_pip: false,
+            audio_headless: true,
+            loading_art_dir: None,
+            loading_variant_idx: 0,
+            loading_channel: String::new(),
+            loading_quality: String::new(),
+            picture: PictureGrade::default(),
+            direct_stream: None,
+        };
+        let args = build_mpv_args(&opts);
+        assert!(args.iter().any(|a| a == "--idle=yes"));
+        assert!(args.iter().any(|a| a == "--force-window=no"));
+        assert!(args.iter().any(|a| a == "--vid=no"));
+        assert!(args.iter().any(|a| a == "--audio-display=no"));
+        assert!(!args.iter().any(|a| a.starts_with("--glsl-shaders=")));
+        assert!(!args.iter().any(|a| a.starts_with("--wayland-app-id=")));
     }
 }
