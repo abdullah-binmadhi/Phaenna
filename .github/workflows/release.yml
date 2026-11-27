@@ -37,6 +37,11 @@ jobs:
             label: linux-x86_64
             artifact_name: phaenna-linux-x86_64
             binary_name: phaenna
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: linux-aarch64
+            artifact_name: phaenna-linux-aarch64
+            binary_name: phaenna
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: windows-x86_64

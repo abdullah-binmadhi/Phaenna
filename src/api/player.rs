@@ -1,4 +1,4 @@
-//! Cross-platform binary detector & non-blocking external video player launcher.
+//! Cross-platform binary detector & non-blocking `mpv` video player launcher.
 
 use crate::api::ytdlp::SelectedStreamPair;
 use crate::config::{
@@ -20,9 +20,9 @@ use tokio::process::{Child, Command};
 pub struct DependencyStatus {
     pub has_ytdlp: bool,
     pub has_mpv: bool,
-    pub has_mpvnet: bool,
-    pub has_celluloid: bool,
+    pub has_deno: bool,
     pub has_ffmpeg: bool,
+    pub popup_browser: Option<&'static str>,
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -72,6 +72,7 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
         extras.push(home.join(".local/bin").join(name));
         extras.push(home.join(".cargo/bin").join(name));
+        extras.push(home.join(".deno/bin").join(name));
     }
 
     #[cfg(target_os = "macos")]
@@ -83,13 +84,15 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 
     #[cfg(windows)]
     {
-        if name == "mpvnet" || name == "mpv.net" {
+        if name == "mpv" {
             if let Some(local) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-                extras.push(local.join("Programs/mpv.net/mpvnet.exe"));
+                extras.push(local.join(r"Microsoft\WinGet\Links\mpv.exe"));
             }
-            extras.push(PathBuf::from(r"C:\Program Files\mpv.net\mpvnet.exe"));
-        } else if name == "mpv" {
             extras.push(PathBuf::from(r"C:\Program Files\mpv\mpv.exe"));
+        } else if name == "deno" {
+            if let Some(profile) = env::var_os("USERPROFILE").map(PathBuf::from) {
+                extras.push(profile.join(r".deno\bin\deno.exe"));
+            }
         }
     }
 
@@ -99,16 +102,16 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 pub fn detect_dependencies() -> DependencyStatus {
     let has_ytdlp = find_binary("yt-dlp").is_some();
     let has_mpv = find_binary("mpv").is_some();
-    let has_mpvnet = find_binary("mpvnet").is_some() || find_binary("mpv.net").is_some();
-    let has_celluloid = find_binary("celluloid").is_some();
+    let has_deno = find_binary("deno").is_some();
     let has_ffmpeg = find_binary("ffmpeg").is_some();
+    let popup_browser = crate::services::auth::detect_popup_browser().map(|(label, _)| label);
 
     DependencyStatus {
         has_ytdlp,
         has_mpv,
-        has_mpvnet,
-        has_celluloid,
+        has_deno,
         has_ffmpeg,
+        popup_browser,
     }
 }
 
@@ -119,19 +122,9 @@ pub fn cached_dependencies() -> &'static DependencyStatus {
     DEPS_CACHE.get_or_init(detect_dependencies)
 }
 
-/// Returns whether a playback engine (or at least one host backend for `AutoBest`) is installed.
-pub fn is_player_installed(player: Player) -> bool {
-    let d = cached_dependencies();
-    match player {
-        Player::AutoBest => {
-            d.has_mpv
-                || (cfg!(windows) && d.has_mpvnet)
-                || (cfg!(target_os = "linux") && d.has_celluloid)
-        }
-        Player::Mpv => d.has_mpv,
-        Player::MpvNet => d.has_mpvnet,
-        Player::Celluloid => d.has_celluloid,
-    }
+/// Returns whether standalone `mpv` is installed on the host.
+pub fn is_player_installed(_player: Player) -> bool {
+    cached_dependencies().has_mpv
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +134,6 @@ pub struct PlayOptions {
     /// Either a local file path (for offline vault playback) or None (uses YouTube watch URL).
     pub local_file: Option<PathBuf>,
     pub quality_format: String,
-    pub player: Player,
     pub cookies_path: Option<PathBuf>,
     pub start_pos: Option<f64>,
     pub ipc_socket: Option<String>,
@@ -1595,22 +1587,6 @@ fn resolved_mpv_target(opts: &PlayOptions) -> String {
         .unwrap_or_else(|| youtube_watch_url(&opts.video_id))
 }
 
-/// Resolve `Player::AutoBest` to the highest-parity installed `libmpv` binary on the host.
-pub fn resolve_auto_player() -> Player {
-    if find_binary("mpv").is_some() {
-        return Player::Mpv;
-    }
-    #[cfg(windows)]
-    if find_binary("mpvnet").is_some() || find_binary("mpv.net").is_some() {
-        return Player::MpvNet;
-    }
-    #[cfg(target_os = "linux")]
-    if find_binary("celluloid").is_some() {
-        return Player::Celluloid;
-    }
-    Player::Mpv
-}
-
 /// Build arguments for standalone `mpv` (pure function for unit testing).
 pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     let mut args = vec!["--force-window=immediate".to_string()];
@@ -1624,91 +1600,23 @@ pub fn build_mpv_args(opts: &PlayOptions) -> Vec<String> {
     args
 }
 
-/// Build arguments for Windows `mpv.net` (`libmpv` native shell with full CLI/IPC/GLSL/Lua parity).
-pub fn build_mpvnet_args(opts: &PlayOptions) -> Vec<String> {
-    build_mpv_args(opts)
-}
-
-/// Build arguments for Linux `Celluloid` (`GTK4/Wayland libmpv` translating flags via `--mpv-*`).
-pub fn build_celluloid_args(opts: &PlayOptions) -> Vec<String> {
-    let mut args = vec![
-        "--new-window".to_string(),
-        "--mpv-force-window=immediate".to_string(),
-    ];
-    if let Some(ref sock) = opts.ipc_socket {
-        args.push(format!("--mpv-input-ipc-server={}", sock));
-    }
-    for kv in shared_mpv_kv_flags(opts) {
-        args.push(format!("--mpv-{kv}"));
-    }
-    args.push(resolved_mpv_target(opts));
-    args
-}
-
-/// Launch playback asynchronously in the background without blocking the TUI event loop.
+/// Launch `mpv` asynchronously in the background without blocking the TUI event loop.
 pub fn spawn_player(opts: &PlayOptions) -> Result<Option<Child>> {
-    let effective_player = opts.player.resolve_supported_for_host();
-    let resolved_player = match effective_player {
-        Player::AutoBest => resolve_auto_player(),
-        other => other,
-    };
-
-    match resolved_player {
-        Player::AutoBest => unreachable!(),
-        Player::Mpv => {
-            let bin = find_binary("mpv").ok_or_else(|| {
-                AppError::Player(
-                    "mpv not found in PATH. Install mpv (e.g. brew/winget/apt) to launch streams."
-                        .to_string(),
-                )
-            })?;
-            let args = build_mpv_args(opts);
-            let child = Command::new(bin)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| AppError::Player(format!("Failed to launch mpv: {}", e)))?;
-            Ok(Some(child))
-        }
-        Player::MpvNet => {
-            let bin = find_binary("mpvnet")
-                .or_else(|| find_binary("mpv.net"))
-                .ok_or_else(|| {
-                    AppError::Player(
-                        "mpv.net not found (install via `winget install mpv.net` or switch to mpv)."
-                            .to_string(),
-                    )
-                })?;
-            let args = build_mpvnet_args(opts);
-            let child = Command::new(bin)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| AppError::Player(format!("Failed to launch mpv.net: {}", e)))?;
-            Ok(Some(child))
-        }
-        Player::Celluloid => {
-            let bin = find_binary("celluloid").ok_or_else(|| {
-                AppError::Player(
-                    "Celluloid not found in PATH (install via apt/dnf/flatpak or switch to mpv)."
-                        .to_string(),
-                )
-            })?;
-            let args = build_celluloid_args(opts);
-            let child = Command::new(bin)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| AppError::Player(format!("Failed to launch Celluloid: {}", e)))?;
-            Ok(Some(child))
-        }
-    }
+    let bin = find_binary("mpv").ok_or_else(|| {
+        AppError::Player(
+            "mpv not found in PATH. Install mpv (e.g. brew/winget/pacman/apt) to launch streams."
+                .to_string(),
+        )
+    })?;
+    let args = build_mpv_args(opts);
+    let child = Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::Player(format!("Failed to launch mpv: {}", e)))?;
+    Ok(Some(child))
 }
 
 /// Inspect `mpv`/`ytdl_hook` `stderr` and process exit code to surface actionable toast errors on crash.
@@ -1798,7 +1706,6 @@ mod tests {
             title: "Test Video".to_string(),
             local_file: None,
             quality_format: "bestvideo[height<=1080]+bestaudio/best".to_string(),
-            player: Player::Mpv,
             cookies_path: None,
             start_pos: Some(42.5),
             ipc_socket: Some("/tmp/yt-test.sock".to_string()),
@@ -1885,16 +1792,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_mpvnet_and_celluloid_full_shader_ipc_parity() {
-        let mut opts = PlayOptions {
+    fn test_build_mpv_full_shader_ipc_parity() {
+        let opts = PlayOptions {
             video_id: "dQw4w9WgXcQ".to_string(),
             title: "Reference 4K Test".to_string(),
             local_file: None,
             quality_format: "bestvideo[height<=?4320][vcodec^=av01]+bestaudio/best".to_string(),
-            player: Player::Celluloid,
             cookies_path: None,
             start_pos: Some(18.0),
-            ipc_socket: Some("/tmp/phaenna-celluloid.sock".to_string()),
+            ipc_socket: Some("/tmp/phaenna-mpv.sock".to_string()),
             subtitles_enabled: true,
             sub_lang: Some("en".to_string()),
             sub_url: None,
@@ -1925,26 +1831,17 @@ mod tests {
             direct_stream: None,
         };
 
-        let c_args = build_celluloid_args(&opts);
-        assert!(c_args.iter().any(|a| a == "--new-window"));
-        assert!(c_args
-            .iter()
-            .any(|a| a == "--mpv-input-ipc-server=/tmp/phaenna-celluloid.sock"));
-        assert!(c_args.iter().any(|a| a.starts_with("--mpv-glsl-shaders=")));
-        assert!(c_args.iter().any(|a| a == "--mpv-deband=yes"));
-        assert!(c_args.iter().any(|a| a == "--mpv-tone-mapping=spline"));
-        assert!(c_args.iter().any(|a| a == "--mpv-fullscreen=yes"));
-        assert!(c_args.iter().any(|a| a == "--mpv-start=18.0"));
-        assert!(c_args.iter().any(|a| a == "--mpv-alang=ar"));
-        assert!(c_args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
-
-        opts.player = Player::MpvNet;
-        let m_args = build_mpvnet_args(&opts);
+        let m_args = build_mpv_args(&opts);
         assert!(m_args
             .iter()
-            .any(|a| a == "--input-ipc-server=/tmp/phaenna-celluloid.sock"));
+            .any(|a| a == "--input-ipc-server=/tmp/phaenna-mpv.sock"));
         assert!(m_args.iter().any(|a| a.starts_with("--glsl-shaders=")));
+        assert!(m_args.iter().any(|a| a == "--deband=yes"));
+        assert!(m_args.iter().any(|a| a == "--tone-mapping=spline"));
         assert!(m_args.iter().any(|a| a == "--fullscreen=yes"));
+        assert!(m_args.iter().any(|a| a == "--start=18.0"));
+        assert!(m_args.iter().any(|a| a == "--alang=ar"));
+        assert!(m_args.iter().any(|a| a == "--slang=en,eng,en-US,en-GB,en-orig"));
         assert!(m_args.last().unwrap().ends_with("v=dQw4w9WgXcQ"));
     }
 
@@ -1955,7 +1852,6 @@ mod tests {
             title: "24/7 Live Stream".to_string(),
             local_file: None,
             quality_format: "best[height<=?1080][vcodec!^=av01][protocol^=m3u8]/best".to_string(),
-            player: Player::Mpv,
             cookies_path: None,
             start_pos: Some(120.0),
             ipc_socket: None,
@@ -2009,7 +1905,6 @@ mod tests {
             title: "Congested WiFi Test".to_string(),
             local_file: None,
             quality_format: "bestvideo[height<=?720]+bestaudio/best".to_string(),
-            player: Player::Mpv,
             cookies_path: None,
             start_pos: None,
             ipc_socket: None,

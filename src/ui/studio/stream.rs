@@ -374,14 +374,7 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
         }
         let active = pl == player_now;
         let installed = crate::api::player::is_player_installed(pl);
-        let cap_lbl = match (pl, wide_caps) {
-            (Player::AutoBest, true) => "Auto libmpv",
-            (Player::AutoBest, false) => "Auto",
-            (Player::Mpv, true) => "Universal 100%",
-            (Player::Mpv, false) => "100%",
-            (Player::MpvNet, _) => "Win 99%",
-            (Player::Celluloid, _) => "GTK 95%",
-        };
+        let cap_lbl = if wide_caps { "Universal 100%" } else { "100%" };
         let status_lbl = if installed { "READY" } else { "MISSING" };
         let status_color = if installed {
             Color::Rgb(52, 211, 153)
@@ -418,11 +411,11 @@ fn render_quality_player_pane(frame: &mut Frame, area: Rect, state: &mut AppStat
     }
     if (p_lines.len() as u16) < p_area.height {
         let host_note = if cfg!(target_os = "macos") {
-            "   macOS native libmpv · mpv.net=Win, Celluloid=Linux"
+            "   macOS Metal/Vulkan via mpv · GLSL + HUD + IPC"
         } else if cfg!(windows) {
-            "   Windows native libmpv · Celluloid=Linux"
+            "   Windows D3D11/Vulkan via mpv · GLSL + HUD + IPC"
         } else {
-            "   Linux native libmpv · mpv.net=Windows"
+            "   Linux Wayland/Vulkan via mpv · GLSL + PiP + IPC"
         };
         p_lines.push(Line::from(Span::styled(
             truncate_words(host_note, p_area.width as usize),

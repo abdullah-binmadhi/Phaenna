@@ -157,10 +157,6 @@ fn now_unix() -> i64 {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut cfg = Config::load().unwrap_or_default();
-    if !cfg.player.is_supported_on_host() {
-        cfg.player = crate::config::Player::AutoBest;
-        let _ = cfg.save();
-    }
 
     if let Some(ref cpath) = cli.cookies {
         cfg.custom_cookies_path = Some(cpath.clone());
@@ -174,13 +170,24 @@ async fn main() -> anyhow::Result<()> {
             Commands::Doctor => {
                 let d = detect_dependencies();
                 println!("Phaenna v{} ({})", env!("CARGO_PKG_VERSION"), env!("PHAENNA_GIT_SHA"));
-                println!("  yt-dlp   : {}", if d.has_ytdlp { "READY" } else { "MISSING" });
-                println!("  mpv      : {}", if d.has_mpv { "READY" } else { "MISSING" });
-                #[cfg(windows)]
-                println!("  mpv.net  : {}", if d.has_mpvnet { "READY" } else { "MISSING" });
-                #[cfg(target_os = "linux")]
-                println!("  Celluloid: {}", if d.has_celluloid { "READY" } else { "MISSING" });
-                println!("  ffmpeg   : {}", if d.has_ffmpeg { "READY" } else { "MISSING" });
+                println!("  mpv      : {}", if d.has_mpv { "READY" } else { "MISSING (install mpv)" });
+                println!("  yt-dlp   : {}", if d.has_ytdlp { "READY" } else { "MISSING (install yt-dlp)" });
+                println!(
+                    "  deno     : {}",
+                    if d.has_deno {
+                        "READY"
+                    } else {
+                        "MISSING (recommended for yt-dlp YouTube JS challenges)"
+                    }
+                );
+                println!("  ffmpeg   : {}", if d.has_ffmpeg { "READY" } else { "MISSING (install ffmpeg)" });
+                println!(
+                    "  Sign-In  : {}",
+                    match d.popup_browser {
+                        Some(b) => format!("READY ({b})"),
+                        None => "MISSING (install Chromium, Chrome, Brave, or Edge for [L] Google Sign-In)".to_string(),
+                    }
+                );
                 return Ok(());
             }
             Commands::Remote { port } => {
@@ -2897,7 +2904,6 @@ async fn start_nonblocking_playback_with_live_opts(
         title: video.title.clone(),
         local_file,
         quality_format: ytdl_format,
-        player: state.config.player,
         cookies_path: cookies_path.clone(),
         start_pos,
         ipc_socket: Some(sock_path.clone()),

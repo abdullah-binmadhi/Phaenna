@@ -67,9 +67,9 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             id: HubActionId::PlayerBackend,
             category: "▶ PLAYBACK & STREAMING",
             label: "Video Player Engine",
-            keywords: "player mpv mpvnet celluloid libmpv auto hwdec",
-            badge: format!("[ {} ▾ ]", cfg.player.label()),
-            description: "Choose libmpv playback engine (Auto-Best, mpv, mpv.net Windows, Celluloid Linux) with full shader, HUD & IPC parity.",
+            keywords: "player mpv libmpv hwdec glsl ipc",
+            badge: format!("[ {} ]", cfg.player.label()),
+            description: "Uses standalone mpv with full 4K GLSL mastering, Lua HUD, PiP, and JSON-RPC IPC parity.",
         },
         HubItem {
             id: HubActionId::AutoFullscreen,

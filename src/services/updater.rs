@@ -107,6 +107,10 @@ pub fn target_asset_name() -> &'static str {
     {
         "phaenna-linux-x86_64"
     }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        "phaenna-linux-aarch64"
+    }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         "phaenna-windows-x86_64.exe"
@@ -115,6 +119,7 @@ pub fn target_asset_name() -> &'static str {
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
         all(target_os = "windows", target_arch = "x86_64"),
     )))]
     {

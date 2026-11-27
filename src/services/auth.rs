@@ -648,6 +648,11 @@ async fn cdp_fetch_cookies_and_optionally_close(
     Some((jar, netscape, target_urls))
 }
 
+/// Detect any installed Chromium-based browser usable for isolated Google Sign-In popups.
+pub fn detect_popup_browser() -> Option<(&'static str, PathBuf)> {
+    find_chromium_popup_browser().map(|(path, label)| (label, path))
+}
+
 fn find_chromium_popup_browser() -> Option<(PathBuf, &'static str)> {
     let candidates: &[(&str, &str)] = &[
         ("chromium", "Chromium"),

@@ -470,89 +470,56 @@ impl NetworkMode {
 #[serde(rename_all = "lowercase")]
 pub enum Player {
     #[default]
-    #[serde(alias = "auto", alias = "iina", alias = "vlc", alias = "browser")]
-    AutoBest,
+    #[serde(
+        alias = "auto",
+        alias = "autobest",
+        alias = "mpvnet",
+        alias = "mpv.net",
+        alias = "mpv_net",
+        alias = "celluloid",
+        alias = "iina",
+        alias = "vlc",
+        alias = "browser"
+    )]
     Mpv,
-    #[serde(alias = "mpv.net", alias = "mpv_net")]
-    MpvNet,
-    Celluloid,
 }
 
 #[allow(dead_code)]
 impl Player {
-    pub const fn all() -> [Player; 4] {
-        [Player::AutoBest, Player::Mpv, Player::MpvNet, Player::Celluloid]
+    pub const fn all() -> [Player; 1] {
+        [Player::Mpv]
     }
 
     pub const fn is_supported_on_host(self) -> bool {
-        match self {
-            Player::AutoBest | Player::Mpv => true,
-            Player::MpvNet => cfg!(windows),
-            Player::Celluloid => cfg!(target_os = "linux"),
-        }
+        true
     }
 
     pub const fn host_supported() -> &'static [Player] {
-        #[cfg(windows)]
-        {
-            &[Player::AutoBest, Player::Mpv, Player::MpvNet]
-        }
-        #[cfg(target_os = "linux")]
-        {
-            &[Player::AutoBest, Player::Mpv, Player::Celluloid]
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            &[Player::AutoBest, Player::Mpv]
-        }
+        &[Player::Mpv]
     }
 
     pub fn next_for_host(self) -> Self {
-        let supported = Self::host_supported();
-        if let Some(idx) = supported.iter().position(|&p| p == self) {
-            supported[(idx + 1) % supported.len()]
-        } else {
-            Player::AutoBest
-        }
+        Player::Mpv
     }
 
     pub const fn resolve_supported_for_host(self) -> Self {
-        if self.is_supported_on_host() {
-            self
-        } else {
-            Player::AutoBest
-        }
+        Player::Mpv
     }
 
     pub const fn next(self) -> Self {
-        match self {
-            Player::AutoBest => Player::Mpv,
-            Player::Mpv => Player::MpvNet,
-            Player::MpvNet => Player::Celluloid,
-            Player::Celluloid => Player::AutoBest,
-        }
+        Player::Mpv
     }
 
     pub const fn label(self) -> &'static str {
-        match self {
-            Player::AutoBest => "Auto-Best (libmpv Parity)",
-            Player::Mpv => "MPV (Universal · 100% Parity)",
-            Player::MpvNet => "mpv.net (Windows · 99% Parity)",
-            Player::Celluloid => "Celluloid (Linux GTK · 95%)",
-        }
+        "mpv (Universal · 4K GLSL · IPC · PiP)"
     }
 
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Player::AutoBest => "auto",
-            Player::Mpv => "mpv",
-            Player::MpvNet => "mpvnet",
-            Player::Celluloid => "celluloid",
-        }
+        "mpv"
     }
 }
 
-/// Real-time GPU mastering, compression cleanup & 4K super-resolution GLSL shader profile for `mpv` / `iina`.
+/// Real-time GPU mastering, compression cleanup & 4K super-resolution GLSL shader profile for `mpv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoShaderMode {
@@ -2329,7 +2296,7 @@ mod tests {
 
         let cfg = Config {
             quality: Quality::P1440,
-            player: Player::Celluloid,
+            player: Player::Mpv,
             sponsorblock_mode: SponsorBlockMode::SponsorOnly,
             shader_mode: VideoShaderMode::Reference4K,
             theme_index: 4,
@@ -2339,42 +2306,28 @@ mod tests {
 
         let loaded = Config::load_from_path(&cfg_path).unwrap();
         assert_eq!(loaded.quality, Quality::P1440);
-        assert_eq!(loaded.player, Player::Celluloid);
+        assert_eq!(loaded.player, Player::Mpv);
         assert_eq!(loaded.sponsorblock_mode, SponsorBlockMode::SponsorOnly);
         assert_eq!(loaded.shader_mode, VideoShaderMode::Reference4K);
         assert_eq!(loaded.theme_index, 4);
 
-        // Legacy TOML alias compatibility (`"ultra"` -> `Reference4K`, `iina`/`vlc`/`browser` -> `AutoBest`)
-        let legacy: Config = toml::from_str("shader_mode = \"ultra\"\nplayer = \"iina\"\n").unwrap();
-        assert_eq!(legacy.shader_mode, VideoShaderMode::Reference4K);
-        assert_eq!(legacy.player, Player::AutoBest);
-        let legacy_vlc: Config = toml::from_str("player = \"vlc\"\n").unwrap();
-        assert_eq!(legacy_vlc.player, Player::AutoBest);
-        let legacy_br: Config = toml::from_str("player = \"browser\"\n").unwrap();
-        assert_eq!(legacy_br.player, Player::AutoBest);
+        // Legacy TOML alias compatibility (`"ultra"` -> `Reference4K`, old player names -> `Mpv`)
+        for legacy_player in ["auto", "mpvnet", "mpv.net", "celluloid", "iina", "vlc", "browser"] {
+            let toml_s = format!("shader_mode = \"ultra\"\nplayer = \"{legacy_player}\"\n");
+            let legacy: Config = toml::from_str(&toml_s).unwrap();
+            assert_eq!(legacy.shader_mode, VideoShaderMode::Reference4K);
+            assert_eq!(legacy.player, Player::Mpv);
+        }
     }
 
     #[test]
     fn test_player_host_filtering_and_cycling() {
         let supported = Player::host_supported();
-        assert!(supported.contains(&Player::AutoBest));
-        assert!(supported.contains(&Player::Mpv));
-        assert!(supported.iter().all(|p| p.is_supported_on_host()));
-
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(supported, &[Player::AutoBest, Player::Mpv]);
-            assert!(!Player::MpvNet.is_supported_on_host());
-            assert!(!Player::Celluloid.is_supported_on_host());
-            assert_eq!(Player::MpvNet.resolve_supported_for_host(), Player::AutoBest);
-            assert_eq!(Player::Celluloid.resolve_supported_for_host(), Player::AutoBest);
-            assert_eq!(Player::MpvNet.next_for_host(), Player::AutoBest);
-        }
-
-        assert_eq!(Player::AutoBest.next_for_host(), Player::Mpv);
-        let cycled = Player::Mpv.next_for_host();
-        assert!(cycled.is_supported_on_host());
+        assert_eq!(supported, &[Player::Mpv]);
+        assert!(Player::Mpv.is_supported_on_host());
+        assert_eq!(Player::Mpv.next_for_host(), Player::Mpv);
         assert_eq!(Player::Mpv.resolve_supported_for_host(), Player::Mpv);
+        assert_eq!(Player::Mpv.as_str(), "mpv");
     }
 
     #[test]

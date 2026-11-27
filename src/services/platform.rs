@@ -272,7 +272,7 @@ pub fn detect_device_profile() -> &'static DeviceProfile {
     DEVICE_PROFILE_CACHE.get_or_init(probe_device_profile_uncached)
 }
 
-/// Returns cached installed player capabilities (`mpv` / `mpv.net` / `celluloid`).
+/// Returns cached installed `mpv` player capabilities.
 #[allow(dead_code)]
 pub fn detect_player_capabilities() -> &'static PlayerCapabilities {
     PLAYER_CAPS_CACHE.get_or_init(probe_player_capabilities_uncached)
@@ -828,9 +828,7 @@ fn linux_has_vulkan_icd() -> bool {
 }
 
 fn probe_player_capabilities_uncached() -> PlayerCapabilities {
-    let bin_path = find_binary("mpv")
-        .or_else(|| find_binary("mpvnet"))
-        .or_else(|| find_binary("mpv.net"));
+    let bin_path = find_binary("mpv");
     let Some(path) = bin_path else {
         return PlayerCapabilities::conservative_fallback();
     };
