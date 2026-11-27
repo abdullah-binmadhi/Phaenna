@@ -1836,6 +1836,7 @@ pub const EQ_BAND_LABELS: [&str; 10] = [
 pub enum AudioEqPreset {
     #[default]
     Flat,
+    Harman,
     VoiceClarity,
     Podcast,
     BassBoost,
@@ -1843,8 +1844,13 @@ pub enum AudioEqPreset {
     TrebleCrisp,
     Rock,
     Electronic,
+    HipHop,
     Acoustic,
     Jazz,
+    Classical,
+    WarmTube,
+    LoFi,
+    Loudness,
     Cinema,
     LateNight,
     Custom,
@@ -1867,17 +1873,45 @@ impl AudioEqPreset {
         Self::LateNight,
     ];
 
-    pub const ALL: [Self; 13] = [
+    /// Full 18-preset audiophile catalog sorted for the Music EQ Dropdown menu.
+    pub const AUDIOPHILE_PRESETS: [Self; 18] = [
         Self::Flat,
-        Self::VoiceClarity,
-        Self::Podcast,
+        Self::Harman,
         Self::BassBoost,
         Self::DeepSub,
-        Self::TrebleCrisp,
+        Self::WarmTube,
+        Self::Classical,
+        Self::Jazz,
+        Self::Acoustic,
         Self::Rock,
         Self::Electronic,
-        Self::Acoustic,
+        Self::HipHop,
+        Self::LoFi,
+        Self::Loudness,
+        Self::VoiceClarity,
+        Self::TrebleCrisp,
+        Self::Podcast,
+        Self::Cinema,
+        Self::LateNight,
+    ];
+
+    pub const ALL: [Self; 19] = [
+        Self::Flat,
+        Self::Harman,
+        Self::BassBoost,
+        Self::DeepSub,
+        Self::WarmTube,
+        Self::Classical,
         Self::Jazz,
+        Self::Acoustic,
+        Self::Rock,
+        Self::Electronic,
+        Self::HipHop,
+        Self::LoFi,
+        Self::Loudness,
+        Self::VoiceClarity,
+        Self::TrebleCrisp,
+        Self::Podcast,
         Self::Cinema,
         Self::LateNight,
         Self::Custom,
@@ -1886,17 +1920,23 @@ impl AudioEqPreset {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Flat => "Flat (Reference 0dB)",
-            Self::VoiceClarity => "Voice Clarity (Dialogue +5dB)",
-            Self::Podcast => "Podcast Studio (Warm Vocal)",
-            Self::BassBoost => "Bass Boost (+6dB Punch)",
-            Self::DeepSub => "Deep Sub (+8dB Theater LFE)",
-            Self::TrebleCrisp => "Treble Crisp (+6dB Air)",
-            Self::Rock => "Rock (Punchy V-Shape)",
-            Self::Electronic => "EDM / Electronic (Sub + Air)",
-            Self::Acoustic => "Acoustic (Warm Natural)",
+            Self::Harman => "Harman Target (Audiophile Ref)",
+            Self::VoiceClarity => "Vocal Presence (De-Mud Clarity)",
+            Self::Podcast => "Podcast Studio (Warm Speech)",
+            Self::BassBoost => "Audiophile Bass+ (Zero Mud)",
+            Self::DeepSub => "Deep Sub (Theater / Drop LFE)",
+            Self::TrebleCrisp => "Treble Air (Fatigue-Free Detail)",
+            Self::Rock => "Rock (Punchy Kick & Guitars)",
+            Self::Electronic => "Electronic (EDM Precision V)",
+            Self::HipHop => "Hip-Hop / 808 (Tight Punch)",
+            Self::Acoustic => "Acoustic (Warm Organic Stage)",
             Self::Jazz => "Jazz (Upright Bass & Brass)",
-            Self::Cinema => "Cinema (Wide + Dialogue)",
-            Self::LateNight => "Late Night (Soft Bass / Peaks)",
+            Self::Classical => "Classical (Hall Air & Dynamics)",
+            Self::WarmTube => "Warm Tube (Analog Roll-Off)",
+            Self::LoFi => "Lo-Fi / Chillhop (Dusty Mids)",
+            Self::Loudness => "Equal Loudness (Fletcher-Munson)",
+            Self::Cinema => "Cinema (LFE + Centered Voice)",
+            Self::LateNight => "Late Night (Soft Peaks)",
             Self::Custom => "Custom User Curve",
         }
     }
@@ -1904,6 +1944,7 @@ impl AudioEqPreset {
     pub const fn short_label(self) -> &'static str {
         match self {
             Self::Flat => "Flat",
+            Self::Harman => "Harman",
             Self::VoiceClarity => "Voice",
             Self::Podcast => "Podcast",
             Self::BassBoost => "Bass+",
@@ -1911,8 +1952,13 @@ impl AudioEqPreset {
             Self::TrebleCrisp => "Treble+",
             Self::Rock => "Rock",
             Self::Electronic => "EDM",
+            Self::HipHop => "HipHop",
             Self::Acoustic => "Acoustic",
             Self::Jazz => "Jazz",
+            Self::Classical => "Classical",
+            Self::WarmTube => "Tube",
+            Self::LoFi => "Lo-Fi",
+            Self::Loudness => "Loudness",
             Self::Cinema => "Cinema",
             Self::LateNight => "Night",
             Self::Custom => "Custom",
@@ -1921,36 +1967,58 @@ impl AudioEqPreset {
 
     pub const fn next(self) -> Self {
         match self {
-            Self::Flat => Self::VoiceClarity,
-            Self::VoiceClarity => Self::Podcast,
-            Self::Podcast => Self::BassBoost,
+            Self::Flat => Self::Harman,
+            Self::Harman => Self::BassBoost,
             Self::BassBoost => Self::DeepSub,
-            Self::DeepSub => Self::TrebleCrisp,
-            Self::TrebleCrisp => Self::Rock,
+            Self::DeepSub => Self::WarmTube,
+            Self::WarmTube => Self::Classical,
+            Self::Classical => Self::Jazz,
+            Self::Jazz => Self::Acoustic,
+            Self::Acoustic => Self::Rock,
             Self::Rock => Self::Electronic,
-            Self::Electronic => Self::Acoustic,
-            Self::Acoustic => Self::Jazz,
-            Self::Jazz => Self::Cinema,
+            Self::Electronic => Self::HipHop,
+            Self::HipHop => Self::LoFi,
+            Self::LoFi => Self::Loudness,
+            Self::Loudness => Self::VoiceClarity,
+            Self::VoiceClarity => Self::TrebleCrisp,
+            Self::TrebleCrisp => Self::Podcast,
+            Self::Podcast => Self::Cinema,
             Self::Cinema => Self::LateNight,
             Self::LateNight | Self::Custom => Self::Flat,
         }
     }
 
-    /// 10-band graphic EQ gains (dB) at `[31Hz, 62Hz, 125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz, 16kHz]`.
+    /// Compact audiophile curve hint for EQ preset dropdown rows (`Sub · Mid · Air`).
+    pub fn signature_summary(self) -> String {
+        let b = self.band_gains_db();
+        format!(
+            "Sub:{:+}dB Mid:{:+}dB Air:{:+}dB",
+            b[0], b[5], b[8]
+        )
+    }
+
+    /// Calibrated 10-band graphic EQ gains (dB) at `[31Hz, 62Hz, 125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz, 16kHz]`,
+    /// tuned against Sean Olive Harman Target, AutoEq, and Fletcher-Munson equal-loudness contours.
     pub const fn band_gains_db(self) -> [i8; 10] {
         match self {
             Self::Flat | Self::Custom => [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            Self::VoiceClarity => [-5, -4, -2, 0, 2, 4, 5, 4, 2, 0],
-            Self::Podcast => [-4, -2, 0, 2, 3, 4, 3, 2, 1, 0],
-            Self::BassBoost => [6, 5, 4, 2, 0, 0, 0, -1, 0, 1],
-            Self::DeepSub => [8, 6, 3, 1, -1, -1, 0, 1, 2, 2],
-            Self::TrebleCrisp => [-1, -1, 0, 0, 1, 2, 3, 5, 6, 6],
-            Self::Rock => [4, 3, 1, -1, -2, 0, 2, 4, 5, 4],
-            Self::Electronic => [6, 5, 2, 0, -2, 0, 1, 3, 5, 6],
-            Self::Acoustic => [2, 2, 1, 1, 2, 2, 3, 2, 2, 1],
-            Self::Jazz => [3, 2, 1, 2, -1, -1, 0, 1, 2, 3],
-            Self::Cinema => [5, 4, 1, 0, 1, 3, 4, 2, 1, 2],
-            Self::LateNight => [-6, -5, -3, -1, 1, 2, 2, 1, -2, -4],
+            Self::Harman => [4, 3, 1, 0, -1, -1, 1, 3, 2, 1],
+            Self::BassBoost => [5, 4, 2, -1, -1, -1, 0, 1, 1, 1],
+            Self::DeepSub => [6, 5, 2, -1, -2, -1, 0, 2, 2, 1],
+            Self::WarmTube => [1, 2, 3, 1, 0, -1, -2, -3, -4, -5],
+            Self::Classical => [2, 1, 0, 0, 0, 0, 1, 1, 2, 2],
+            Self::Jazz => [2, 1, 1, 0, -1, 0, 1, 2, 2, 3],
+            Self::Acoustic => [1, 1, 1, -1, 0, 1, 2, 2, 2, 1],
+            Self::Rock => [2, 3, 2, -1, -1, 0, 2, 3, 2, 1],
+            Self::Electronic => [5, 4, 2, -1, -2, -1, 1, 2, 3, 3],
+            Self::HipHop => [5, 4, 1, -1, -1, 0, 1, 2, 2, 1],
+            Self::LoFi => [2, 3, 2, 1, 0, 2, 1, -1, -4, -6],
+            Self::Loudness => [5, 4, 2, 0, -1, -2, 0, 2, 3, 4],
+            Self::VoiceClarity => [-1, -1, 0, -2, 0, 1, 3, 2, 1, 0],
+            Self::TrebleCrisp => [-1, 0, 0, 0, 0, 1, 2, 3, 4, 4],
+            Self::Podcast => [-2, -1, 1, -1, 1, 2, 2, 1, 0, -1],
+            Self::Cinema => [4, 3, 1, -1, 0, 2, 3, 2, 1, 2],
+            Self::LateNight => [-3, -2, 1, 2, 1, 0, -1, -2, -4, -5],
         }
     }
 }
@@ -2735,11 +2803,16 @@ mod tests {
     #[test]
     fn test_audio_eq_channel_and_fps_config_roundtrip() {
         assert_eq!(AudioEqPreset::PRESETS_12.len(), 12);
-        assert_eq!(AudioEqPreset::ALL.len(), 13);
+        assert_eq!(AudioEqPreset::AUDIOPHILE_PRESETS.len(), 18);
+        assert_eq!(AudioEqPreset::ALL.len(), 19);
         assert_eq!(AudioEqPreset::Flat.band_gains_db(), [0; 10]);
         assert_eq!(
+            AudioEqPreset::Harman.band_gains_db(),
+            [4, 3, 1, 0, -1, -1, 1, 3, 2, 1]
+        );
+        assert_eq!(
             AudioEqPreset::VoiceClarity.band_gains_db(),
-            [-5, -4, -2, 0, 2, 4, 5, 4, 2, 0]
+            [-1, -1, 0, -2, 0, 1, 3, 2, 1, 0]
         );
         assert_eq!(AudioEqPreset::LateNight.next(), AudioEqPreset::Flat);
         assert_eq!(AudioChannelMode::Stereo.next(), AudioChannelMode::Mono);

@@ -500,6 +500,10 @@ fn extract_continuation(val: &Value) -> Option<String> {
 }
 
 fn parse_two_row_item(r: &Value) -> Option<YtmShelfItem> {
+    parse_two_row_item_with_hint(r, None)
+}
+
+fn parse_two_row_item_with_hint(r: &Value, shelf_title: Option<&str>) -> Option<YtmShelfItem> {
     let title = runs_text(r.get("title"));
     if title.is_empty() {
         return None;
@@ -522,11 +526,23 @@ fn parse_two_row_item(r: &Value) -> Option<YtmShelfItem> {
     }
     let (bid, params, page_type) = extract_browse_endpoint(nav);
 
+    let shelf_is_video = shelf_title.is_some_and(|s| s.to_ascii_lowercase().contains("video"));
+    let vtype = play_ep
+        .or(nav)
+        .and_then(|e| {
+            e.pointer("/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType")
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let kind = if let Some(ref b) = bid {
         classify_browse_kind(b, page_type, &subtitle)
     } else if vid.is_some() {
         let sub_low = subtitle.to_ascii_lowercase();
-        if sub_low.contains("video") {
+        if shelf_is_video
+            || sub_low.contains("video")
+            || vtype == "MUSIC_VIDEO_TYPE_OMV"
+            || vtype == "MUSIC_VIDEO_TYPE_UGC"
+        {
             YtmItemKind::Video
         } else {
             YtmItemKind::Song
@@ -662,7 +678,11 @@ fn parse_responsive_item(r: &Value, default_playlist_id: Option<&str>) -> Option
             .and_then(|e| e.pointer("/watchEndpoint/watchEndpointMusicSupportedConfigs/watchEndpointMusicConfig/musicVideoType"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if vtype == "MUSIC_VIDEO_TYPE_OMV" || vtype == "MUSIC_VIDEO_TYPE_UGC" {
+        if vtype == "MUSIC_VIDEO_TYPE_OMV"
+            || vtype == "MUSIC_VIDEO_TYPE_UGC"
+            || subtitle.to_ascii_lowercase().contains("video")
+            || subtitle.to_ascii_lowercase().contains("views")
+        {
             YtmItemKind::Video
         } else {
             YtmItemKind::Song
@@ -966,7 +986,7 @@ pub fn parse_ytm_browse_json(root: &Value) -> YtmPage {
                     if let Some(arr) = car.get("contents").and_then(Value::as_array) {
                         for entry in arr {
                             if let Some(two) = entry.get("musicTwoRowItemRenderer") {
-                                if let Some(it) = parse_two_row_item(two) {
+                                if let Some(it) = parse_two_row_item_with_hint(two, Some(&title)) {
                                     items.push(it);
                                 }
                             } else if let Some(resp) = entry.get("musicResponsiveListItemRenderer") {
@@ -1188,14 +1208,23 @@ pub fn parse_ytm_search_json(root: &Value) -> YtmPage {
                     page.continuation = extract_continuation(ms);
                 }
                 let title = runs_text(ms.get("title"));
+                let is_video_shelf = title.to_ascii_lowercase().contains("video");
                 let mut items = Vec::new();
                 if let Some(list) = ms.get("contents").and_then(Value::as_array) {
                     for entry in list {
                         if let Some(resp) = entry.get("musicResponsiveListItemRenderer") {
-                            if let Some(tr) = responsive_to_track(resp, "", None) {
+                            if let Some(mut tr) = responsive_to_track(resp, "", None) {
+                                if is_video_shelf {
+                                    tr.kind = YtmItemKind::Video;
+                                }
                                 page.tracks.push(tr);
                             }
-                            if let Some(it) = parse_responsive_item(resp, None) {
+                            if let Some(mut it) = parse_responsive_item(resp, None) {
+                                if is_video_shelf
+                                    && matches!(it.kind, YtmItemKind::Song | YtmItemKind::Video)
+                                {
+                                    it.kind = YtmItemKind::Video;
+                                }
                                 items.push(it);
                             }
                         }

@@ -679,8 +679,10 @@ impl PlayerCommand {
             }
             Self::SwitchAudioTrack { url, title, .. } => {
                 vec![
+                    json!({"command": ["set_property", "start", "none"]}).to_string(),
                     json!({"command": ["set_property", "force-media-title", title]}).to_string(),
                     json!({"command": ["loadfile", url, "replace"]}).to_string(),
+                    json!({"command": ["set_property", "pause", false]}).to_string(),
                 ]
             }
             Self::PushOverlayComments { payload_json } => {
@@ -1186,6 +1188,7 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
         let mut marked_watched = false;
         let mut skip_segments = config.skip_segments.clone();
         let mut pending_reset_start = false;
+        let mut pending_unpause = false;
         let mut sb_rx: Option<oneshot::Receiver<Vec<SponsorSegment>>> = None;
 
         // Persistent YouTube playback + watchtime tracking session (one cpn/plid for entire watch)
@@ -1302,6 +1305,9 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                 prev_pos = 0.0;
                                 last_dur = 0.0;
                                 marked_watched = false;
+                                pending_reset_start = true;
+                                pending_unpause = true;
+                                tracker.is_paused = false;
                                 let _ = video_id;
                             }
                             for raw in cmd.to_mpv_json_commands() {
@@ -1328,11 +1334,20 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                             .await;
                     }
 
-                    if pending_reset_start && is_file_loaded_event(&line) {
-                        pending_reset_start = false;
-                        let _ = writer
-                            .write_all(b"{\"command\":[\"set_property\",\"start\",\"none\"]}\n")
-                            .await;
+                    if (pending_reset_start || pending_unpause) && is_file_loaded_event(&line) {
+                        if pending_reset_start {
+                            pending_reset_start = false;
+                            let _ = writer
+                                .write_all(b"{\"command\":[\"set_property\",\"start\",\"none\"]}\n")
+                                .await;
+                        }
+                        if pending_unpause {
+                            pending_unpause = false;
+                            tracker.is_paused = false;
+                            let _ = writer
+                                .write_all(b"{\"command\":[\"set_property\",\"pause\",false]}\n")
+                                .await;
+                        }
                     }
 
                     if let Some((cmd_name, args)) = parse_client_message(&line) {
@@ -1781,6 +1796,16 @@ mod tests {
         assert!(sw_cmds.iter().any(|c| c.contains("\"loadfile\",\"https://cdn.example.com/v480.webm\",\"replace\"")));
         assert!(is_file_loaded_event(r#"{"event":"file-loaded"}"#));
         assert!(!is_file_loaded_event(r#"{"event":"end-file"}"#));
+
+        let sw_audio = PlayerCommand::SwitchAudioTrack {
+            url: "https://www.youtube.com/watch?v=Pgum6OT_VH8".to_string(),
+            title: "Starlight".to_string(),
+            video_id: "Pgum6OT_VH8".to_string(),
+        }
+        .to_mpv_json_commands();
+        assert!(sw_audio.iter().any(|c| c.contains("\"start\",\"none\"")));
+        assert!(sw_audio.iter().any(|c| c.contains("\"pause\",false")));
+        assert!(sw_audio.iter().any(|c| c.contains("\"loadfile\",")));
 
         assert!(matches!(
             parse_live_ipc_event(r#"{"event":"property-change","id":24,"name":"estimated-vf-fps","data":59.94}"#),

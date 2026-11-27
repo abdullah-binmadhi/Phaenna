@@ -7,7 +7,7 @@
 //! - Centered Spotify Album / Playlist / Artist Detail Popup (`ActiveOverlay::MusicAlbum`)
 //! - Dedicated YouTube Music Audio & UI Settings Modal (`ActiveOverlay::MusicSettings`)
 
-use crate::api::ytmusic::{YtmItemKind, YtmPage, YtmSearchFilter, YtmShelfItem};
+use crate::api::ytmusic::{YtmItemKind, YtmPage, YtmSearchFilter, YtmShelfItem, YtmTrack};
 use crate::config::{AudioEqPreset, MusicSettingsConfig, EQ_BAND_LABELS};
 use crate::db::cache::format_duration_secs;
 use crate::state::{
@@ -77,9 +77,10 @@ pub fn render_music_workspace(
         return;
     }
 
+    let bar_h: u16 = if area.height >= 26 { 6 } else { 5 };
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(4)])
+        .constraints([Constraint::Min(8), Constraint::Length(bar_h)])
         .split(area);
 
     let body_area = root_chunks[0];
@@ -218,7 +219,7 @@ fn render_spotify_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
             .fg(theme.accent)
             .bg(Color::Reset)
             .add_modifier(Modifier::BOLD);
-        let txt = truncate_str(" ⚙ Music Settings", inner.width as usize);
+        let txt = truncate_str(" [#] Music Settings", inner.width as usize);
         frame.render_widget(Paragraph::new(txt).style(st), s_rect);
         y += 1;
     }
@@ -650,7 +651,7 @@ fn render_cover_shelves_grid(
                 );
             } else {
                 frame.render_widget(
-                    Paragraph::new(format!("\n♪ {}", item.kind.badge()))
+                    Paragraph::new(format!("\n◈ {}", item.kind.badge()))
                         .alignment(Alignment::Center)
                         .style(Style::default().fg(border_col).bg(card_bg)),
                     art_rect,
@@ -829,33 +830,52 @@ fn render_right_drawer(
     modal_rect: Option<Rect>,
 ) {
     let cur_track = state.music.current_track().cloned();
-    let items = state.music.selectable_items();
-    let preview = items.get(state.music.cursor).cloned();
+    let preview = state.music.preview_item.clone();
+    let is_preview = preview.is_some();
 
-    let (art_id, art_url, title, artist, album_opt) = if let Some(ref tr) = cur_track {
+    let (art_id, art_url, title, artist, album_opt, preview_kind) = if let Some(ref p) = preview {
+        (
+            p.thumb_cache_key(),
+            p.thumb_url.clone(),
+            p.title.clone(),
+            if p.subtitle.is_empty() {
+                p.kind.badge().to_string()
+            } else {
+                p.subtitle.clone()
+            },
+            p.duration_secs.map(|d| format!("Duration: {}", format_duration_secs(d))),
+            Some(p.kind),
+        )
+    } else if let Some(ref tr) = cur_track {
         (
             tr.thumb_cache_key(),
             tr.effective_thumb_url(),
             tr.title.clone(),
             tr.artist.clone(),
             tr.album.clone(),
-        )
-    } else if let Some(ref p) = preview {
-        (
-            p.thumb_cache_key(),
-            p.thumb_url.clone(),
-            p.title.clone(),
-            p.subtitle.clone(),
-            None,
+            Some(tr.kind),
         )
     } else {
-        (
-            String::new(),
-            String::new(),
-            "Nothing Playing".to_string(),
-            "Double-click Album or Song".to_string(),
-            None,
-        )
+        let fallback = state.music.selectable_items().get(state.music.cursor).cloned();
+        if let Some(ref p) = fallback {
+            (
+                p.thumb_cache_key(),
+                p.thumb_url.clone(),
+                p.title.clone(),
+                p.subtitle.clone(),
+                p.duration_secs.map(|d| format!("Duration: {}", format_duration_secs(d))),
+                Some(p.kind),
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                "Nothing Playing".to_string(),
+                "Click to inspect · 2x-click to play".to_string(),
+                None,
+                None,
+            )
+        }
     };
 
     if !art_id.is_empty() && !art_url.is_empty() {
@@ -867,12 +887,17 @@ fn render_right_drawer(
         state.base_theme().clone()
     };
 
+    let drawer_title = if is_preview {
+        " Preview Inspector "
+    } else {
+        " Now Playing "
+    };
     let blk = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(pal.primary))
         .title(Span::styled(
-            " Now Playing ",
+            drawer_title,
             Style::default()
                 .fg(pal.primary)
                 .add_modifier(Modifier::BOLD),
@@ -889,16 +914,16 @@ fn render_right_drawer(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(art_h),
-            Constraint::Length(3),
+            Constraint::Length(if is_preview { 4 } else { 3 }),
             Constraint::Min(4),
         ])
         .split(inner);
 
     if !art_id.is_empty() && !rect_intersects_optional(parts[0], modal_rect) {
-        render_thumbnail_cover(frame, parts[0], &art_id, state, "♪");
+        render_thumbnail_cover(frame, parts[0], &art_id, state, "ART");
     } else {
         frame.render_widget(
-            Paragraph::new("\n♪\nYTM")
+            Paragraph::new("\n◈\nYTM")
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(pal.primary).bg(Color::Reset)),
             parts[0],
@@ -912,36 +937,100 @@ fn render_right_drawer(
     } else {
         artist
     };
-    let album_btn_rect = Rect::new(parts[1].x, parts[1].y + 2, parts[1].width, 1);
-    if cur_track.as_ref().is_some_and(|t| t.album_browse_id.is_some()) {
-        state
-            .music
-            .hitboxes
-            .push((album_btn_rect, MusicHit::OpenCurrentAlbum));
-    }
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                marq,
+    if is_preview {
+        let kind = preview_kind.unwrap_or(YtmItemKind::Song);
+        let play_lbl = match kind {
+            YtmItemKind::Video => " [▸ Watch Video] ",
+            YtmItemKind::Album | YtmItemKind::Playlist | YtmItemKind::Artist => " [◈ Open] ",
+            _ => " [▸ Play Now] ",
+        };
+        let pw = play_lbl.chars().count() as u16;
+        let btn_y = parts[1].y + 3;
+        let mut bx = parts[1].x;
+        let mut btn_spans = Vec::new();
+        if bx + pw <= parts[1].x + parts[1].width {
+            state
+                .music
+                .hitboxes
+                .push((Rect::new(bx, btn_y, pw, 1), MusicHit::PreviewPlay));
+            btn_spans.push(Span::styled(
+                play_lbl,
                 Style::default()
-                    .fg(Color::White)
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(30, 215, 96))
                     .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                truncate_str(&sub_line, w),
-                Style::default().fg(pal.text_dim),
-            )),
-            Line::from(Span::styled(
-                if cur_track.as_ref().is_some_and(|t| t.album_browse_id.is_some()) {
-                    "[Open Album Popup]"
-                } else {
-                    ""
-                },
-                Style::default().fg(pal.accent),
-            )),
-        ]),
-        parts[1],
-    );
+            ));
+            bx += pw + 1;
+        }
+        if cur_track.is_some() {
+            let np_lbl = " [Live] ";
+            let nw = np_lbl.chars().count() as u16;
+            if bx + nw <= parts[1].x + parts[1].width {
+                state
+                    .music
+                    .hitboxes
+                    .push((Rect::new(bx, btn_y, nw, 1), MusicHit::ShowNowPlaying));
+                btn_spans.push(Span::raw(" "));
+                btn_spans.push(Span::styled(
+                    np_lbl,
+                    Style::default()
+                        .fg(pal.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("[{}] 2x-click to run", kind.badge()),
+                    Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    marq,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    truncate_str(&sub_line, w),
+                    Style::default().fg(pal.text_dim),
+                )),
+                Line::from(btn_spans),
+            ]),
+            parts[1],
+        );
+    } else {
+        let album_btn_rect = Rect::new(parts[1].x, parts[1].y + 2, parts[1].width, 1);
+        if cur_track.as_ref().is_some_and(|t| t.album_browse_id.is_some()) {
+            state
+                .music
+                .hitboxes
+                .push((album_btn_rect, MusicHit::OpenCurrentAlbum));
+        }
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    marq,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    truncate_str(&sub_line, w),
+                    Style::default().fg(pal.text_dim),
+                )),
+                Line::from(Span::styled(
+                    if cur_track.as_ref().is_some_and(|t| t.album_browse_id.is_some()) {
+                        "[Open Album Popup]"
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(pal.accent),
+                )),
+            ]),
+            parts[1],
+        );
+    }
 
     render_drawer_queue_or_lyrics(frame, parts[2], state, &pal);
 }
@@ -1026,7 +1115,8 @@ fn render_bottom_player_bar(
     let theme = state.base_theme().clone();
     let bar_bg = Color::Reset;
     let blk = Block::default()
-        .borders(Borders::TOP)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border_idle))
         .style(Style::default().bg(bar_bg));
     let inner = blk.inner(area);
@@ -1039,22 +1129,34 @@ fn render_bottom_player_bar(
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
-            Constraint::Percentage(30),
+            Constraint::Percentage(32),
+            Constraint::Percentage(36),
+            Constraint::Percentage(32),
         ])
         .split(inner);
 
-    // 1. Left section: Mini 1:1 cover + Title + Artist + Heart (Click opens Album / Collection Popup!)
+    // 1. Left section: Enlarged 1:1 cover + Title + Artist + Album + Live Status
     let cur = state.music.current_track().cloned();
     let left_area = cols[0];
-    let cover_w: u16 = if left_area.width >= 20 { 6 } else { 0 };
+    let cover_w: u16 = if left_area.width >= 24 {
+        (inner.height * 2 + 2).clamp(8, 12)
+    } else if left_area.width >= 18 {
+        8
+    } else {
+        0
+    };
     let (mini_cover_rect, meta_rect) = if cover_w > 0 {
         let lsplit = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(cover_w), Constraint::Min(8)])
             .split(left_area);
-        (Some(lsplit[0]), lsplit[1])
+        let c = Rect::new(
+            lsplit[0].x + 1,
+            lsplit[0].y,
+            lsplit[0].width.saturating_sub(2),
+            lsplit[0].height,
+        );
+        (Some(c), lsplit[1])
     } else {
         (None, left_area)
     };
@@ -1066,12 +1168,19 @@ fn render_bottom_player_bar(
             state.queue_thumb_with_priority(&key, &eff_url, ThumbPriority::Focused);
         }
         if !rect_intersects_optional(c_rect, modal_rect) {
-            render_thumbnail_cover(frame, c_rect, &key, state, "♪");
+            render_thumbnail_cover(frame, c_rect, &key, state, "◈");
         }
         state
             .music
             .hitboxes
             .push((c_rect, MusicHit::OpenCurrentAlbum));
+    } else if let Some(c_rect) = mini_cover_rect {
+        frame.render_widget(
+            Paragraph::new(if c_rect.height >= 3 { "\n◈ YTM" } else { "◈" })
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(spotify_green).bg(bar_bg)),
+            c_rect,
+        );
     }
 
     if let Some(ref tr) = cur {
@@ -1079,70 +1188,126 @@ fn render_bottom_player_bar(
         let heart_lbl = if liked { " ♥" } else { " ♡" };
         let w = meta_rect.width.saturating_sub(4) as usize;
         let t_str = marquee_window(&tr.title, w.max(6), state.ticker_step);
-        let sub_str = tr
+        let artist_str = if tr.artist.is_empty() {
+            "YouTube Music".to_string()
+        } else {
+            tr.artist.clone()
+        };
+        let album_str = tr
             .album
             .as_deref()
-            .map(|alb| format!("{} · {alb}", tr.artist))
-            .unwrap_or_else(|| tr.artist.clone());
+            .map(|a| format!("{a} [Open]"))
+            .unwrap_or_else(|| "Single / Mix".to_string());
 
         let heart_x = meta_rect.x + (t_str.chars().count() as u16 + 1).min(meta_rect.width.saturating_sub(2));
         state
             .music
             .hitboxes
             .push((Rect::new(heart_x, meta_rect.y, 3, 1), MusicHit::ToggleLike));
-        if tr.album_browse_id.is_some() || state.music.last_opened_collection.is_some() {
+        if (tr.album_browse_id.is_some() || state.music.last_opened_collection.is_some())
+            && meta_rect.height >= 2
+        {
+            let album_row = if meta_rect.height >= 3 {
+                meta_rect.y + 2
+            } else {
+                meta_rect.y + 1
+            };
             state.music.hitboxes.push((
-                Rect::new(meta_rect.x, meta_rect.y + 1, meta_rect.width, 1),
+                Rect::new(meta_rect.x, album_row, meta_rect.width, 1),
                 MusicHit::OpenCurrentAlbum,
             ));
         }
 
+        let mut meta_lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {t_str}"),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(bar_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    heart_lbl,
+                    Style::default()
+                        .fg(if liked {
+                            spotify_green
+                        } else {
+                            theme.text_dim
+                        })
+                        .bg(bar_bg),
+                ),
+            ]),
+            Line::from(Span::styled(
+                format!(" {}", truncate_str(&artist_str, w)),
+                Style::default().fg(theme.text_dim).bg(bar_bg),
+            )),
+        ];
+        if meta_rect.height >= 3 {
+            meta_lines.push(Line::from(Span::styled(
+                format!(" {}", truncate_str(&album_str, w)),
+                Style::default().fg(theme.accent).bg(bar_bg),
+            )));
+        }
+        if meta_rect.height >= 4 {
+            let state_tag = if !state.live_playback.paused && state.has_live_ipc() {
+                "▸ PLAYING"
+            } else if state.has_live_ipc() {
+                "|| PAUSED"
+            } else {
+                "◆ READY"
+            };
+            let q_info = format!(
+                " {state_tag} · Track {}/{}",
+                state.music.queue_index + 1,
+                state.music.queue.len().max(1)
+            );
+            meta_lines.push(Line::from(Span::styled(
+                truncate_str(&q_info, w),
+                Style::default().fg(spotify_green).bg(bar_bg),
+            )));
+        }
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {t_str}"),
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(bar_bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        heart_lbl,
-                        Style::default()
-                            .fg(if liked {
-                                spotify_green
-                            } else {
-                                theme.text_dim
-                            })
-                            .bg(bar_bg),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    format!(" {}", truncate_str(&sub_str, w)),
-                    Style::default().fg(theme.text_dim).bg(bar_bg),
-                )),
-            ])
-            .style(Style::default().bg(bar_bg)),
+            Paragraph::new(meta_lines).style(Style::default().bg(bar_bg)),
             meta_rect,
         );
     } else {
-        frame.render_widget(
-            Paragraph::new(" ♪ Pick a track or album cover to start listening")
-                .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
-            meta_rect,
-        );
+        let mut idle_lines = vec![Line::from(Span::styled(
+            " ◈ Ready to Listen",
+            Style::default()
+                .fg(Color::White)
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ))];
+        if meta_rect.height >= 2 {
+            idle_lines.push(Line::from(Span::styled(
+                " 1x Click: Inspect · 2x Click: Play",
+                Style::default().fg(theme.text_dim).bg(bar_bg),
+            )));
+        }
+        if meta_rect.height >= 3 {
+            idle_lines.push(Line::from(Span::styled(
+                " Videos open in mpv Window",
+                Style::default().fg(theme.accent).bg(bar_bg),
+            )));
+        }
+        frame.render_widget(Paragraph::new(idle_lines), meta_rect);
     }
 
-    // 2. Center section: Transport row + Spotify progress bar
+    // 2. Center section: Transport row + Seek bar + Live Audio Spec / Hint rows (Zero Dead Space)
     let center = cols[1];
     let c_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(center);
 
     let play_lbl = if cur.is_some() && !state.live_playback.paused && state.has_live_ipc() {
-        " ⏸ "
+        " || "
     } else {
         " ▶ "
     };
@@ -1239,13 +1404,50 @@ fn render_bottom_player_bar(
             c_rows[1],
         );
     }
+    if c_rows[2].height >= 1 {
+        let eq_tag = state.config.music.eq_badge_label();
+        let spec_line = if let Some(ref tr) = cur {
+            let mode_s = if tr.kind == YtmItemKind::Video || state.music.video_mode {
+                "Video+Audio"
+            } else {
+                "Opus 48kHz 32f"
+            };
+            format!(
+                "{mode_s} · {} · EQ:{eq_tag}",
+                state.config.music.channel_mode.label()
+            )
+        } else {
+            format!(
+                "PipeWire 32f Float · EQ:{eq_tag} · {}",
+                state.config.music.audio_quality.label()
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_str(&spec_line, center.width as usize))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.accent).bg(bar_bg)),
+            c_rows[2],
+        );
+    }
+    if c_rows[3].height >= 1 {
+        frame.render_widget(
+            Paragraph::new(truncate_str(
+                "[Space] Pause  [[/]] Seek ±10s  [</>] Prev/Next",
+                center.width as usize,
+            ))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
+            c_rows[3],
+        );
+    }
 
-    // 3. Right section: Lyrics/Queue drawer toggle, Video/Audio switch, Volume, [EQ], Settings
+    // 3. Right section: Balanced 4-row Deck (Controls, Volume Bar, Audio Telemetry, Hotkeys)
     let right_area = cols[2];
+    let vol_pct = state.live_playback.volume.clamp(0, 100);
     let vol_lbl = if state.live_playback.muted {
         "MUTE".to_string()
     } else {
-        format!("{}%", state.live_playback.volume.clamp(0, 100))
+        format!("{vol_pct}%")
     };
     let eq_badge = state.config.music.eq_badge_label();
     let eq_pill_lbl = format!(" [EQ:{eq_badge}] ");
@@ -1269,9 +1471,9 @@ fn render_bottom_player_bar(
         ),
         (
             if state.music.video_mode {
-                " Vid ".to_string()
+                " [Vid] ".to_string()
             } else {
-                " Aud ".to_string()
+                " [Aud] ".to_string()
             },
             MusicHit::ToggleVideoMode,
             if state.music.video_mode {
@@ -1284,32 +1486,48 @@ fn render_bottom_player_bar(
         (" Vol".to_string(), MusicHit::ToggleMute, Color::White),
         ("+ ".to_string(), MusicHit::VolumeDelta(5), theme.text_dim),
         (eq_pill_lbl, MusicHit::OpenMusicEq, eq_pill_col),
-        (" ⚙ ".to_string(), MusicHit::OpenMusicSettings, theme.accent),
+        (" [#] ".to_string(), MusicHit::OpenMusicSettings, theme.accent),
     ];
-    let mut rx = right_area.x;
-    let mut rspans = Vec::new();
+    let mut kept: Vec<(String, MusicHit, Color, u16)> = Vec::new();
+    let max_w = right_area.width.saturating_sub(1);
+    let mut actual_w: u16 = 0;
     for (lbl, hit, col) in r_btns {
         let w = lbl.chars().count() as u16;
-        if rx + w <= right_area.x + right_area.width {
-            state
-                .music
-                .hitboxes
-                .push((Rect::new(rx, right_area.y, w, 1), hit));
-            rspans.push(Span::styled(
-                lbl,
-                Style::default()
-                    .fg(col)
-                    .bg(bar_bg)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            rx += w;
+        if actual_w + w <= max_w {
+            actual_w += w;
+            kept.push((lbl, hit, col, w));
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(rspans)), right_area);
+    let lead_pad = max_w.saturating_sub(actual_w);
+    let mut rx = right_area.x + lead_pad;
+    let mut rspans = if lead_pad > 0 {
+        vec![Span::raw(" ".repeat(lead_pad as usize))]
+    } else {
+        Vec::new()
+    };
+    for (lbl, hit, col, w) in kept {
+        state
+            .music
+            .hitboxes
+            .push((Rect::new(rx, right_area.y, w, 1), hit));
+        rspans.push(Span::styled(
+            lbl,
+            Style::default()
+                .fg(col)
+                .bg(bar_bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+        rx += w;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(rspans)),
+        Rect::new(right_area.x, right_area.y, right_area.width.saturating_sub(1), 1),
+    );
     if right_area.height >= 2 {
+        let eff_preamp = crate::api::player::effective_music_preamp_db(&state.config.music);
         let info = format!(
-            " Vol: {vol_lbl} · EQ:{eq_badge} ({:+}dB) · {}",
-            state.config.music.preamp_db,
+            "Vol: {vol_lbl} · EQ:{eq_badge} ({:+}dB) · {}",
+            eff_preamp,
             if state.config.music.anti_clip_limiter {
                 "Lossless Safe"
             } else {
@@ -1317,9 +1535,41 @@ fn render_bottom_player_bar(
             }
         );
         frame.render_widget(
-            Paragraph::new(truncate_str(&info, right_area.width as usize))
+            Paragraph::new(truncate_str(&info, right_area.width.saturating_sub(1) as usize))
+                .alignment(Alignment::Right)
                 .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
-            Rect::new(right_area.x, right_area.y + 1, right_area.width, 1),
+            Rect::new(right_area.x, right_area.y + 1, right_area.width.saturating_sub(1), 1),
+        );
+    }
+    if right_area.height >= 3 {
+        let bar_w = 10usize;
+        let filled_v = if state.live_playback.muted {
+            0
+        } else {
+            ((vol_pct as usize * bar_w) / 100).min(bar_w)
+        };
+        let vol_bar = format!(
+            "Output [{}{}] {:>4}",
+            "█".repeat(filled_v),
+            "░".repeat(bar_w - filled_v),
+            vol_lbl
+        );
+        frame.render_widget(
+            Paragraph::new(truncate_str(&vol_bar, right_area.width.saturating_sub(1) as usize))
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(spotify_green).bg(bar_bg)),
+            Rect::new(right_area.x, right_area.y + 2, right_area.width.saturating_sub(1), 1),
+        );
+    }
+    if right_area.height >= 4 {
+        frame.render_widget(
+            Paragraph::new(truncate_str(
+                "[e] EQ Studio · [s] Audio Settings · [d] Drawer",
+                right_area.width.saturating_sub(1) as usize,
+            ))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
+            Rect::new(right_area.x, right_area.y + 3, right_area.width.saturating_sub(1), 1),
         );
     }
 }
@@ -1490,7 +1740,7 @@ fn render_lyrics_view(
         } else {
             Style::default().fg(Color::White)
         };
-        let prefix = if is_active { "♪ " } else { "  " };
+        let prefix = if is_active { "▸ " } else { "  " };
         rendered_lines.push(Line::from(Span::styled(
             format!("{prefix}{}", line.text),
             st,
@@ -1615,8 +1865,7 @@ pub fn popup_nav_rows(
             let is_duplicate_tracks_shelf = !page.tracks.is_empty()
                 && !shelf.items.is_empty()
                 && shelf.items.iter().all(|it| {
-                    it.browse_id.is_none()
-                        && it.video_id.as_deref().is_some_and(|v| track_vids.contains(v))
+                    it.video_id.as_deref().is_some_and(|v| track_vids.contains(v))
                 })
                 && !shelf.title.to_ascii_lowercase().contains("video");
 
@@ -1833,17 +2082,45 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
         nav_spans.push(Span::raw(" "));
         nx += bw + 1;
     }
-    let close_lbl = " [✕ Close] ";
+    let dr_lbl = if state.music.album_popup.drawer_open {
+        " [d Drawer:ON] "
+    } else {
+        " [d Drawer:OFF] "
+    };
+    let close_lbl = " [x Close] ";
+    let dw = dr_lbl.chars().count() as u16;
     let cw = close_lbl.chars().count() as u16;
     let cx = nav.x + nav.width.saturating_sub(cw + 1);
+    let dx = cx.saturating_sub(dw + 1);
+    state
+        .music
+        .album_popup
+        .hitboxes
+        .push((Rect::new(dx, nav.y, dw, 1), YtmAlbumPopupHit::ToggleDrawer));
     state
         .music
         .album_popup
         .hitboxes
         .push((Rect::new(cx, nav.y, cw, 1), YtmAlbumPopupHit::Close));
-    if cx > nx {
-        nav_spans.push(Span::raw(" ".repeat((cx - nx) as usize)));
+    if dx > nx {
+        nav_spans.push(Span::raw(" ".repeat((dx - nx) as usize)));
     }
+    nav_spans.push(Span::styled(
+        dr_lbl,
+        Style::default()
+            .fg(if state.music.album_popup.drawer_open {
+                Color::Black
+            } else {
+                pal.text_dim
+            })
+            .bg(if state.music.album_popup.drawer_open {
+                spotify_green
+            } else {
+                Color::Reset
+            })
+            .add_modifier(Modifier::BOLD),
+    ));
+    nav_spans.push(Span::raw(" "));
     nav_spans.push(Span::styled(
         close_lbl,
         Style::default()
@@ -1867,10 +2144,10 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
         hsplit[0].height,
     );
     if !art_url.is_empty() {
-        render_thumbnail_cover(frame, cov_rect, &art_key, state, if is_artist { "Artist" } else { "♪ Song" });
+        render_thumbnail_cover(frame, cov_rect, &art_key, state, if is_artist { "Artist" } else { "Cover" });
     } else {
         frame.render_widget(
-            Paragraph::new(if is_artist { "\n\nARTIST" } else { "\n\n♪ COVER" })
+            Paragraph::new(if is_artist { "\n\n◈ ARTIST" } else { "\n\n◈ COVER" })
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(pal.primary).bg(Color::Reset)),
             cov_rect,
@@ -1983,7 +2260,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                 spotify_green,
             ),
             (
-                " 🔀 Shuffle ",
+                " [~] Shuffle ",
                 YtmAlbumPopupHit::ShuffleAll,
                 Color::White,
                 Color::Rgb(50, 58, 76),
@@ -1991,7 +2268,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
         ];
         if p.header_radio_playlist_id.is_some() {
             actions.push((
-                " 📻 Start Radio ",
+                " ((·)) Start Radio ",
                 YtmAlbumPopupHit::StartRadio,
                 Color::Black,
                 pal.accent,
@@ -2062,9 +2339,19 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
         frame.render_widget(Paragraph::new(Line::from(tspans)), tab_bar);
     }
 
-    // 3. Body: Unified Tracklist + Shelves + Artist Bio
-    let body = chunks[body_idx];
+    // 3. Body: Left Unified Tracklist/Shelves/Bio + Collapsible Right Preview Inspector Drawer
+    let body_row = chunks[body_idx];
     let footer = chunks[body_idx + 1];
+    let show_inspector = state.music.album_popup.drawer_open && body_row.width >= 72 && page_opt.is_some();
+    let (body, inspector_opt) = if show_inspector {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(body_row);
+        (cols[0], Some(cols[1]))
+    } else {
+        (body_row, None)
+    };
 
     if state.music.album_popup.loading {
         frame.render_widget(
@@ -2115,6 +2402,26 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                 state.music.album_popup.scroll.min(rows.len() - vis);
         } else {
             state.music.album_popup.scroll = 0;
+        }
+
+        let mut inspected_track: Option<YtmTrack> = None;
+        let mut inspected_item: Option<YtmShelfItem> = None;
+        for row in &rows {
+            match row {
+                PopupNavRow::Track { sel_idx, track_idx }
+                    if *sel_idx == state.music.album_popup.cursor =>
+                {
+                    inspected_track = p.tracks.get(*track_idx).cloned();
+                    break;
+                }
+                PopupNavRow::ShelfItem { sel_idx, item, .. }
+                    if *sel_idx == state.music.album_popup.cursor =>
+                {
+                    inspected_item = Some(item.clone());
+                    break;
+                }
+                _ => {}
+            }
         }
 
         for (vi, row) in rows
@@ -2171,7 +2478,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                     let lead = if is_playing {
                         "▶ ".to_string()
                     } else if is_sel {
-                        "▸ ".to_string()
+                        "› ".to_string()
                     } else {
                         format!("{:>2}.", track_idx + 1)
                     };
@@ -2193,6 +2500,12 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                     let pill_h = if liked { " ♥ " } else { " ♡ " };
                     let hx = r.x + r.width.saturating_sub(14);
                     let qx = r.x + r.width.saturating_sub(10);
+                    // Push row SelectRow first, then specific pill hitboxes so .rev() prioritizes pills!
+                    state
+                        .music
+                        .album_popup
+                        .hitboxes
+                        .push((r, YtmAlbumPopupHit::SelectRow(*sel_idx)));
                     state
                         .music
                         .album_popup
@@ -2203,11 +2516,6 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                         .album_popup
                         .hitboxes
                         .push((Rect::new(qx, row_y, 4, 1), YtmAlbumPopupHit::QueueTrack(*track_idx)));
-                    state
-                        .music
-                        .album_popup
-                        .hitboxes
-                        .push((r, YtmAlbumPopupHit::PlayTrack(*track_idx)));
 
                     let title_col = if is_playing {
                         spotify_green
@@ -2270,7 +2578,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                 }
                 PopupNavRow::ShelfItem {
                     sel_idx,
-                    flat_item_idx,
+                    flat_item_idx: _,
                     item,
                 } => {
                     let is_sel = *sel_idx == state.music.album_popup.cursor;
@@ -2278,11 +2586,15 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                         .music
                         .album_popup
                         .hitboxes
-                        .push((r, YtmAlbumPopupHit::OpenItem(*flat_item_idx)));
-                    let marker = if is_sel { " ▸" } else { "  " };
+                        .push((r, YtmAlbumPopupHit::SelectRow(*sel_idx)));
+                    let marker = if is_sel { " ›" } else { "  " };
                     let badge = format!("[{}]", item.kind.badge());
-                    let title_str = truncate_str(&item.title, (r.width as usize).saturating_sub(24));
-                    let sub_str = truncate_str(&item.subtitle, 28);
+                    let dur_s = item
+                        .duration_secs
+                        .map(|d| format!(" · {}", format_duration_secs(d)))
+                        .unwrap_or_default();
+                    let title_str = truncate_str(&item.title, (r.width as usize).saturating_sub(26));
+                    let sub_str = truncate_str(&item.subtitle, 24);
                     frame.render_widget(
                         Paragraph::new(Line::from(vec![
                             Span::styled(
@@ -2302,10 +2614,12 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
-                                if sub_str.is_empty() {
+                                if sub_str.is_empty() && dur_s.is_empty() {
                                     String::new()
+                                } else if sub_str.is_empty() {
+                                    dur_s
                                 } else {
-                                    format!(" · {sub_str}")
+                                    format!(" · {sub_str}{dur_s}")
                                 },
                                 Style::default().fg(pal.text_dim),
                             ),
@@ -2323,13 +2637,246 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                 }
             }
         }
+
+        // Collapsible Right Preview Inspector Drawer inside Popup
+        if let Some(insp_area) = inspector_opt {
+            let insp_blk = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(pal.accent))
+                .title(Span::styled(
+                    " PREVIEW INSPECTOR ",
+                    Style::default()
+                        .fg(pal.accent)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(Color::Reset));
+            let i_inner = insp_blk.inner(insp_area);
+            frame.render_widget(insp_blk, insp_area);
+
+            if i_inner.width >= 14 && i_inner.height >= 6 {
+                let (sel_k, sel_u, kind_tag, s_title, s_sub, s_meta, can_open_alb, is_playable, vid_opt) =
+                    if let Some(ref tr) = inspected_track {
+                        let k = tr.thumb_cache_key();
+                        let u = tr.effective_thumb_url();
+                        let kind = if tr.kind == YtmItemKind::Video {
+                            "[VID] mpv Video"
+                        } else {
+                            "[TRK] Lossless Audio"
+                        };
+                        let dur = tr
+                            .duration_text
+                            .as_deref()
+                            .map(ToString::to_string)
+                            .or_else(|| tr.duration_secs.map(format_duration_secs))
+                            .unwrap_or_default();
+                        let plays = tr.plays_text.as_deref().unwrap_or("");
+                        let meta = [tr.album.as_deref().unwrap_or(""), &dur, plays]
+                            .into_iter()
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        (
+                            k,
+                            u,
+                            kind,
+                            tr.title.clone(),
+                            tr.artist.clone(),
+                            meta,
+                            tr.album_browse_id.is_some(),
+                            true,
+                            Some(tr.video_id.clone()),
+                        )
+                    } else if let Some(ref it) = inspected_item {
+                        let k = it.thumb_cache_key();
+                        let u = it.thumb_url.clone();
+                        let kind = match it.kind {
+                            YtmItemKind::Video => "[VID] mpv Video",
+                            YtmItemKind::Song => "[TRK] Song Preview",
+                            YtmItemKind::Album => "[ALB] Album",
+                            YtmItemKind::Playlist => "[PLS] Playlist",
+                            YtmItemKind::Artist => "[ART] Artist",
+                            YtmItemKind::Radio => "[MIX] Mix",
+                        };
+                        let dur = it
+                            .duration_secs
+                            .map(format_duration_secs)
+                            .unwrap_or_default();
+                        (
+                            k,
+                            u,
+                            kind,
+                            it.title.clone(),
+                            it.subtitle.clone(),
+                            dur,
+                            false,
+                            it.video_id.is_some(),
+                            it.video_id.clone(),
+                        )
+                    } else {
+                        (
+                            art_key.clone(),
+                            art_url.clone(),
+                            "[◈] Selection",
+                            p.header_title
+                                .clone()
+                                .unwrap_or_else(|| state.music.album_popup.title.clone()),
+                            p.header_artist
+                                .clone()
+                                .or_else(|| p.header_subscribers.clone())
+                                .unwrap_or_default(),
+                            p.header_track_summary.clone().unwrap_or_default(),
+                            false,
+                            false,
+                            None,
+                        )
+                    };
+
+                if !sel_k.is_empty() && !sel_u.is_empty() {
+                    state.queue_thumb_with_priority(&sel_k, &sel_u, ThumbPriority::Focused);
+                }
+
+                let cov_h = (i_inner.height / 2).clamp(4, 10);
+                let i_parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(cov_h),
+                        Constraint::Min(3),
+                        Constraint::Length(2),
+                    ])
+                    .split(i_inner);
+
+                let cov_w = (cov_h * 2 + 2).min(i_parts[0].width);
+                let cov_x = i_parts[0].x + i_parts[0].width.saturating_sub(cov_w) / 2;
+                let preview_cov_rect = Rect::new(cov_x, i_parts[0].y, cov_w, i_parts[0].height);
+                if !sel_u.is_empty() {
+                    render_thumbnail_cover(frame, preview_cov_rect, &sel_k, state, "Preview");
+                } else {
+                    frame.render_widget(
+                        Paragraph::new("\n◈ PREVIEW")
+                            .alignment(Alignment::Center)
+                            .style(Style::default().fg(pal.accent)),
+                        preview_cov_rect,
+                    );
+                }
+
+                let iw = i_parts[1].width.saturating_sub(2) as usize;
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            truncate_str(kind_tag, iw),
+                            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            truncate_str(&s_title, iw),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            truncate_str(&s_sub, iw),
+                            Style::default().fg(pal.text_dim),
+                        )),
+                        Line::from(Span::styled(
+                            truncate_str(&s_meta, iw),
+                            Style::default().fg(spotify_green),
+                        )),
+                    ])
+                    .wrap(Wrap { trim: true }),
+                    Rect::new(i_parts[1].x + 1, i_parts[1].y, i_parts[1].width.saturating_sub(2), i_parts[1].height),
+                );
+
+                // Action pills in Inspector Footer
+                let act_r = i_parts[2];
+                let mut ax = act_r.x + 1;
+                let mut r0_spans = Vec::new();
+                let prim_lbl = if kind_tag.contains("VID") {
+                    " [▸ Watch] "
+                } else if is_playable {
+                    " [▸ Play] "
+                } else {
+                    " [◈ Open] "
+                };
+                let pw = prim_lbl.chars().count() as u16;
+                if ax + pw <= act_r.x + act_r.width {
+                    state
+                        .music
+                        .album_popup
+                        .hitboxes
+                        .push((Rect::new(ax, act_r.y, pw, 1), YtmAlbumPopupHit::PreviewPlay));
+                    r0_spans.push(Span::styled(
+                        prim_lbl,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(spotify_green)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    ax += pw + 1;
+                }
+                if is_playable {
+                    let qlbl = " +Q ";
+                    let qw = qlbl.chars().count() as u16;
+                    if ax + qw <= act_r.x + act_r.width {
+                        state
+                            .music
+                            .album_popup
+                            .hitboxes
+                            .push((Rect::new(ax, act_r.y, qw, 1), YtmAlbumPopupHit::PreviewQueue));
+                        r0_spans.push(Span::raw(" "));
+                        r0_spans.push(Span::styled(
+                            qlbl,
+                            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                        ));
+                        ax += qw + 1;
+                    }
+                    let liked = vid_opt
+                        .as_deref()
+                        .is_some_and(|v| state.music.liked_ids.contains(v));
+                    let hlbl = if liked { " ♥ " } else { " ♡ " };
+                    let hw = hlbl.chars().count() as u16;
+                    if ax + hw <= act_r.x + act_r.width {
+                        state
+                            .music
+                            .album_popup
+                            .hitboxes
+                            .push((Rect::new(ax, act_r.y, hw, 1), YtmAlbumPopupHit::PreviewLike));
+                        r0_spans.push(Span::raw(" "));
+                        r0_spans.push(Span::styled(
+                            hlbl,
+                            Style::default().fg(if liked {
+                                spotify_green
+                            } else {
+                                pal.text_dim
+                            }),
+                        ));
+                    }
+                }
+                frame.render_widget(
+                    Paragraph::new(Line::from(r0_spans)),
+                    Rect::new(act_r.x, act_r.y, act_r.width, 1),
+                );
+                if act_r.height >= 2 && can_open_alb {
+                    let alb_lbl = " [Open Album >] ";
+                    let aw = alb_lbl.chars().count() as u16;
+                    state.music.album_popup.hitboxes.push((
+                        Rect::new(act_r.x + 1, act_r.y + 1, aw.min(act_r.width), 1),
+                        YtmAlbumPopupHit::PreviewOpenAlbum,
+                    ));
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            alb_lbl,
+                            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                        )),
+                        Rect::new(act_r.x + 1, act_r.y + 1, aw.min(act_r.width), 1),
+                    );
+                }
+            }
+        }
     }
 
     frame.render_widget(
         Paragraph::new(if is_artist {
-            "[Click/Enter] Play Song or Open Album · [Tab] Section Filter · [<- Back] Return · [Esc] Close"
+            "[1x Click] Preview Cover · [2x Click/Enter] Play, Watch Video or Open · [d] Drawer · [<- Back] · [Esc] Close"
         } else {
-            "[Click/Enter] Play Song & Sync Cover · [+Q/a] Queue Next · [♥/l] Like · [Esc] Close"
+            "[1x Click] Inspect Song · [2x Click/Enter] Play or Watch Video · [+Q/a] Queue · [♥/l] Like · [d] Drawer · [Esc] Close"
         })
         .alignment(Alignment::Center)
         .style(Style::default().fg(pal.text_dim)),
@@ -2355,7 +2902,7 @@ pub fn render_music_settings_modal(frame: &mut Frame, state: &mut AppState) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(spotify_green))
         .title(Span::styled(
-            " ♪ YouTube Music & Lossless Audio Settings ",
+            " [=] YouTube Music & Lossless Audio Settings ",
             Style::default()
                 .fg(spotify_green)
                 .add_modifier(Modifier::BOLD),
@@ -2510,9 +3057,7 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(5),
+            Constraint::Min(6),
             Constraint::Length(1),
         ])
         .split(inner);
@@ -2523,6 +3068,7 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
     let preamp = state.config.music.preamp_db;
     let bands = state.config.music.active_eq_bands();
     let cursor = state.music.eq.band_cursor.min(9);
+    let dropdown_open = state.music.eq.dropdown_open;
 
     let render_pill_strip = |frame: &mut Frame,
                              row: Rect,
@@ -2561,45 +3107,12 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
             Style::default().fg(theme.text_dim).bg(Color::Reset)
         }
     };
-    let row0_pills: Vec<(String, Style, Option<MusicEqHit>)> = AudioEqPreset::PRESETS_12[0..6]
-        .iter()
-        .map(|&p| {
-            let on = !bypass && active_saved.is_none() && cur_preset == p;
-            (
-                format!("[{}]", p.short_label()),
-                pill_st(on, spotify_green),
-                Some(MusicEqHit::SelectPreset(p)),
-            )
-        })
-        .collect();
-    render_pill_strip(frame, chunks[0], " Presets: ", theme.accent, &row0_pills, hits);
-
-    let mut row1_pills: Vec<(String, Style, Option<MusicEqHit>)> = AudioEqPreset::PRESETS_12[6..12]
-        .iter()
-        .map(|&p| {
-            let on = !bypass && active_saved.is_none() && cur_preset == p;
-            (
-                format!("[{}]", p.short_label()),
-                pill_st(on, theme.primary),
-                Some(MusicEqHit::SelectPreset(p)),
-            )
-        })
-        .collect();
-    row1_pills.push((
-        "[Custom*]".to_string(),
-        pill_st(
-            !bypass && active_saved.is_none() && cur_preset == AudioEqPreset::Custom,
-            theme.secondary,
-        ),
-        Some(MusicEqHit::SelectPreset(AudioEqPreset::Custom)),
-    ));
-    render_pill_strip(frame, chunks[1], "          ", theme.text_dim, &row1_pills, hits);
 
     if state.music.eq.save_editing {
         let cancel_lbl = " [Esc Cancel] ";
         let cw = cancel_lbl.chars().count() as u16;
-        let cx = chunks[2].x + chunks[2].width.saturating_sub(cw + 1);
-        hits.push((Rect::new(cx, chunks[2].y, cw, 1), MusicEqHit::CancelSavePrompt));
+        let cx = chunks[0].x + chunks[0].width.saturating_sub(cw + 1);
+        hits.push((Rect::new(cx, chunks[0].y, cw, 1), MusicEqHit::CancelSavePrompt));
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -2617,12 +3130,32 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
                     Style::default().fg(Color::Rgb(245, 110, 110)),
                 ),
             ])),
-            chunks[2],
+            chunks[0],
         );
     } else {
-        let mut sp = vec![
+        let active_dd_name = active_saved
+            .as_deref()
+            .map(|s| format!("◈ {s}"))
+            .unwrap_or_else(|| cur_preset.label().to_string());
+        let dd_arrow = if dropdown_open { "▴" } else { "▾" };
+        let top_pills = vec![
             (
-                "[💾 Save As]".to_string(),
+                format!("[{dd_arrow} {active_dd_name}]"),
+                if dropdown_open {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(spotify_green)
+                        .add_modifier(Modifier::BOLD)
+                },
+                Some(MusicEqHit::ToggleDropdown),
+            ),
+            (
+                "[+] Save As".to_string(),
                 Style::default()
                     .fg(Color::Black)
                     .bg(theme.accent)
@@ -2636,23 +3169,23 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
                     .add_modifier(Modifier::BOLD),
                 Some(MusicEqHit::OverwriteCustom),
             ),
+            (
+                if bypass {
+                    "[b Bypass:ON]"
+                } else {
+                    "[b Bypass:OFF]"
+                }
+                .to_string(),
+                pill_st(bypass, Color::Rgb(251, 191, 36)),
+                Some(MusicEqHit::ToggleBypass),
+            ),
+            (
+                "[0 Flat]".to_string(),
+                Style::default().fg(theme.text_dim),
+                Some(MusicEqHit::ResetFlat),
+            ),
         ];
-        for (i, saved) in state.config.music.saved_eq_presets.iter().enumerate() {
-            let active = active_saved
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(&saved.name));
-            sp.push((
-                format!("[★ {}]", truncate_str(&saved.name, 12)),
-                pill_st(active && !bypass, spotify_green),
-                Some(MusicEqHit::SelectSavedPreset(i)),
-            ));
-            sp.push((
-                "×".to_string(),
-                Style::default().fg(Color::Rgb(245, 110, 110)),
-                Some(MusicEqHit::DeleteSavedPreset(i)),
-            ));
-        }
-        render_pill_strip(frame, chunks[2], " Saved  : ", theme.accent, &sp, hits);
+        render_pill_strip(frame, chunks[0], " Preset : ", theme.accent, &top_pills, hits);
     }
 
     let eff_preamp = crate::api::player::effective_music_preamp_db(&state.config.music);
@@ -2664,7 +3197,15 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
             ""
         }
     );
-    let tools = vec![
+    let curve_sig = if active_saved.is_some() || cur_preset == AudioEqPreset::Custom {
+        let sub = (bands[0] + bands[1]) / 2;
+        let mid = (bands[4] + bands[5]) / 2;
+        let air = (bands[8] + bands[9]) / 2;
+        format!("Custom Curve (Sub:{sub:+} / Mid:{mid:+} / Air:{air:+})")
+    } else {
+        cur_preset.signature_summary()
+    };
+    let row1_tools = vec![
         ("Preamp:".to_string(), Style::default().fg(theme.text_dim), None),
         (
             "[-]".to_string(),
@@ -2687,24 +3228,14 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
             None,
         ),
         (
-            if bypass {
-                "[b Bypass:ON]"
-            } else {
-                "[b Bypass:OFF]"
-            }
-            .to_string(),
-            pill_st(bypass, Color::Rgb(251, 191, 36)),
-            Some(MusicEqHit::ToggleBypass),
-        ),
-        (
-            "[0 Flat]".to_string(),
+            format!("· {curve_sig}"),
             Style::default().fg(theme.text_dim),
-            Some(MusicEqHit::ResetFlat),
+            None,
         ),
     ];
-    render_pill_strip(frame, chunks[3], " Stage  : ", theme.text_dim, &tools, hits);
+    render_pill_strip(frame, chunks[1], " Stage  : ", theme.text_dim, &row1_tools, hits);
 
-    let eq_area = chunks[4];
+    let eq_area = chunks[2];
     let show_steppers = eq_area.height >= 6;
     let bar_h = eq_area
         .height
@@ -2857,9 +3388,168 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
         hits.push((b_rows[bi], MusicEqHit::SelectBand(idx)));
     }
 
+    // Floating Preset Dropdown Menu Overlay when dropdown_open == true
+    if dropdown_open && inner.width >= 36 && inner.height >= 8 {
+        #[derive(Clone)]
+        enum DdRow {
+            Header(&'static str),
+            Builtin(AudioEqPreset),
+            Saved(usize, String),
+            SavePrompt,
+        }
+        let mut dd_rows: Vec<DdRow> = vec![DdRow::Header("AUDIOPHILE CALIBRATED PRESETS (18)")];
+        for &p in &AudioEqPreset::AUDIOPHILE_PRESETS {
+            dd_rows.push(DdRow::Builtin(p));
+        }
+        if !state.config.music.saved_eq_presets.is_empty() {
+            dd_rows.push(DdRow::Header("SAVED CUSTOM PROFILES"));
+            for (i, s) in state.config.music.saved_eq_presets.iter().enumerate() {
+                dd_rows.push(DdRow::Saved(i, s.name.clone()));
+            }
+        }
+        dd_rows.push(DdRow::SavePrompt);
+
+        let total_dd = dd_rows.len();
+        let dd_w = 58u16.min(inner.width.saturating_sub(4));
+        let dd_x = (inner.x + 10).min(inner.x + inner.width.saturating_sub(dd_w + 1));
+        let dd_h = ((total_dd + 2) as u16).min(chunks[2].height.saturating_add(1)).max(6);
+        let dd_rect = Rect::new(dd_x, chunks[1].y, dd_w, dd_h);
+
+        frame.render_widget(Clear, dd_rect);
+        let dd_blk = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(spotify_green))
+            .title(Span::styled(
+                " Audiophile EQ Presets ",
+                Style::default()
+                    .fg(spotify_green)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(Color::Rgb(16, 19, 27)));
+        let dd_inner = dd_blk.inner(dd_rect);
+        frame.render_widget(dd_blk, dd_rect);
+
+        // Push dd_rect first so individual rows pushed afterward override it, while background closes dropdown cleanly
+        hits.push((dd_rect, MusicEqHit::ToggleDropdown));
+
+        let vis_dd = dd_inner.height as usize;
+        let dd_cur = state.music.eq.dropdown_cursor.min(total_dd.saturating_sub(1));
+        let scroll_dd = if dd_cur >= vis_dd {
+            dd_cur + 1 - vis_dd
+        } else {
+            0
+        };
+
+        for (vi, item) in dd_rows.iter().enumerate().skip(scroll_dd).take(vis_dd) {
+            let row_rect = Rect::new(dd_inner.x, dd_inner.y + vi as u16 - scroll_dd as u16, dd_inner.width, 1);
+            let is_hl = vi == dd_cur;
+            match item {
+                DdRow::Header(hdr) => {
+                    frame.render_widget(
+                        Paragraph::new(format!(" {hdr}")).style(
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        row_rect,
+                    );
+                }
+                DdRow::Builtin(p) => {
+                    let is_act = !bypass && active_saved.is_none() && cur_preset == *p;
+                    let sig = p.signature_summary();
+                    let name_s = p.label();
+                    let w = row_rect.width as usize;
+                    let mark = if is_act { "● " } else if is_hl { "› " } else { "  " };
+                    let left = format!(" {mark}{name_s}");
+                    let gap = w.saturating_sub(left.chars().count() + sig.chars().count() + 1);
+                    let line = Line::from(vec![
+                        Span::styled(
+                            left,
+                            Style::default()
+                                .fg(if is_act {
+                                    spotify_green
+                                } else if is_hl {
+                                    Color::White
+                                } else {
+                                    theme.text
+                                })
+                                .add_modifier(if is_act || is_hl {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        ),
+                        Span::raw(" ".repeat(gap)),
+                        Span::styled(sig, Style::default().fg(theme.text_dim)),
+                    ]);
+                    frame.render_widget(
+                        Paragraph::new(line).style(Style::default().bg(if is_hl {
+                            Color::Rgb(34, 42, 58)
+                        } else {
+                            Color::Rgb(16, 19, 27)
+                        })),
+                        row_rect,
+                    );
+                    hits.push((row_rect, MusicEqHit::SelectDropdownPreset(*p)));
+                }
+                DdRow::Saved(idx, name) => {
+                    let is_act = !bypass
+                        && active_saved
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name));
+                    let del_x = row_rect.x + row_rect.width.saturating_sub(4);
+                    let main_w = row_rect.width.saturating_sub(4);
+                    hits.push((
+                        Rect::new(row_rect.x, row_rect.y, main_w, 1),
+                        MusicEqHit::SelectSavedPreset(*idx),
+                    ));
+                    hits.push((
+                        Rect::new(del_x, row_rect.y, 4, 1),
+                        MusicEqHit::DeleteSavedPreset(*idx),
+                    ));
+                    let mark = if is_act { "◈ " } else if is_hl { "› " } else { "  " };
+                    let txt = truncate_str(&format!(" {mark}{name} (Saved)"), main_w as usize);
+                    let pad = (main_w as usize).saturating_sub(txt.chars().count());
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(
+                                txt,
+                                Style::default()
+                                    .fg(if is_act { spotify_green } else { Color::White })
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(" ".repeat(pad)),
+                            Span::styled("[x]", Style::default().fg(Color::Rgb(245, 110, 110))),
+                        ]))
+                        .style(Style::default().bg(if is_hl {
+                            Color::Rgb(34, 42, 58)
+                        } else {
+                            Color::Rgb(16, 19, 27)
+                        })),
+                        row_rect,
+                    );
+                }
+                DdRow::SavePrompt => {
+                    hits.push((row_rect, MusicEqHit::StartSavePrompt));
+                    frame.render_widget(
+                        Paragraph::new("  [+] Save Current Curve as Named Profile…")
+                            .style(
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .bg(Color::Rgb(16, 19, 27))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        row_rect,
+                    );
+                }
+            }
+        }
+    }
+
     let close_rect = Rect::new(
-        chunks[5].x + chunks[5].width.saturating_sub(12),
-        chunks[5].y,
+        chunks[3].x + chunks[3].width.saturating_sub(12),
+        chunks[3].y,
         11,
         1,
     );
@@ -2869,10 +3559,10 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
         .hitboxes
         .push((close_rect, MusicEqHit::Close));
     frame.render_widget(
-        Paragraph::new("[←/→] Band · [↑/↓/Click/Scroll] Gain · [w] Save Preset · [p] Preset · [b] Bypass · [Esc] Close")
+        Paragraph::new("[p] Presets · [←/→] Band · [↑/↓/Click/Scroll] Gain · [w] Save · [b] Bypass · [Esc] Close")
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.text_dim)),
-        chunks[5],
+        chunks[3],
     );
 }
 
@@ -3059,6 +3749,10 @@ mod tests {
         // Transparent background preserved across Music workspace panels (no dark RGB fill slabs)
         assert_eq!(term.backend().buffer()[(40, 8)].bg, Color::Reset);
         assert_eq!(term.backend().buffer()[(10, 15)].bg, Color::Reset);
+        // Zero emoji / slop glyphs in workspace buffer
+        for bad in ["🔀", "📻", "💾", "⚙", "➕", "❌", "♪"] {
+            assert!(!text.contains(bad), "unexpected emoji {bad} in music workspace");
+        }
 
         // Playlist popup dynamically binds hero cover & status to active playing song
         st.overlay = ActiveOverlay::MusicAlbum;
@@ -3079,8 +3773,9 @@ mod tests {
             .collect();
         assert!(pop_text.contains("Play All"));
         assert!(pop_text.contains("Playing #1: Starlight"));
+        assert!(pop_text.contains("PREVIEW INSPECTOR"));
 
-        // Artist profile renders BOTH Top Songs AND Albums AND Subscribers AND Bio simultaneously!
+        // Artist profile renders SINGLE TOP SONGS (even if Top songs shelf items carry album_browse_id!)
         st.music.album_popup.title = "Muse".to_string();
         st.music.album_popup.browse_id = "UCmuse".to_string();
         st.music.album_popup.page = Some(YtmPage {
@@ -3090,21 +3785,38 @@ mod tests {
             header_description: Some("English rock band from Teignmouth.".to_string()),
             header_radio_playlist_id: Some("RDEM_muse".to_string()),
             tracks: st.music.queue.clone(),
-            shelves: vec![YtmShelf {
-                title: "Albums".to_string(),
-                items: vec![YtmShelfItem {
-                    kind: YtmItemKind::Album,
-                    title: "Absolution".to_string(),
-                    subtitle: "2003".to_string(),
-                    video_id: None,
-                    browse_id: Some("MPREb_abso".to_string()),
-                    playlist_id: None,
-                    params: None,
-                    thumb_url: String::new(),
-                    duration_secs: None,
-                }],
-                ..Default::default()
-            }],
+            shelves: vec![
+                YtmShelf {
+                    title: "Top songs".to_string(),
+                    items: vec![YtmShelfItem {
+                        kind: YtmItemKind::Song,
+                        title: "Starlight".to_string(),
+                        subtitle: "Muse".to_string(),
+                        video_id: Some("Pgum6OT_VH8".to_string()),
+                        browse_id: Some("MPREb_123".to_string()),
+                        playlist_id: None,
+                        params: None,
+                        thumb_url: String::new(),
+                        duration_secs: Some(240),
+                    }],
+                    ..Default::default()
+                },
+                YtmShelf {
+                    title: "Albums".to_string(),
+                    items: vec![YtmShelfItem {
+                        kind: YtmItemKind::Album,
+                        title: "Absolution".to_string(),
+                        subtitle: "2003".to_string(),
+                        video_id: None,
+                        browse_id: Some("MPREb_abso".to_string()),
+                        playlist_id: None,
+                        params: None,
+                        thumb_url: String::new(),
+                        duration_secs: None,
+                    }],
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         });
         term.draw(|f| crate::ui::render_app(f, &mut st)).unwrap();
@@ -3115,14 +3827,19 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(art_text.contains("TOP SONGS"));
+        assert_eq!(art_text.matches("TOP SONGS").count(), 1);
         assert!(art_text.contains("ALBUMS"));
         assert!(art_text.contains("Absolution"));
         assert!(art_text.contains("14.2M subscribers"));
         assert!(art_text.contains("Teignmouth"));
+        assert!(art_text.contains("PREVIEW INSPECTOR"));
+        for bad in ["🔀", "📻", "💾", "⚙", "➕", "❌", "♪"] {
+            assert!(!art_text.contains(bad), "unexpected emoji {bad} in artist popup");
+        }
 
-        // Dedicated YouTube Music 10-Band EQ Studio modal renders cleanly over transparent background
+        // Dedicated YouTube Music 10-Band EQ Studio modal renders sleek Dropdown Preset menu
         st.overlay = ActiveOverlay::MusicEq;
+        st.music.eq.dropdown_open = true;
         term.draw(|f| crate::ui::render_app(f, &mut st)).unwrap();
         let eq_text: String = term
             .backend()
@@ -3135,6 +3852,16 @@ mod tests {
         assert!(eq_text.contains("31Hz"));
         assert!(eq_text.contains("16kHz"));
         assert!(eq_text.contains("Save As"));
+        assert!(eq_text.contains("Harman Target"));
+        assert!(st
+            .music
+            .eq
+            .hitboxes
+            .iter()
+            .any(|(_, h)| matches!(h, MusicEqHit::SelectDropdownPreset(crate::config::AudioEqPreset::Harman))));
+        for bad in ["🔀", "📻", "💾", "⚙", "➕", "❌", "♪"] {
+            assert!(!eq_text.contains(bad), "unexpected emoji {bad} in eq modal");
+        }
 
         // Dedicated YouTube Music Settings modal renders separately from video Settings
         st.overlay = ActiveOverlay::MusicSettings;
@@ -3148,5 +3875,8 @@ mod tests {
             .collect();
         assert!(set_text.contains("Anti-Clipping Limiter"));
         assert!(set_text.contains("Open 10-Band EQ Studio"));
+        for bad in ["🔀", "📻", "💾", "⚙", "➕", "❌", "♪"] {
+            assert!(!set_text.contains(bad), "unexpected emoji {bad} in settings modal");
+        }
     }
 }

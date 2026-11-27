@@ -2248,6 +2248,8 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
             "replaygain-clip=no".to_string(),
             "volume-max=100".to_string(),
             "audio-pitch-correction=yes".to_string(),
+            "pause=no".to_string(),
+            "cache-pause-initial=no".to_string(),
         ]
     } else {
         let mut f = vec![
@@ -3087,7 +3089,7 @@ mod tests {
         assert!(chain.starts_with("lavfi=["));
         assert!(chain.contains("volume=-2dB"));
         assert!(chain.contains("highpass=f=80"));
-        assert!(chain.contains("equalizer=f=2000:t=q:w=1.4:g=5"));
+        assert!(chain.contains("equalizer=f=2000:t=q:w=1.4:g=3"));
         assert!(chain.contains("dynaudnorm=f=150:g=15:p=0.9"));
         assert!(chain.contains("crossfeed=strength=0.45:range=0.5"));
 
@@ -3187,6 +3189,8 @@ mod tests {
         assert!(args.iter().any(|a| a == "--replaygain-clip=no"));
         assert!(args.iter().any(|a| a == "--volume-max=100"));
         assert!(args.iter().any(|a| a == "--video-sync=audio"));
+        assert!(args.iter().any(|a| a == "--pause=no"));
+        assert!(args.iter().any(|a| a == "--cache-pause-initial=no"));
         assert!(!args.iter().any(|a| a.starts_with("--glsl-shaders=")));
         assert!(!args.iter().any(|a| a.starts_with("--wayland-app-id=")));
         assert!(!args.iter().any(|a| a.starts_with("--vo=")));
@@ -3215,8 +3219,8 @@ mod tests {
             ..Default::default()
         };
         let bass_chain = build_music_audio_filter_chain(&bass_cfg).unwrap();
-        // BassBoost max peak (+6 dB) -> exact -6 dB headroom compensation (no extra -2 dB dullness)
-        assert!(bass_chain.contains("volume=-6dB"), "got {bass_chain}");
+        // BassBoost max peak (+5 dB) -> exact -5 dB headroom compensation
+        assert!(bass_chain.contains("volume=-5dB"), "got {bass_chain}");
         assert!(bass_chain.contains("equalizer=f=31:"));
         assert!(bass_chain.contains("dynaudnorm="));
         assert!(bass_chain.contains("crossfeed="));

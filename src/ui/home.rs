@@ -199,7 +199,7 @@ pub fn compute_grid_metrics_for_size(area: Rect, size_mode: GridCardSize) -> Gri
 /// Format category label shown inside Phaenna's top bar and click hit-tester.
 pub fn top_bar_cat_label(cat: Category, count: usize) -> String {
     if cat == Category::Music {
-        " ♪ Music ".to_string()
+        " ◈ Music ".to_string()
     } else {
         format!(" {} ({}) ", cat.label(), count)
     }

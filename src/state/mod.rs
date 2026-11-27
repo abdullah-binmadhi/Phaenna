@@ -388,6 +388,8 @@ pub enum MusicHit {
     ToggleMute,
     SelectRightTab(YtmRightPaneTab),
     SelectQueueTrack(usize),
+    PreviewPlay,
+    ShowNowPlaying,
     SeekBar,
 }
 
@@ -441,20 +443,26 @@ impl YtmArtistSectionTab {
 pub enum YtmAlbumPopupHit {
     Close,
     Back,
+    ToggleDrawer,
     PlayAll,
     ShuffleAll,
     StartRadio,
     OpenArtist,
     SelectArtistTab(YtmArtistSectionTab),
     ExpandShelf(usize),
+    SelectRow(usize),
     PlayTrack(usize),
     QueueTrack(usize),
     LikeTrack(usize),
     OpenItem(usize),
+    PreviewPlay,
+    PreviewOpenAlbum,
+    PreviewQueue,
+    PreviewLike,
 }
 
 /// Interactive state for the centered Spotify-style Album / Playlist / Artist detail popup.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct YtmAlbumPopupState {
     pub title: String,
     pub browse_id: String,
@@ -464,9 +472,31 @@ pub struct YtmAlbumPopupState {
     pub error: Option<String>,
     pub cursor: usize,
     pub scroll: usize,
+    pub drawer_open: bool,
+    pub last_click: Option<(usize, Instant)>,
     pub section_filter: YtmArtistSectionTab,
     pub history: Vec<(String, String, Option<String>, YtmPage)>,
     pub hitboxes: Vec<(Rect, YtmAlbumPopupHit)>,
+}
+
+impl Default for YtmAlbumPopupState {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            browse_id: String::new(),
+            params: None,
+            page: None,
+            loading: false,
+            error: None,
+            cursor: 0,
+            scroll: 0,
+            drawer_open: true,
+            last_click: None,
+            section_filter: YtmArtistSectionTab::All,
+            history: Vec::new(),
+            hitboxes: Vec::new(),
+        }
+    }
 }
 
 /// Mouse click target inside the dedicated YouTube Music Settings modal.
@@ -481,7 +511,8 @@ pub enum MusicSettingsHit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MusicEqHit {
     Close,
-    SelectPreset(crate::config::AudioEqPreset),
+    ToggleDropdown,
+    SelectDropdownPreset(crate::config::AudioEqPreset),
     SelectSavedPreset(usize),
     DeleteSavedPreset(usize),
     StartSavePrompt,
@@ -499,6 +530,8 @@ pub enum MusicEqHit {
 #[derive(Debug, Clone, Default)]
 pub struct YtmMusicEqState {
     pub band_cursor: usize,
+    pub dropdown_open: bool,
+    pub dropdown_cursor: usize,
     pub save_editing: bool,
     pub save_input: String,
     pub hitboxes: Vec<(Rect, MusicEqHit)>,
@@ -541,6 +574,7 @@ pub struct YtmMusicState {
     pub lyrics_loading: bool,
     pub album_popup: YtmAlbumPopupState,
     pub last_opened_collection: Option<(String, String, Option<String>)>,
+    pub preview_item: Option<YtmShelfItem>,
     pub eq: YtmMusicEqState,
     pub settings_cursor: usize,
     pub settings_hitboxes: Vec<(Rect, MusicSettingsHit)>,
@@ -587,6 +621,7 @@ impl Default for YtmMusicState {
             lyrics_loading: false,
             album_popup: YtmAlbumPopupState::default(),
             last_opened_collection: None,
+            preview_item: None,
             eq: YtmMusicEqState::default(),
             settings_cursor: 0,
             settings_hitboxes: Vec::new(),
