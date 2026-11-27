@@ -40,7 +40,7 @@ pub fn marquee_window(text: &str, width: usize, step: usize) -> String {
     (0..width).map(|i| tape[(start + i) % tape.len()]).collect()
 }
 
-pub const TOP_BAR_HEIGHT: u16 = 1;
+pub const TOP_BAR_HEIGHT: u16 = 2;
 pub const HERO_HEIGHT: u16 = 8;
 pub const FOOTER_HEIGHT: u16 = 0;
 #[allow(dead_code)]
@@ -527,8 +527,129 @@ pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: O
     }
 }
 
-fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = state.base_theme();
+fn render_top_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let theme = state.base_theme().clone();
+    state.top_account_hitbox = None;
+    state.top_whats_new_hitbox = None;
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let (row0, row1) = if area.height >= 2 {
+        (
+            Rect::new(area.x, area.y, area.width, 1),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        )
+    } else {
+        (Rect::new(area.x, area.y, area.width, 0), area)
+    };
+
+    // Row 0: Dedicated Top Utility Strip directly above PHAENNA & Continue Watching
+    // Keeps the full login handle visible without getting truncated by category pills!
+    if row0.height > 0 {
+        let acct_text = if let Some(acct) = state.auth_vault.active_account() {
+            let handle = acct
+                .channel_handle
+                .as_deref()
+                .filter(|h| !h.is_empty())
+                .map(|h| {
+                    if !acct.display_name.is_empty() && acct.display_name != *h {
+                        format!("{h} · {}", acct.display_name)
+                    } else {
+                        h.to_string()
+                    }
+                })
+                .unwrap_or_else(|| acct.display_name.clone());
+            format!(" [OK] Signed in: {handle} ")
+        } else {
+            " [L] Sign in to YouTube ".to_string()
+        };
+        let acct_style = if state.auth_vault.active_account().is_some() {
+            Style::default()
+                .fg(Color::Rgb(52, 211, 153))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+
+        // Right-side live indicators & What's New / Update trigger pill
+        let mut right_parts: Vec<(String, Style, bool)> = Vec::new();
+        if state.is_fetching_more {
+            let lbl = if let Some((cur, tot)) = state.pagination_progress {
+                format!(" +Loading {cur}/{tot} ")
+            } else {
+                " +Loading more... ".to_string()
+            };
+            right_parts.push((
+                lbl,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                false,
+            ));
+        } else if state.active_playback_video_id.is_some() {
+            right_parts.push((
+                format!(
+                    " > {} ",
+                    format_duration_secs(state.active_playback_pos as u64)
+                ),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                false,
+            ));
+        }
+        if let Some(ref info) = state.available_update {
+            right_parts.push((
+                format!(" [U] Update: {} ", info.latest_version),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(52, 211, 153))
+                    .add_modifier(Modifier::BOLD),
+                true,
+            ));
+        } else {
+            right_parts.push((
+                format!(" [v{} · What's New] ", env!("CARGO_PKG_VERSION")),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                true,
+            ));
+        }
+
+        let right_w: u16 = right_parts
+            .iter()
+            .map(|(s, _, _)| s.chars().count() as u16 + 1)
+            .sum();
+        let max_acct_w = row0.width.saturating_sub(right_w + 2) as usize;
+        let acct_chars: String = acct_text.chars().take(max_acct_w).collect();
+        let acct_w = acct_chars.chars().count() as u16;
+        if acct_w > 0 {
+            state.top_account_hitbox = Some(Rect::new(row0.x, row0.y, acct_w, 1));
+        }
+
+        let gap_w = row0.width.saturating_sub(acct_w + right_w) as usize;
+        let mut r0_spans = vec![Span::styled(acct_chars, acct_style)];
+        if gap_w > 0 {
+            r0_spans.push(Span::raw(" ".repeat(gap_w)));
+        }
+        let mut rx = row0.x + acct_w + gap_w as u16;
+        for (lbl, st, is_upd) in right_parts {
+            let lw = lbl.chars().count() as u16;
+            if is_upd && rx + lw <= row0.x + row0.width {
+                state.top_whats_new_hitbox = Some(Rect::new(rx, row0.y, lw, 1));
+            }
+            r0_spans.push(Span::styled(lbl, st));
+            r0_spans.push(Span::raw(" "));
+            rx += lw + 1;
+        }
+        frame.render_widget(Paragraph::new(Line::from(r0_spans)), row0);
+    }
+
+    // Row 1: Primary Navigation Strip (PHAENNA + all category tabs unobstructed)
     let mut spans = vec![
         Span::styled(
             " PHAENNA ",
@@ -557,54 +678,7 @@ fn render_top_bar(frame: &mut Frame, area: Rect, state: &AppState) {
         spans.push(Span::raw(" "));
     }
 
-    if state.is_fetching_more {
-        if let Some((cur, tot)) = state.pagination_progress {
-            spans.push(Span::styled(
-                format!(" +Loading {cur}/{tot} "),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::styled(
-                " +Loading more... ",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-    } else if state.active_playback_video_id.is_some() {
-        spans.push(Span::styled(
-            format!(
-                " > {} ",
-                format_duration_secs(state.active_playback_pos as u64)
-            ),
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else if area.width >= 96 {
-        if let Some(acct) = state.auth_vault.active_account() {
-            let tag = acct
-                .channel_handle
-                .as_deref()
-                .unwrap_or(&acct.display_name);
-            spans.push(Span::styled(
-                format!(" [OK] {tag} "),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::styled(
-                " [L] Sign In ",
-                Style::default().fg(theme.text_dim),
-            ));
-        }
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), row1);
 }
 
 fn build_progress_spans(
@@ -1815,7 +1889,8 @@ mod tests {
         });
 
         let area = Rect::new(0, 0, 120, 40);
-        let [_, _, grid, footer] = home_layout(area);
+        let [top_area, _, grid, footer] = home_layout(area);
+        assert_eq!(top_area.height, 2);
         assert_eq!(footer.height, 0);
         assert_eq!(grid_card_index_at(grid, grid.x + 3, grid.y + 2, 0, 1), Some(0));
         assert_eq!(footer_action_at(footer, 2, footer.y), None);
@@ -1825,6 +1900,8 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render_home_screen(f, &mut st, None)).unwrap();
         assert!(!st.home_channel_hitboxes.is_empty());
+        assert!(st.top_account_hitbox.is_some());
+        assert!(st.top_whats_new_hitbox.is_some());
     }
 
     #[test]

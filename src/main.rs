@@ -287,6 +287,11 @@ async fn main() -> anyhow::Result<()> {
     }
     trigger_swr_feed_refreshes(&mut state, &pool, &tx, &client, false);
 
+    // 5b. Show one-time plain-English "What's New & Fixed" welcome popup after upgrades
+    if let Some((ver_label, notes)) = services::updater::check_or_take_post_update_welcome() {
+        state.open_post_update_welcome(ver_label, notes);
+    }
+
     // 6. Optional non-blocking GitHub Releases check (supports SemVer & rolling main@sha)
     if state.config.update.check_on_startup {
         spawn_update_check(
@@ -2425,6 +2430,13 @@ async fn handle_app_message(
                 state.active_playback_dur = 0.0;
                 state.reset_live_playback();
 
+                // Restore any fullscreen/maximized terminal that yielded so mpv could appear in front
+                if let Some((yield_addr, yield_mode)) = state.yielded_fullscreen_window.take() {
+                    tokio::spawn(async move {
+                        services::pip::restore_yielded_fullscreen(&yield_addr, yield_mode).await;
+                    });
+                }
+
                 if let Some(vid) = finished_vid {
                     if finished_pos > 3.0 && state.auth_vault.active_account().is_none() {
                         let cpath = state.config.cookies_path().ok();
@@ -2515,6 +2527,9 @@ async fn handle_app_message(
                 "❖ Fullscreen: OFF"
             });
         }
+        AppMessage::LinuxFullscreenYielded { address, mode } => {
+            state.yielded_fullscreen_window = Some((address, mode));
+        }
         AppMessage::LinuxPipOutcome(outcome) => {
             if let services::pip::PipApplyOutcome::UnsupportedCompositor(de) = outcome {
                 state.show_toast(format!(
@@ -2562,16 +2577,25 @@ async fn handle_app_message(
                 let new_ver = info.latest_version.clone();
                 let is_brew = info.is_homebrew;
                 if is_brew {
-                    state.available_update = Some(info);
-                    state.show_toast(format!("Phaenna {new_ver} available: brew upgrade phaenna"));
+                    state.available_update = Some(info.clone());
+                    if was_checking {
+                        state.open_update_modal(info);
+                    } else {
+                        state.show_toast(format!("Phaenna {new_ver} available: brew upgrade phaenna"));
+                    }
                 } else if state.config.update.auto_install && !was_checking {
                     state.is_updating = true;
-                    state.available_update = Some(info);
+                    state.available_update = Some(info.clone());
+                    state.update_modal_phase = Some(crate::state::UpdateModalPhase::Downloading {
+                        info: Some(info),
+                        progress_pct: 0.0,
+                        speed: "Downloading update in background...".to_string(),
+                    });
                     state.show_toast(format!("Updating Phaenna to {new_ver} in background..."));
                 } else {
-                    state.available_update = Some(info);
-                    if state.overlay == ActiveOverlay::None {
-                        state.overlay = ActiveOverlay::Update;
+                    state.available_update = Some(info.clone());
+                    if state.overlay == ActiveOverlay::None || was_checking {
+                        state.open_update_modal(info);
                     }
                     state.show_toast(format!("Update {new_ver} available! Press [U]"));
                 }
@@ -2586,20 +2610,43 @@ async fn handle_app_message(
         AppMessage::UpdateProgress(pct, msg) => {
             state.is_updating = true;
             state.update_progress = pct;
-            state.update_status = Some(msg);
+            state.update_status = Some(msg.clone());
+            state.update_modal_phase = Some(crate::state::UpdateModalPhase::Downloading {
+                info: state.available_update.clone(),
+                progress_pct: pct,
+                speed: msg,
+            });
         }
         AppMessage::UpdateSuccess(ver) => {
             state.is_updating = false;
             state.update_progress = 100.0;
             state.update_completed_version = Some(ver.clone());
             state.update_status = Some(format!("Updated to {} — press [Enter] to exit!", ver));
+            let notes = state
+                .available_update
+                .as_ref()
+                .map(|i| {
+                    if i.simple_notes.is_empty() {
+                        services::updater::default_current_release_notes()
+                    } else {
+                        i.simple_notes.clone()
+                    }
+                })
+                .unwrap_or_else(services::updater::default_current_release_notes);
+            state.update_modal_phase = Some(crate::state::UpdateModalPhase::RestartRequired {
+                new_version: ver.clone(),
+                simple_notes: notes,
+            });
             state.overlay = ActiveOverlay::Update;
-            state.show_toast(format!("Phaenna updated to {}! Press [Enter] to exit.", ver));
+            state.show_toast(format!("Phaenna updated to {}! Press [Enter] to relaunch.", ver));
         }
         AppMessage::UpdateFailed(err) => {
             state.is_updating = false;
             state.update_progress = 0.0;
-            state.update_status = Some(format!("✕ {}", err));
+            state.update_status = Some(format!("[!] {}", err));
+            state.update_modal_phase = Some(crate::state::UpdateModalPhase::Failed {
+                error: err.clone(),
+            });
             state.show_toast(format!("Update failed: {err}"));
         }
         AppMessage::CastDevicesDiscovered(devs) => {
@@ -3567,16 +3614,14 @@ async fn start_nonblocking_playback_with_live_opts(
     match spawn_player(&opts) {
         Ok(Some(mut child)) => {
             let player_pid = child.id();
-            if opts.auto_pip {
-                spawn_linux_pip_task(
-                    true,
+            if !opts.audio_headless {
+                spawn_linux_front_task(
+                    opts.auto_pip,
+                    opts.auto_fullscreen,
                     state.live_playback.pip_corner_idx,
                     player_pid,
-                    true,
                     Some(tx.clone()),
                 );
-            } else if opts.auto_fullscreen {
-                spawn_linux_fullscreen_task(true, player_pid, true, Some(tx.clone()));
             }
             let tx_watch = tx.clone();
             let stderr_pipe = child.stderr.take();
@@ -5393,6 +5438,39 @@ async fn handle_music_key_event(
     false
 }
 
+fn spawn_linux_front_task(
+    auto_pip: bool,
+    auto_fullscreen: bool,
+    corner_idx: usize,
+    player_pid: Option<u32>,
+    tx: Option<tokio::sync::mpsc::Sender<AppMessage>>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        tokio::spawn(async move {
+            let (outcome, yielded) = services::pip::bring_player_to_front(
+                player_pid,
+                corner_idx,
+                auto_pip,
+                auto_fullscreen,
+            )
+            .await;
+            if let Some(sender) = tx {
+                if let Some((address, mode)) = yielded {
+                    let _ = sender
+                        .send(AppMessage::LinuxFullscreenYielded { address, mode })
+                        .await;
+                }
+                let _ = sender.send(AppMessage::LinuxPipOutcome(outcome)).await;
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (auto_pip, auto_fullscreen, corner_idx, player_pid, tx);
+    }
+}
+
 fn spawn_linux_pip_task(
     enabled: bool,
     corner_idx: usize,
@@ -6230,11 +6308,31 @@ async fn execute_hub_action(
             open_analytics(state, pool).await;
         }
         HubActionId::CheckUpdates => {
-            state.overlay = ActiveOverlay::Update;
+            if let Some(info) = state.available_update.clone() {
+                state.open_update_modal(info);
+            } else {
+                state.overlay = ActiveOverlay::Update;
+            }
             if !state.is_checking_update {
                 state.is_checking_update = true;
                 spawn_update_check(pool, tx, client, false, 0, false);
             }
+        }
+        HubActionId::WhatsNewNotes => {
+            let (ver_label, notes) = if let Some(ref u) = state.available_update {
+                let n = if u.simple_notes.is_empty() {
+                    services::updater::default_current_release_notes()
+                } else {
+                    u.simple_notes.clone()
+                };
+                (u.latest_version.clone(), n)
+            } else {
+                (
+                    services::updater::current_display_version_label(),
+                    services::updater::default_current_release_notes(),
+                )
+            };
+            state.open_post_update_welcome(ver_label, notes);
         }
         HubActionId::AutoUpdateMode => {
             if !state.config.update.check_on_startup {
@@ -8865,6 +8963,31 @@ async fn handle_mouse_event(
             }
             return false;
         }
+        if state.overlay == ActiveOverlay::Update {
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+                state.close_update_modal();
+                return true;
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some(modal) =
+                    crate::state::active_modal_rect(frame_area, ActiveOverlay::Update)
+                {
+                    if !in_rect(modal) {
+                        state.close_update_modal();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
         if state.overlay == ActiveOverlay::Help {
             let in_rect = |r: ratatui::layout::Rect| -> bool {
                 r.width > 0
@@ -9164,7 +9287,34 @@ async fn handle_mouse_event(
                 open_channel_for_video(&ch_video, state, tx, client);
                 return true;
             }
+            let in_rect = |r: ratatui::layout::Rect| -> bool {
+                r.width > 0
+                    && r.height > 0
+                    && mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
             if mouse.row == top_area.y {
+                if state.top_account_hitbox.is_some_and(in_rect) {
+                    state.login_ui.step = LoginStep::Hub;
+                    state.login_ui.error_banner = None;
+                    state.overlay = ActiveOverlay::Login;
+                    return true;
+                }
+                if state.top_whats_new_hitbox.is_some_and(in_rect) {
+                    if let Some(info) = state.available_update.clone() {
+                        state.open_update_modal(info);
+                    } else {
+                        state.open_post_update_welcome(
+                            services::updater::current_display_version_label(),
+                            services::updater::default_current_release_notes(),
+                        );
+                    }
+                    return true;
+                }
+            }
+            if mouse.row == top_area.y + 1 || (top_area.height == 1 && mouse.row == top_area.y) {
                 if let Some(idx) = top_bar_shelf_at(&state.categories, mouse.column) {
                     state.active_category = idx;
                     if state.categories[idx].0 == Category::Music {
@@ -9790,7 +9940,13 @@ async fn handle_key_event(
         }
         KeyCode::Char('m') => state.overlay = ActiveOverlay::Remote,
         KeyCode::Char('C') => execute_hub_action(HubActionId::CastScan, state, pool, tx, client).await,
-        KeyCode::Char('U') => state.overlay = ActiveOverlay::Update,
+        KeyCode::Char('U') => {
+            if let Some(info) = state.available_update.clone() {
+                state.open_update_modal(info);
+            } else {
+                state.overlay = ActiveOverlay::Update;
+            }
+        }
         KeyCode::Char('T') => {
             state.config.theme_index = (state.config.theme_index + 1) % ui::theme::THEMES.len();
             let _ = state.config.save();
@@ -10019,7 +10175,13 @@ async fn handle_overlay_key(
             KeyCode::Char('c') => apply_help_hit(HelpHit::OpenCalendar, state, pool).await,
             KeyCode::Char('L') => apply_help_hit(HelpHit::OpenLogin, state, pool).await,
             KeyCode::Char('T') => apply_help_hit(HelpHit::CycleTheme, state, pool).await,
-            KeyCode::Char('U') => state.overlay = ActiveOverlay::Update,
+            KeyCode::Char('U') => {
+            if let Some(info) = state.available_update.clone() {
+                state.open_update_modal(info);
+            } else {
+                state.overlay = ActiveOverlay::Update;
+            }
+        }
             _ => {}
         },
         ActiveOverlay::Login => {
@@ -11215,23 +11377,112 @@ async fn handle_overlay_key(
                 state.overlay = ActiveOverlay::None;
             }
         }
-        ActiveOverlay::Update => match code {
-            KeyCode::Esc | KeyCode::Char('U') => state.overlay = ActiveOverlay::None,
-            KeyCode::Char('r') => {
-                execute_hub_action(HubActionId::CheckUpdates, state, pool, tx, client).await;
-            }
-            KeyCode::Enter => {
-                if state.update_completed_version.is_some() {
-                    state.should_quit = true;
-                } else if !state.is_updating {
-                    if let Some(info) = state.available_update.clone() {
-                        state.is_updating = true;
-                        spawn_self_update(client.clone(), info, tx.clone());
+        ActiveOverlay::Update => {
+            let phase_opt = state.update_modal_phase.clone();
+            match phase_opt {
+                Some(crate::state::UpdateModalPhase::Available { info }) => match code {
+                    KeyCode::Enter
+                    | KeyCode::Char('u')
+                    | KeyCode::Char('U')
+                    | KeyCode::Char('y')
+                    | KeyCode::Char('Y') => {
+                        if !info.is_homebrew && !state.is_updating {
+                            state.is_updating = true;
+                            state.update_modal_phase =
+                                Some(crate::state::UpdateModalPhase::Downloading {
+                                    info: Some(info.clone()),
+                                    progress_pct: 0.0,
+                                    speed: "Connecting...".to_string(),
+                                });
+                            spawn_self_update(client.clone(), info, tx.clone());
+                        }
+                    }
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        if !info.is_homebrew && !state.is_updating {
+                            state.is_updating = true;
+                            spawn_self_update(client.clone(), info.clone(), tx.clone());
+                            state.close_update_modal();
+                            state.show_toast(format!(
+                                "◈ Downloading Phaenna {} in background...",
+                                info.latest_version
+                            ));
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        execute_hub_action(HubActionId::CheckUpdates, state, pool, tx, client)
+                            .await;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        state.close_update_modal();
+                    }
+                    _ => {}
+                },
+                Some(crate::state::UpdateModalPhase::Downloading { .. }) => {
+                    if matches!(
+                        code,
+                        KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Char('U')
+                    ) {
+                        state.close_update_modal();
+                        state.show_toast("◈ Update download continuing quietly in background...");
                     }
                 }
+                Some(crate::state::UpdateModalPhase::RestartRequired { .. }) => match code {
+                    KeyCode::Enter | KeyCode::Char('q') => {
+                        state.should_quit = true;
+                    }
+                    KeyCode::Esc | KeyCode::Char('U') => {
+                        state.close_update_modal();
+                    }
+                    _ => {}
+                },
+                Some(crate::state::UpdateModalPhase::PostUpdateWelcome { .. }) => {
+                    if matches!(
+                        code,
+                        KeyCode::Enter
+                            | KeyCode::Esc
+                            | KeyCode::Char(' ')
+                            | KeyCode::Char('q')
+                            | KeyCode::Char('U')
+                    ) {
+                        state.close_update_modal();
+                    }
+                }
+                Some(crate::state::UpdateModalPhase::Failed { .. }) => {
+                    if matches!(
+                        code,
+                        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('U')
+                    ) {
+                        state.close_update_modal();
+                    }
+                }
+                None => match code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        state.close_update_modal();
+                    }
+                    KeyCode::Char('r') => {
+                        execute_hub_action(HubActionId::CheckUpdates, state, pool, tx, client)
+                            .await;
+                    }
+                    KeyCode::Enter => {
+                        if state.update_completed_version.is_some() {
+                            state.should_quit = true;
+                        } else if !state.is_updating {
+                            if let Some(info) = state.available_update.clone() {
+                                state.is_updating = true;
+                                state.update_modal_phase =
+                                    Some(crate::state::UpdateModalPhase::Downloading {
+                                        info: Some(info.clone()),
+                                        progress_pct: 0.0,
+                                        speed: "Connecting...".to_string(),
+                                    });
+                                spawn_self_update(client.clone(), info, tx.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
             }
-            _ => {}
-        },
+        }
         ActiveOverlay::ConfirmQuit => match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => state.should_quit = true,
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {

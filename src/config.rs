@@ -1919,24 +1919,24 @@ impl AudioEqPreset {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Flat => "Flat (Reference 0dB)",
-            Self::Harman => "Harman Target (Audiophile Ref)",
-            Self::VoiceClarity => "Vocal Presence (De-Mud Clarity)",
-            Self::Podcast => "Podcast Studio (Warm Speech)",
-            Self::BassBoost => "Audiophile Bass+ (Zero Mud)",
-            Self::DeepSub => "Deep Sub (Theater / Drop LFE)",
-            Self::TrebleCrisp => "Treble Air (Fatigue-Free Detail)",
-            Self::Rock => "Rock (Punchy Kick & Guitars)",
-            Self::Electronic => "Electronic (EDM Precision V)",
-            Self::HipHop => "Hip-Hop / 808 (Tight Punch)",
-            Self::Acoustic => "Acoustic (Warm Organic Stage)",
-            Self::Jazz => "Jazz (Upright Bass & Brass)",
-            Self::Classical => "Classical (Hall Air & Dynamics)",
-            Self::WarmTube => "Warm Tube (Analog Roll-Off)",
-            Self::LoFi => "Lo-Fi / Chillhop (Dusty Mids)",
-            Self::Loudness => "Equal Loudness (Fletcher-Munson)",
-            Self::Cinema => "Cinema (LFE + Centered Voice)",
-            Self::LateNight => "Late Night (Soft Peaks)",
+            Self::Flat => "Flat (Reference)",
+            Self::Harman => "Harman Target",
+            Self::VoiceClarity => "Vocal Presence",
+            Self::Podcast => "Podcast Studio",
+            Self::BassBoost => "Audiophile Bass+",
+            Self::DeepSub => "Deep Sub",
+            Self::TrebleCrisp => "Treble Air",
+            Self::Rock => "Rock",
+            Self::Electronic => "Electronic",
+            Self::HipHop => "Hip-Hop",
+            Self::Acoustic => "Acoustic",
+            Self::Jazz => "Jazz",
+            Self::Classical => "Classical",
+            Self::WarmTube => "Warm Tube",
+            Self::LoFi => "Lo-Fi / Chillhop",
+            Self::Loudness => "Equal Loudness",
+            Self::Cinema => "Cinema",
+            Self::LateNight => "Late Night",
             Self::Custom => "Custom User Curve",
         }
     }
@@ -1986,15 +1986,6 @@ impl AudioEqPreset {
             Self::Cinema => Self::LateNight,
             Self::LateNight | Self::Custom => Self::Flat,
         }
-    }
-
-    /// Compact audiophile curve hint for EQ preset dropdown rows (`Sub · Mid · Air`).
-    pub fn signature_summary(self) -> String {
-        let b = self.band_gains_db();
-        format!(
-            "Sub:{:+}dB Mid:{:+}dB Air:{:+}dB",
-            b[0], b[5], b[8]
-        )
     }
 
     /// Calibrated 10-band graphic EQ gains (dB) at `[31Hz, 62Hz, 125Hz, 250Hz, 500Hz, 1kHz, 2kHz, 4kHz, 8kHz, 16kHz]`,

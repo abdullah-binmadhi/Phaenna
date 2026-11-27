@@ -159,6 +159,10 @@ pub enum AppMessage {
     FullscreenToggleFromPlayer {
         enabled: bool,
     },
+    LinuxFullscreenYielded {
+        address: String,
+        mode: i32,
+    },
     LinuxPipOutcome(crate::services::pip::PipApplyOutcome),
     PlaybackCommandReady {
         session_id: u64,

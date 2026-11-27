@@ -874,6 +874,29 @@ impl SortOrder {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateModalPhase {
+    Available {
+        info: UpdateInfo,
+    },
+    Downloading {
+        info: Option<UpdateInfo>,
+        progress_pct: f32,
+        speed: String,
+    },
+    RestartRequired {
+        new_version: String,
+        simple_notes: Vec<String>,
+    },
+    PostUpdateWelcome {
+        version_label: String,
+        simple_notes: Vec<String>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadJobState {
     pub video_id: String,
@@ -1047,11 +1070,15 @@ pub struct AppState {
     pub is_scanning_cast: bool,
     pub active_download: Option<DownloadJobState>,
     pub available_update: Option<UpdateInfo>,
+    pub update_modal_phase: Option<UpdateModalPhase>,
     pub update_status: Option<String>,
     pub update_progress: f32,
     pub is_checking_update: bool,
     pub is_updating: bool,
     pub update_completed_version: Option<String>,
+    pub top_account_hitbox: Option<Rect>,
+    pub top_whats_new_hitbox: Option<Rect>,
+    pub yielded_fullscreen_window: Option<(String, i32)>,
     pub should_quit: bool,
     pub quit_confirm_yes: bool,
 
@@ -1262,11 +1289,15 @@ impl AppState {
             is_scanning_cast: false,
             active_download: None,
             available_update: None,
+            update_modal_phase: None,
             update_status: None,
             update_progress: 0.0,
             is_checking_update: false,
             is_updating: false,
             update_completed_version: None,
+            top_account_hitbox: None,
+            top_whats_new_hitbox: None,
+            yielded_fullscreen_window: None,
             should_quit: false,
             quit_confirm_yes: false,
 
@@ -1317,6 +1348,30 @@ impl AppState {
             if ts.elapsed().as_secs() >= 4 {
                 self.toast = None;
             }
+        }
+    }
+
+    pub fn open_update_modal(&mut self, info: UpdateInfo) {
+        self.available_update = Some(info.clone());
+        self.update_modal_phase = Some(UpdateModalPhase::Available { info });
+        self.overlay = ActiveOverlay::Update;
+        self.kitty_flush_needed = true;
+    }
+
+    pub fn open_post_update_welcome(&mut self, version_label: String, simple_notes: Vec<String>) {
+        self.update_modal_phase = Some(UpdateModalPhase::PostUpdateWelcome {
+            version_label,
+            simple_notes,
+        });
+        self.overlay = ActiveOverlay::Update;
+        self.kitty_flush_needed = true;
+    }
+
+    pub fn close_update_modal(&mut self) {
+        self.update_modal_phase = None;
+        if self.overlay == ActiveOverlay::Update {
+            self.overlay = ActiveOverlay::None;
+            self.kitty_flush_needed = true;
         }
     }
 
@@ -3327,7 +3382,7 @@ pub fn active_modal_rect(frame_area: Rect, overlay: ActiveOverlay) -> Option<Rec
         ActiveOverlay::Remote => (64, 78),
         ActiveOverlay::Cast => (68, 60),
         ActiveOverlay::Download => (68, 52),
-        ActiveOverlay::Update => (66, 54),
+        ActiveOverlay::Update => (78, 74),
         ActiveOverlay::ConfirmQuit => (50, 30),
     };
     Some(centered_rect(px, py, frame_area))

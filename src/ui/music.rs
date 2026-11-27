@@ -353,6 +353,33 @@ fn render_main_stage(
     }
 }
 
+fn fit_joined_parts(parts: &[&str], sep: &str, max_w: usize) -> String {
+    if max_w == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for p in parts {
+        let candidate_len = if out.is_empty() {
+            p.chars().count()
+        } else {
+            out.chars().count() + sep.chars().count() + p.chars().count()
+        };
+        if candidate_len <= max_w {
+            if !out.is_empty() {
+                out.push_str(sep);
+            }
+            out.push_str(p);
+        } else {
+            break;
+        }
+    }
+    if out.is_empty() {
+        truncate_str(parts.first().copied().unwrap_or(""), max_w)
+    } else {
+        out
+    }
+}
+
 fn render_stage_header(frame: &mut Frame, area: Rect, state: &mut AppState, show_search: bool) {
     let theme = state.base_theme().clone();
     let top_row = Rect::new(area.x, area.y, area.width, 1);
@@ -382,7 +409,7 @@ fn render_stage_header(frame: &mut Frame, area: Rect, state: &mut AppState, show
         YtmSection::Browse if !state.music.browse_title.is_empty() => {
             format!(" {} ", state.music.browse_title)
         }
-        YtmSection::Home => " Spotify-Style Home ".to_string(),
+        YtmSection::Home => " Home ".to_string(),
         YtmSection::Liked => " ♥ Liked Music ".to_string(),
         s => format!(" {} ", s.label()),
     };
@@ -401,12 +428,25 @@ fn render_stage_header(frame: &mut Frame, area: Rect, state: &mut AppState, show
             Style::default().fg(theme.accent),
         ));
     } else {
-        spans.push(Span::styled(
-            " · Double-Click Album/Artist: Open · Click Song: Play · [e] EQ · [s] Settings · [d] Drawer",
-            Style::default().fg(theme.text_dim),
-        ));
+        let avail_w = (top_row.x + top_row.width).saturating_sub(x + 3) as usize;
+        let hint = fit_joined_parts(
+            &[
+                "[Click] Preview",
+                "[2x Click] Play/Open",
+                "[e] EQ",
+                "[s] Settings",
+                "[d] Drawer",
+            ],
+            " · ",
+            avail_w,
+        );
+        if !hint.is_empty() {
+            spans.push(Span::styled(
+                format!(" · {hint}"),
+                Style::default().fg(theme.text_dim),
+            ));
+        }
     }
-    let _ = x;
     frame.render_widget(Paragraph::new(Line::from(spans)), top_row);
 
     if show_search && area.height >= 3 {
@@ -909,7 +949,7 @@ fn render_right_drawer(
         return;
     }
 
-    let art_h = (inner.height / 2).clamp(6, 13);
+    let art_h = ((inner.height as usize * 54) / 100).clamp(7, 15) as u16;
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1129,9 +1169,11 @@ fn render_bottom_player_bar(
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(32),
-            Constraint::Percentage(36),
-            Constraint::Percentage(32),
+            Constraint::Percentage(29),
+            Constraint::Length(2),
+            Constraint::Percentage(38),
+            Constraint::Length(2),
+            Constraint::Percentage(31),
         ])
         .split(inner);
 
@@ -1295,7 +1337,7 @@ fn render_bottom_player_bar(
     }
 
     // 2. Center section: Transport row + Seek bar + Live Audio Spec / Hint rows (Zero Dead Space)
-    let center = cols[1];
+    let center = cols[2];
     let c_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1430,19 +1472,21 @@ fn render_bottom_player_bar(
         );
     }
     if c_rows[3].height >= 1 {
+        let hint = fit_joined_parts(
+            &["[Space] Play", "[/] Seek", "</> Track"],
+            " · ",
+            center.width as usize,
+        );
         frame.render_widget(
-            Paragraph::new(truncate_str(
-                "[Space] Pause  [[/]] Seek ±10s  [</>] Prev/Next",
-                center.width as usize,
-            ))
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
+            Paragraph::new(hint)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
             c_rows[3],
         );
     }
 
     // 3. Right section: Balanced 4-row Deck (Controls, Volume Bar, Audio Telemetry, Hotkeys)
-    let right_area = cols[2];
+    let right_area = cols[4];
     let vol_pct = state.live_playback.volume.clamp(0, 100);
     let vol_lbl = if state.live_playback.muted {
         "MUTE".to_string()
@@ -1562,13 +1606,15 @@ fn render_bottom_player_bar(
         );
     }
     if right_area.height >= 4 {
+        let hint = fit_joined_parts(
+            &["[e] EQ", "[s] Settings", "[d] Drawer"],
+            " · ",
+            right_area.width.saturating_sub(1) as usize,
+        );
         frame.render_widget(
-            Paragraph::new(truncate_str(
-                "[e] EQ Studio · [s] Audio Settings · [d] Drawer",
-                right_area.width.saturating_sub(1) as usize,
-            ))
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
+            Paragraph::new(hint)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(theme.text_dim).bg(bar_bg)),
             Rect::new(right_area.x, right_area.y + 3, right_area.width.saturating_sub(1), 1),
         );
     }
@@ -2045,9 +2091,10 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
     }
 
     let is_artist = page_opt.as_ref().is_some_and(|p| p.is_artist_profile);
+    let hero_h: u16 = if inner.height >= 26 { 12 } else { 10 };
     let mut constraints = vec![
         Constraint::Length(1),
-        Constraint::Length(10),
+        Constraint::Length(hero_h),
     ];
     if is_artist {
         constraints.push(Constraint::Length(1));
@@ -2130,9 +2177,11 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
     ));
     frame.render_widget(Paragraph::new(Line::from(nav_spans)), nav);
 
-    // 2. Hero Header (Dynamic 1:1 Cover Art + Rich Metadata + Actions)
+    // 2. Hero Header (Enlarged Cover Art + Rich Metadata + Actions)
     let hero = chunks[1];
-    let cover_w = 20u16.min(hero.width / 3);
+    let cover_w = (hero.width / 3)
+        .clamp(24, 34)
+        .min(hero.width.saturating_sub(24).max(16));
     let hsplit = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(cover_w), Constraint::Min(18)])
@@ -2161,7 +2210,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
             .as_deref()
             .unwrap_or(&state.music.album_popup.title);
         let info_w = info_rect.width.saturating_sub(2) as usize;
-        let btn_y = info_rect.y + 6.min(info_rect.height.saturating_sub(2));
+        let btn_y = info_rect.y + hero_h.saturating_sub(3).min(8).min(info_rect.height.saturating_sub(2));
 
         let (kicker, line3, line4) = if p.is_artist_profile {
             let subs = p
@@ -2736,7 +2785,7 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                     state.queue_thumb_with_priority(&sel_k, &sel_u, ThumbPriority::Focused);
                 }
 
-                let cov_h = (i_inner.height / 2).clamp(4, 10);
+                let cov_h = ((i_inner.height as usize * 58) / 100).clamp(7, 14) as u16;
                 let i_parts = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -2746,9 +2795,12 @@ pub fn render_album_popup_modal(frame: &mut Frame, state: &mut AppState) {
                     ])
                     .split(i_inner);
 
-                let cov_w = (cov_h * 2 + 2).min(i_parts[0].width);
-                let cov_x = i_parts[0].x + i_parts[0].width.saturating_sub(cov_w) / 2;
-                let preview_cov_rect = Rect::new(cov_x, i_parts[0].y, cov_w, i_parts[0].height);
+                let preview_cov_rect = Rect::new(
+                    i_parts[0].x + 1,
+                    i_parts[0].y,
+                    i_parts[0].width.saturating_sub(2),
+                    i_parts[0].height,
+                );
                 if !sel_u.is_empty() {
                     render_thumbnail_cover(frame, preview_cov_rect, &sel_k, state, "Preview");
                 } else {
@@ -3197,13 +3249,10 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
             ""
         }
     );
-    let curve_sig = if active_saved.is_some() || cur_preset == AudioEqPreset::Custom {
-        let sub = (bands[0] + bands[1]) / 2;
-        let mid = (bands[4] + bands[5]) / 2;
-        let air = (bands[8] + bands[9]) / 2;
-        format!("Custom Curve (Sub:{sub:+} / Mid:{mid:+} / Air:{air:+})")
+    let active_curve_name = if let Some(ref s) = active_saved {
+        format!("Profile: {s}")
     } else {
-        cur_preset.signature_summary()
+        format!("Profile: {}", cur_preset.label())
     };
     let row1_tools = vec![
         ("Preamp:".to_string(), Style::default().fg(theme.text_dim), None),
@@ -3228,7 +3277,7 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
             None,
         ),
         (
-            format!("· {curve_sig}"),
+            format!("· {active_curve_name}"),
             Style::default().fg(theme.text_dim),
             None,
         ),
@@ -3397,7 +3446,7 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
             Saved(usize, String),
             SavePrompt,
         }
-        let mut dd_rows: Vec<DdRow> = vec![DdRow::Header("AUDIOPHILE CALIBRATED PRESETS (18)")];
+        let mut dd_rows: Vec<DdRow> = vec![DdRow::Header("AUDIOPHILE CALIBRATED PRESETS")];
         for &p in &AudioEqPreset::AUDIOPHILE_PRESETS {
             dd_rows.push(DdRow::Builtin(p));
         }
@@ -3410,7 +3459,7 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
         dd_rows.push(DdRow::SavePrompt);
 
         let total_dd = dd_rows.len();
-        let dd_w = 58u16.min(inner.width.saturating_sub(4));
+        let dd_w = 42u16.min(inner.width.saturating_sub(4));
         let dd_x = (inner.x + 10).min(inner.x + inner.width.saturating_sub(dd_w + 1));
         let dd_h = ((total_dd + 2) as u16).min(chunks[2].height.saturating_add(1)).max(6);
         let dd_rect = Rect::new(dd_x, chunks[1].y, dd_w, dd_h);
@@ -3457,12 +3506,11 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
                 }
                 DdRow::Builtin(p) => {
                     let is_act = !bypass && active_saved.is_none() && cur_preset == *p;
-                    let sig = p.signature_summary();
                     let name_s = p.label();
                     let w = row_rect.width as usize;
                     let mark = if is_act { "● " } else if is_hl { "› " } else { "  " };
-                    let left = format!(" {mark}{name_s}");
-                    let gap = w.saturating_sub(left.chars().count() + sig.chars().count() + 1);
+                    let left = truncate_str(&format!(" {mark}{name_s}"), w.saturating_sub(1));
+                    let pad = w.saturating_sub(left.chars().count());
                     let line = Line::from(vec![
                         Span::styled(
                             left,
@@ -3480,8 +3528,7 @@ pub fn render_music_eq_modal(frame: &mut Frame, state: &mut AppState) {
                                     Modifier::empty()
                                 }),
                         ),
-                        Span::raw(" ".repeat(gap)),
-                        Span::styled(sig, Style::default().fg(theme.text_dim)),
+                        Span::raw(" ".repeat(pad)),
                     ]);
                     frame.render_widget(
                         Paragraph::new(line).style(Style::default().bg(if is_hl {
@@ -3745,6 +3792,10 @@ mod tests {
         assert!(text.contains("Your Library"));
         assert!(text.contains("Music Settings"));
         assert!(text.contains("[EQ:"));
+        assert!(text.contains(" Home "));
+        assert!(!text.contains("Spotify-Style"));
+        assert!(!text.contains("[e] E "));
+        assert!(!text.contains("[d] Dr..."));
         assert!(st.music.hitboxes.iter().any(|(_, h)| *h == MusicHit::OpenMusicEq));
         // Transparent background preserved across Music workspace panels (no dark RGB fill slabs)
         assert_eq!(term.backend().buffer()[(40, 8)].bg, Color::Reset);
@@ -3853,6 +3904,8 @@ mod tests {
         assert!(eq_text.contains("16kHz"));
         assert!(eq_text.contains("Save As"));
         assert!(eq_text.contains("Harman Target"));
+        assert!(!eq_text.contains("AUDIOPHILE CALIBRATED PRESETS (18)"));
+        assert!(!eq_text.contains("Sub:+"));
         assert!(st
             .music
             .eq

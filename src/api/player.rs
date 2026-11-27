@@ -2268,6 +2268,7 @@ fn shared_mpv_kv_flags(opts: &PlayOptions) -> Vec<String> {
     };
 
     if !opts.audio_headless {
+        flags.push("focus-on-open=yes".to_string());
         #[cfg(target_os = "linux")]
         {
             flags.push(format!(

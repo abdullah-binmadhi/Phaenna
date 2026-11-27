@@ -240,7 +240,13 @@ pub fn detect_linux_pip_backend() -> LinuxPipBackend {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HyprWorkspaceRef {
+    #[serde(default)]
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HyprClient {
     pub address: String,
     #[serde(default)]
@@ -253,6 +259,8 @@ pub struct HyprClient {
     pub fullscreen: i32,
     #[serde(default)]
     pub monitor: i64,
+    #[serde(default)]
+    pub workspace: HyprWorkspaceRef,
     #[serde(default)]
     pub class: String,
     #[serde(default)]
@@ -517,6 +525,8 @@ pub struct SwayNode {
     pub pid: Option<u32>,
     #[serde(default)]
     pub app_id: Option<String>,
+    #[serde(default)]
+    pub fullscreen_mode: i32,
     #[serde(default)]
     pub nodes: Vec<SwayNode>,
     #[serde(default)]
@@ -887,6 +897,204 @@ pub async fn apply_linux_pip(
     }
 }
 
+/// Find any mapped non-`mpv` window currently fullscreen/maximized on the same workspace/monitor
+/// (such as a fullscreened terminal launched via `Super+V`) that would trap new windows behind it.
+pub fn find_obstructing_fullscreen_client<'a>(
+    clients: &'a [HyprClient],
+    mpv: &HyprClient,
+) -> Option<&'a HyprClient> {
+    clients.iter().find(|c| {
+        c.mapped
+            && !c.address.is_empty()
+            && c.address != mpv.address
+            && c.fullscreen != 0
+            && (mpv.workspace.id == 0 || c.workspace.id == mpv.workspace.id || c.monitor == mpv.monitor)
+    })
+}
+
+/// Map Hyprland JSON `fullscreen` mode (`1` = maximize, `2` = true fullscreen) to `dispatch fullscreen <arg>`.
+pub const fn hypr_fullscreen_dispatcher_arg(json_mode: i32) -> i32 {
+    if json_mode == 1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Build Lua script to cleanly unset fullscreen on an obstructing window under Hyprland >= 0.57.
+pub fn build_hypr_unset_fullscreen_lua(client: &HyprClient) -> Option<String> {
+    if client.fullscreen == 0 || client.address.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "hl.dispatch(hl.dsp.window.fullscreen({{ window = 'address:{}', action = 'unset' }}))",
+        client.address
+    ))
+}
+
+/// Build legacy `--batch` command to un-fullscreen an obstructing client matching its exact mode (`0` or `1`).
+pub fn build_hypr_unset_fullscreen_legacy_batch(client: &HyprClient) -> Option<String> {
+    if client.fullscreen == 0 || client.address.is_empty() {
+        return None;
+    }
+    let arg = hypr_fullscreen_dispatcher_arg(client.fullscreen);
+    Some(format!(
+        "dispatch focuswindow address:{}; dispatch fullscreen {arg}",
+        client.address
+    ))
+}
+
+/// Build batch command to focus and raise the `mpv` window cleanly to the top of the stack.
+pub fn build_hypr_focus_front_batch(mpv: &HyprClient) -> String {
+    format!(
+        "dispatch focuswindow address:{}; dispatch alterzorder top,address:{}; dispatch bringactivetotop",
+        mpv.address, mpv.address
+    )
+}
+
+/// Find any fullscreened non-`mpv` Sway node obstructing focus.
+pub fn find_obstructing_sway_fullscreen_con(node: &SwayNode, mpv_con_id: i64) -> Option<i64> {
+    if node.id != mpv_con_id && node.fullscreen_mode != 0 && node.pid.is_some() {
+        return Some(node.id);
+    }
+    for child in node.floating_nodes.iter().chain(node.nodes.iter()) {
+        if let Some(found) = find_obstructing_sway_fullscreen_con(child, mpv_con_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Bring a newly launched visible `mpv` window in front of fullscreen terminals and apply PiP/fullscreen.
+/// Returns `Some((window_id, previous_mode))` if an obstructing terminal fullscreen was temporarily yielded.
+pub async fn bring_player_to_front(
+    player_pid: Option<u32>,
+    corner_idx: usize,
+    auto_pip: bool,
+    auto_fullscreen: bool,
+) -> (PipApplyOutcome, Option<(String, i32)>) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (player_pid, corner_idx, auto_pip, auto_fullscreen);
+        (PipApplyOutcome::NotNeeded, None)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match detect_linux_pip_backend() {
+            LinuxPipBackend::Hyprland => {
+                let Some(mpv) = find_mapped_hypr_client(player_pid, true).await else {
+                    return (PipApplyOutcome::WindowNotFound, None);
+                };
+
+                let mut yielded: Option<(String, i32)> = None;
+                if let Ok(clients) = hyprctl_json::<Vec<HyprClient>>("clients").await {
+                    if let Some(obs) = find_obstructing_fullscreen_client(&clients, &mpv) {
+                        let lua = build_hypr_unset_fullscreen_lua(obs);
+                        let legacy = build_hypr_unset_fullscreen_legacy_batch(obs);
+                        let _ = exec_hypr_script_or_batch(lua, legacy).await;
+                        yielded = Some((obs.address.clone(), obs.fullscreen));
+                    }
+                }
+
+                let focus_batch = build_hypr_focus_front_batch(&mpv);
+                let _ = tokio::process::Command::new("hyprctl")
+                    .args(["--batch", &focus_batch])
+                    .output()
+                    .await;
+
+                let outcome = if auto_pip {
+                    apply_hyprland_pip(true, corner_idx, player_pid, false).await
+                } else if auto_fullscreen {
+                    apply_hyprland_fullscreen(true, player_pid, false).await
+                } else {
+                    PipApplyOutcome::Applied
+                };
+                (outcome, yielded)
+            }
+            LinuxPipBackend::Sway => {
+                let Some(con_id) = find_sway_con(player_pid, true).await else {
+                    return (PipApplyOutcome::WindowNotFound, None);
+                };
+
+                let mut yielded: Option<(String, i32)> = None;
+                if let Ok(tree) = swaymsg_json::<SwayNode>("get_tree").await {
+                    if let Some(obs_id) = find_obstructing_sway_fullscreen_con(&tree, con_id) {
+                        let cmd = format!("[con_id={obs_id}] fullscreen disable");
+                        let _ = tokio::process::Command::new("swaymsg")
+                            .arg(&cmd)
+                            .output()
+                            .await;
+                        yielded = Some((format!("sway:{obs_id}"), 1));
+                    }
+                }
+
+                let focus_cmd = format!("[con_id={con_id}] focus");
+                let _ = tokio::process::Command::new("swaymsg")
+                    .arg(&focus_cmd)
+                    .output()
+                    .await;
+
+                let outcome = if auto_pip {
+                    apply_sway_pip(true, corner_idx, player_pid, false).await
+                } else if auto_fullscreen {
+                    apply_sway_fullscreen(true, player_pid, false).await
+                } else {
+                    PipApplyOutcome::Applied
+                };
+                (outcome, yielded)
+            }
+            LinuxPipBackend::UnsupportedWayland(de) => {
+                (PipApplyOutcome::UnsupportedCompositor(de), None)
+            }
+            LinuxPipBackend::X11OrNative => (PipApplyOutcome::NotNeeded, None),
+        }
+    }
+}
+
+/// Restore a previously fullscreened/maximized terminal window when playback exits.
+pub async fn restore_yielded_fullscreen(address: &str, prev_mode: i32) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (address, prev_mode);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if address.is_empty() || prev_mode == 0 {
+            return;
+        }
+        if let Some(sway_id) = address.strip_prefix("sway:") {
+            if let Ok(cid) = sway_id.parse::<i64>() {
+                let cmd = format!("[con_id={cid}] fullscreen enable, focus");
+                let _ = tokio::process::Command::new("swaymsg")
+                    .arg(&cmd)
+                    .output()
+                    .await;
+            }
+            return;
+        }
+        match detect_linux_pip_backend() {
+            LinuxPipBackend::Hyprland => {
+                if let Ok(clients) = hyprctl_json::<Vec<HyprClient>>("clients").await {
+                    // Only restore if the terminal window still exists and is currently un-fullscreened
+                    if let Some(term) = clients.iter().find(|c| c.mapped && c.address == address) {
+                        if term.fullscreen == 0 {
+                            let arg = hypr_fullscreen_dispatcher_arg(prev_mode);
+                            let batch = format!(
+                                "dispatch focuswindow address:{address}; dispatch fullscreen {arg}"
+                            );
+                            let _ = tokio::process::Command::new("hyprctl")
+                                .args(["--batch", &batch])
+                                .output()
+                                .await;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Unpin/unfloat if needed and toggle compositor fullscreen on Linux Wayland compositors.
 pub async fn apply_linux_fullscreen(
     enable: bool,
@@ -985,6 +1193,7 @@ mod tests {
                 pinned: false,
                 fullscreen: 0,
                 monitor: 0,
+                workspace: HyprWorkspaceRef { id: 1 },
                 class: "kitty".to_string(),
                 pid: 1001,
             },
@@ -995,6 +1204,7 @@ mod tests {
                 pinned: false,
                 fullscreen: 0,
                 monitor: 0,
+                workspace: HyprWorkspaceRef { id: 1 },
                 class: "mpv".to_string(),
                 pid: 2002,
             },
@@ -1009,6 +1219,43 @@ mod tests {
     }
 
     #[test]
+    fn test_obstructing_fullscreen_terminal_yields_to_mpv_front() {
+        let term = HyprClient {
+            address: "0xaaa".to_string(),
+            mapped: true,
+            floating: false,
+            pinned: false,
+            fullscreen: 1, // Maximize / Super+V
+            monitor: 0,
+            workspace: HyprWorkspaceRef { id: 2 },
+            class: "kitty".to_string(),
+            pid: 1001,
+        };
+        let mpv = HyprClient {
+            address: "0xbbb".to_string(),
+            mapped: true,
+            floating: false,
+            pinned: false,
+            fullscreen: 0,
+            monitor: 0,
+            workspace: HyprWorkspaceRef { id: 2 },
+            class: PHAENNA_WAYLAND_APP_ID.to_string(),
+            pid: 2002,
+        };
+        let clients = vec![term.clone(), mpv.clone()];
+        let obs = find_obstructing_fullscreen_client(&clients, &mpv).unwrap();
+        assert_eq!(obs.address, "0xaaa");
+        assert_eq!(hypr_fullscreen_dispatcher_arg(1), 1);
+        assert_eq!(hypr_fullscreen_dispatcher_arg(2), 0);
+        let unset_lua = build_hypr_unset_fullscreen_lua(obs).unwrap();
+        assert!(unset_lua.contains("address:0xaaa"));
+        assert!(unset_lua.contains("action = 'unset'"));
+        let focus_batch = build_hypr_focus_front_batch(&mpv);
+        assert!(focus_batch.contains("focuswindow address:0xbbb"));
+        assert!(focus_batch.contains("bringactivetotop"));
+    }
+
+    #[test]
     fn test_hypr_lua_scripts_use_address_selector_and_valid_actions() {
         let c = HyprClient {
             address: "0xdeadbeef".to_string(),
@@ -1017,6 +1264,7 @@ mod tests {
             pinned: false,
             fullscreen: 2,
             monitor: 0,
+            workspace: HyprWorkspaceRef::default(),
             class: PHAENNA_WAYLAND_APP_ID.to_string(),
             pid: 4242,
         };

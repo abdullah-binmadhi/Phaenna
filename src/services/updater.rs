@@ -63,14 +63,438 @@ pub struct GitHubRelease {
     pub assets: Vec<ReleaseAsset>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
     pub download_url: String,
     pub asset_name: String,
     pub release_notes: Option<String>,
+    #[serde(default)]
+    pub simple_notes: Vec<String>,
     pub is_homebrew: bool,
+}
+
+/// Persisted state tracking the last seen build SHA/version and any pending Post-Update "What's New" popup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastSeenBuild {
+    pub last_seen_sha: String,
+    pub last_seen_version: String,
+    #[serde(default)]
+    pub pending_whats_new: Vec<String>,
+    #[serde(default)]
+    pub updated_to_label: Option<String>,
+}
+
+const BUILTIN_CURRENT_RELEASE_NOTES: &[&str] = &[
+    "[NEW] Two-Click Preview & Music Inspector: Click any song, album, or artist once to preview its cover art, details, and tracklist without interrupting your music, then double-click (or press Enter) to play or open. How to use: Click an item in the Music tab (7) or inside a popup to inspect it on the right drawer; press 'd' anytime to show or hide the drawer.",
+    "[NEW] Watch Music Videos in Full Video Mode: Music Videos on Artist profiles and Search results now open in a dedicated mpv video window with synced audio. How to use: Switch to the Videos tab on an Artist page (or select any video) and double-click or press [Watch] in the inspector.",
+    "[NEW] 18 Calibrated Equalizer Profiles & Clean Preset Menu: Choose curated profiles like Harman Target, Warm Tube, Classical, Jazz, Rock, Hip-Hop, Lo-Fi, and Equal Loudness from a tidy dropdown menu without clutter. How to use: Press 'e' in the Music tab (or click [EQ:] at the bottom), press 'p' to switch presets, and 'w' to save your custom curve.",
+    "[IMPROVED] Full-Width Header, Clearer Layout & Front-Focused Videos: Placed your YouTube login handle above the top tabs so names never get cut off, enlarged Artist & Preview thumbnails, balanced the bottom player bar, and ensured videos launch in front of fullscreen terminals. How to use: Click your account badge at the very top (or press 'L') to switch accounts.",
+    "[NEW] Plain-English Update & What's New Popup: Updates now summarize everything new, improved, and fixed in plain language with quick navigation tips, both after updating and anytime from Settings. How to use: Open Settings ('s' or ',') and choose 'What's New & Release Notes' whenever you want a refresher.",
+    "[FIXED] Instant Playback & Reply Threads: Fixed songs pausing at 0:00 until pressing Space, removed duplicate Top Songs lists on Artist pages, and enabled double-clicking any main comment or reply to respond directly. How to use: Double-click any comment in a video detail view to reply immediately.",
+];
+
+/// Return plain-English release highlights for the currently running Phaenna build.
+pub fn default_current_release_notes() -> Vec<String> {
+    BUILTIN_CURRENT_RELEASE_NOTES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Return a readable display label for the currently running binary version.
+pub fn current_display_version_label() -> String {
+    let ver = env!("CARGO_PKG_VERSION");
+    let sha = current_build_sha();
+    if sha != "unknown" && !sha.is_empty() {
+        format!("v{} ({})", ver, short_sha(sha))
+    } else {
+        format!("v{}", ver)
+    }
+}
+
+/// Translate raw GitHub Release notes or commit summaries into up to 6 plain-English,
+/// jargon-free bullet points prefixed with `[NEW]`, `[FIXED]`, or `[IMPROVED]`.
+pub fn simplify_release_notes(raw_body: &str) -> Vec<String> {
+    let mut bullets: Vec<String> = Vec::new();
+
+    for (start_tag, end_tag) in [
+        ("<!-- phaenna-notes-start -->", "<!-- phaenna-notes-end -->"),
+        ("<!-- solus-notes-start -->", "<!-- solus-notes-end -->"),
+    ] {
+        if let (Some(start_idx), Some(end_idx)) = (raw_body.find(start_tag), raw_body.find(end_tag)) {
+            let inner_start = start_idx + start_tag.len();
+            if inner_start < end_idx {
+                for line in raw_body[inner_start..end_idx].lines() {
+                    for translated in translate_note_lines(line) {
+                        push_unique_bullet(&mut bullets, translated);
+                    }
+                }
+            }
+        }
+        if !bullets.is_empty() {
+            break;
+        }
+    }
+
+    if bullets.is_empty() {
+        for line in raw_body.lines() {
+            for translated in translate_note_lines(line) {
+                push_unique_bullet(&mut bullets, translated);
+            }
+            if bullets.len() >= 6 {
+                break;
+            }
+        }
+    }
+
+    bullets.truncate(6);
+    if bullets.is_empty() {
+        bullets.push(
+            "[IMPROVED] Smoother video playback, cleaner YouTube Music browsing, and stability fixes."
+                .to_string(),
+        );
+    }
+    bullets
+}
+
+fn push_unique_bullet(bullets: &mut Vec<String>, candidate: String) {
+    if bullets.len() >= 6 {
+        return;
+    }
+    let norm = candidate.to_ascii_lowercase();
+    if !bullets.iter().any(|b| b.to_ascii_lowercase() == norm) {
+        bullets.push(candidate);
+    }
+}
+
+fn translate_note_lines(raw_line: &str) -> Vec<String> {
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("<!--")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("Full Changelog")
+        || trimmed.starts_with("**Full Changelog**")
+    {
+        return Vec::new();
+    }
+
+    let mut line = trimmed.trim_start_matches(['-', '*', '+', '•']).trim();
+    if let Some((num, rest)) = line.split_once('.') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            line = rest.trim();
+        }
+    }
+    if line.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some(rest) = line.strip_prefix("Automated build for commit") {
+        if let Some((_, msg)) = rest.split_once(':') {
+            line = msg.trim();
+        }
+    }
+    if line.is_empty() {
+        return Vec::new();
+    }
+
+    for prefix in ["Simple:", "simple:", "Note:", "note:"] {
+        if let Some(custom) = line.strip_prefix(prefix) {
+            let clean = custom.trim();
+            if !clean.is_empty() {
+                if clean.starts_with("[NEW]")
+                    || clean.starts_with("[FIXED]")
+                    || clean.starts_with("[IMPROVED]")
+                {
+                    return vec![ensure_period(clean)];
+                }
+                return vec![format!("[IMPROVED] {}", ensure_period(clean))];
+            }
+        }
+    }
+
+    for badge in ["[NEW]", "[FIXED]", "[IMPROVED]"] {
+        if let Some(rest) = line.strip_prefix(badge) {
+            let cleaned = strip_github_trailers(rest.trim());
+            if !cleaned.is_empty() {
+                return vec![format!("{} {}", badge, ensure_period(&cleaned))];
+            }
+        }
+    }
+
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("merge pull request")
+        || lower.starts_with("merge branch")
+        || lower.starts_with("chore")
+        || lower.starts_with("ci:")
+        || lower.starts_with("ci(")
+        || lower.starts_with("test:")
+        || lower.starts_with("test(")
+        || lower.starts_with("tests:")
+        || lower.starts_with("docs:")
+        || lower.starts_with("docs(")
+        || lower.starts_with("style:")
+        || lower.starts_with("build:")
+        || lower.starts_with("bump ")
+    {
+        return Vec::new();
+    }
+
+    let badge = if lower.starts_with("feat")
+        || lower.starts_with("add ")
+        || lower.starts_with("added ")
+        || lower.starts_with("introduce")
+    {
+        "[NEW]"
+    } else if lower.starts_with("fix")
+        || lower.starts_with("resolve")
+        || lower.starts_with("prevent")
+        || lower.starts_with("repair")
+        || lower.contains("bug")
+        || lower.contains("crash")
+    {
+        "[FIXED]"
+    } else {
+        "[IMPROVED]"
+    };
+
+    let stripped = strip_conventional_prefix(line);
+    let stripped = strip_github_trailers(&stripped);
+    if stripped.is_empty() {
+        return Vec::new();
+    }
+
+    let s_lower = stripped.to_ascii_lowercase();
+    let mut matched = Vec::new();
+
+    if s_lower.contains("preview") || s_lower.contains("inspector") || s_lower.contains("two-click") {
+        matched.push(format!(
+            "{} Clean Two-Click Preview & Inspector: Single-clicking songs or albums previews their cover and details without pausing playback; double-click (or press Enter) to play or open. How to use: Click any item in Music (7) to preview it on the right drawer, and press 'd' to toggle the drawer.",
+            badge
+        ));
+    }
+    if s_lower.contains("eq") || s_lower.contains("equalizer") || s_lower.contains("harman") {
+        matched.push(format!(
+            "{} 10-Band Audiophile Equalizer & Preset Menu: Switch between 18 tuned presets (like Harman Target, Warm Tube, Jazz, and Bass+) from a clean dropdown menu. How to use: Press 'e' in the Music tab (or click [EQ:] below) and press 'p' to browse presets.",
+            badge
+        ));
+    }
+    if s_lower.contains("mpv video") || s_lower.contains("music video") {
+        matched.push(format!(
+            "{} Music Videos Play With Full Video: Double-clicking a Music Video now opens the video window cleanly alongside lossless audio tracks. How to use: Open an Artist's Videos tab or search results and double-click any video.",
+            badge
+        ));
+    }
+    if s_lower.contains("fullscreen") || s_lower.contains("super+v") || s_lower.contains("front") {
+        matched.push(format!(
+            "{} Video Windows Always Open in Front: Playing a video while your terminal is maximized or fullscreen now brings the video right to the front and restores your terminal fullscreen when done. How to use: Launch any video normally—no extra shortcuts needed.",
+            badge
+        ));
+    }
+    if s_lower.contains("comment") || s_lower.contains("reply") || s_lower.contains("subcomment") {
+        matched.push(format!(
+            "{} Easier Comment Replies: Double-click any main comment or nested reply to respond right away, and single-click comments to expand or collapse replies. How to use: Open comments on a video or press 'C' in playback and double-click any comment.",
+            badge
+        ));
+    }
+    if (s_lower.contains("update") || s_lower.contains("what's new"))
+        && (s_lower.contains("plain") || s_lower.contains("popup") || s_lower.contains("solus"))
+    {
+        matched.push(format!(
+            "{} Plain-English Update Summaries: Updates now show clear, jargon-free notes explaining what changed and how to use new features. How to use: Open Settings ('s') and pick 'What's New & Release Notes' anytime.",
+            badge
+        ));
+    }
+    if !matched.is_empty() {
+        return matched;
+    }
+
+    let humanized = humanize_free_text(&stripped);
+    if humanized.len() < 4 {
+        return Vec::new();
+    }
+    vec![format!("{} {}", badge, ensure_period(&humanized))]
+}
+
+fn strip_conventional_prefix(line: &str) -> String {
+    if let Some((head, tail)) = line.split_once(':') {
+        let h = head.trim().to_ascii_lowercase();
+        let known = [
+            "feat", "fix", "perf", "refactor", "ui", "audio", "playback", "music", "update",
+            "updater", "improve", "remote", "network", "settings",
+        ];
+        if known
+            .iter()
+            .any(|k| h == *k || h.starts_with(&format!("{k}(")) || h.starts_with(&format!("{k}!")))
+        {
+            return tail.trim().to_string();
+        }
+    }
+    line.trim().to_string()
+}
+
+fn strip_github_trailers(line: &str) -> String {
+    let mut s = line.trim().to_string();
+    if let Some(idx) = s.find(" by @") {
+        s.truncate(idx);
+    }
+    if let Some(idx) = s.find(" in https://") {
+        s.truncate(idx);
+    }
+    if let Some(open) = s.rfind("(#") {
+        if s.ends_with(')') && s[open + 2..s.len() - 1].chars().all(|c| c.is_ascii_digit()) {
+            s.truncate(open);
+        }
+    }
+    s.trim().to_string()
+}
+
+fn humanize_free_text(input: &str) -> String {
+    let mut words = Vec::new();
+    for raw_word in input.split_whitespace() {
+        let clean = raw_word.trim_matches(['`', '*']);
+        if clean.is_empty()
+            || clean.contains("src/")
+            || clean.contains(".rs")
+            || clean.contains("::")
+            || clean.starts_with("0x")
+        {
+            continue;
+        }
+        words.push(clean);
+    }
+    let joined = words.join(" ");
+    let mut chars = joined.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn ensure_period(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+/// Path to `last_seen_build.json` used to trigger the one-time Post-Update "What's New" welcome popup.
+pub fn last_seen_build_path() -> Option<PathBuf> {
+    crate::config::Config::config_dir()
+        .ok()
+        .map(|d| d.join("last_seen_build.json"))
+}
+
+/// Save plain-English release notes before restart so the next launch shows "What's New & Fixed".
+pub fn record_pending_post_update_welcome(info: &UpdateInfo) {
+    if let Some(path) = last_seen_build_path() {
+        let _ = record_pending_post_update_welcome_at(&path, info);
+    }
+}
+
+pub fn record_pending_post_update_welcome_at(
+    path: &Path,
+    info: &UpdateInfo,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let notes = if info.simple_notes.is_empty() {
+        simplify_release_notes(info.release_notes.as_deref().unwrap_or(""))
+    } else {
+        info.simple_notes.clone()
+    };
+    let state = LastSeenBuild {
+        last_seen_sha: current_build_sha().to_string(),
+        last_seen_version: info.latest_version.clone(),
+        pending_whats_new: notes,
+        updated_to_label: Some(info.latest_version.clone()),
+    };
+    let json = serde_json::to_string_pretty(&state)?;
+    std::fs::write(path, json)
+}
+
+/// Consume pending Post-Update Welcome notes on startup, or detect an external upgrade (`cargo install` / Homebrew).
+pub fn check_or_take_post_update_welcome() -> Option<(String, Vec<String>)> {
+    let path = last_seen_build_path()?;
+    check_or_take_post_update_welcome_at(
+        &path,
+        env!("CARGO_PKG_VERSION"),
+        current_build_sha(),
+    )
+}
+
+pub fn check_or_take_post_update_welcome_at(
+    path: &Path,
+    running_version: &str,
+    running_sha: &str,
+) -> Option<(String, Vec<String>)> {
+    let running_label = if running_sha != "unknown" && !running_sha.is_empty() {
+        format!(
+            "v{} ({})",
+            running_version.trim_start_matches(['v', 'V']),
+            short_sha(running_sha)
+        )
+    } else {
+        format!("v{}", running_version.trim_start_matches(['v', 'V']))
+    };
+
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let initial = LastSeenBuild {
+            last_seen_sha: running_sha.to_string(),
+            last_seen_version: running_version.to_string(),
+            pending_whats_new: Vec::new(),
+            updated_to_label: None,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&initial) {
+            let _ = std::fs::write(path, json);
+        }
+        return None;
+    };
+
+    let Ok(mut state) = serde_json::from_str::<LastSeenBuild>(&raw) else {
+        return None;
+    };
+
+    if !state.pending_whats_new.is_empty() {
+        let notes = std::mem::take(&mut state.pending_whats_new);
+        let label = state
+            .updated_to_label
+            .take()
+            .unwrap_or_else(|| running_label.clone());
+        state.last_seen_sha = running_sha.to_string();
+        state.last_seen_version = running_version.to_string();
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
+        }
+        return Some((label, notes));
+    }
+
+    let version_changed = !state.last_seen_version.is_empty()
+        && state.last_seen_version.trim_start_matches(['v', 'V'])
+            != running_version.trim_start_matches(['v', 'V']);
+    let sha_changed = !state.last_seen_sha.is_empty()
+        && state.last_seen_sha != "unknown"
+        && running_sha != "unknown"
+        && !state.last_seen_sha.eq_ignore_ascii_case(running_sha);
+
+    if version_changed || sha_changed {
+        state.last_seen_sha = running_sha.to_string();
+        state.last_seen_version = running_version.to_string();
+        state.updated_to_label = None;
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
+        }
+        return Some((running_label, default_current_release_notes()));
+    }
+
+    None
 }
 
 pub fn parse_semver(ver: &str) -> Option<(u32, u32, u32)> {
@@ -245,12 +669,19 @@ pub fn evaluate_release_update(
         .iter()
         .find(|a| a.name == target && a.size >= MIN_BINARY_BYTES)?;
 
+    let cleaned_notes = clean_release_notes(release.body);
+    let simple_notes = cleaned_notes
+        .as_deref()
+        .map(simplify_release_notes)
+        .unwrap_or_else(default_current_release_notes);
+
     Some(UpdateInfo {
         current_version: display_curr,
         latest_version: display_latest,
         download_url: asset.browser_download_url.clone(),
         asset_name: asset.name.clone(),
-        release_notes: clean_release_notes(release.body),
+        release_notes: cleaned_notes,
+        simple_notes,
         is_homebrew: is_homebrew_install(),
     })
 }
@@ -596,6 +1027,7 @@ async fn download_and_install_inner(
 }
 
 pub fn spawn_self_update(client: reqwest::Client, info: UpdateInfo, tx: Sender<AppMessage>) {
+    record_pending_post_update_welcome(&info);
     tokio::spawn(async move {
         let target_version = info.latest_version.clone();
         match download_and_install_inner(&client, &info, &tx).await {
@@ -710,5 +1142,37 @@ mod tests {
         assert_eq!(range_header_value(0), None);
         assert_eq!(range_header_value(4096).as_deref(), Some("bytes=4096-"));
         assert!((compute_progress_pct(8_000_000, 16_000_000) - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_simplify_release_notes_and_post_update_welcome_state() {
+        let raw = "<!-- phaenna-sha:1234567abcdef1234567abcdef1234567abcdef12 -->\nAutomated build for commit `1234567`: feat(music): add 10-band eq presets and harman curve";
+        let notes = simplify_release_notes(raw);
+        assert!(!notes.is_empty());
+        assert!(notes[0].contains("[NEW]"));
+        assert!(notes[0].contains("How to use:"));
+        assert!(!notes[0].contains("src/"));
+
+        let tmp = std::env::temp_dir().join(format!("phaenna_update_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        // First run creates baseline without popup
+        assert!(check_or_take_post_update_welcome_at(&tmp, "1.0.0", "1111111").is_none());
+
+        let info = UpdateInfo {
+            current_version: "v1.0.0 (1111111)".to_string(),
+            latest_version: "main@2222222".to_string(),
+            download_url: "https://example.com/phaenna".to_string(),
+            asset_name: "phaenna-linux-x86_64".to_string(),
+            release_notes: Some(raw.to_string()),
+            simple_notes: notes.clone(),
+            is_homebrew: false,
+        };
+        record_pending_post_update_welcome_at(&tmp, &info).unwrap();
+        let welcome = check_or_take_post_update_welcome_at(&tmp, "1.0.0", "2222222").unwrap();
+        assert_eq!(welcome.0, "main@2222222");
+        assert_eq!(welcome.1, notes);
+        // Consumed once so subsequent launch doesn't re-show unless upgraded again
+        assert!(check_or_take_post_update_welcome_at(&tmp, "1.0.0", "2222222").is_none());
+        let _ = std::fs::remove_file(&tmp);
     }
 }

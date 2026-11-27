@@ -39,6 +39,7 @@ pub enum HubActionId {
     UploadRadar,
     AnalysisDashboard,
     CheckUpdates,
+    WhatsNewNotes,
     AutoUpdateMode,
 }
 
@@ -286,6 +287,14 @@ pub fn get_hub_items(state: &AppState) -> Vec<HubItem> {
             description: "Check upstream GitHub Releases and self-update cleanly.",
         },
         HubItem {
+            id: HubActionId::WhatsNewNotes,
+            category: "ACCOUNT & TOOLS",
+            label: "What's New & Release Notes",
+            keywords: "whats new release notes changelog update fixes features plain english",
+            badge: "[ View Notes ]".to_string(),
+            description: "Open a clean, jargon-free popup showing what is new, fixed, and how to use updated features.",
+        },
+        HubItem {
             id: HubActionId::AutoUpdateMode,
             category: "ACCOUNT & TOOLS",
             label: "Auto-Update Mode",
@@ -468,6 +477,9 @@ mod tests {
         let filtered = filtered_hub_items(&st);
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].id, HubActionId::SponsorBlockMode);
+
+        st.settings_query = "release notes".to_string();
+        assert!(filtered_hub_items(&st).iter().any(|it| it.id == HubActionId::WhatsNewNotes));
 
         st.settings_query = "card size".to_string();
         let grid_filtered = filtered_hub_items(&st);
