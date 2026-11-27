@@ -475,14 +475,25 @@ fn render_shorts_filter_bar(frame: &mut Frame, bar_area: Rect, state: &AppState)
 
 pub fn render_home_screen(frame: &mut Frame, state: &mut AppState, modal_rect: Option<Rect>) {
     state.home_channel_hitboxes.clear();
-    let [top_area, hero_area, mut grid_area, _footer_area] = home_layout(frame.area());
-    render_top_bar(frame, top_area, state);
-
     let active_cat = state
         .categories
         .get(state.active_category)
         .map(|(c, _)| *c)
         .unwrap_or(Category::Recommended);
+
+    if active_cat == Category::Music
+        && state.music.section == crate::state::YtmSection::Karaoke
+        && state.music.karaoke.fullscreen
+    {
+        state.top_account_hitbox = None;
+        state.top_whats_new_hitbox = None;
+        state.live_playback.now_playing_hitboxes.clear();
+        crate::ui::music::render_music_workspace(frame, frame.area(), state, modal_rect);
+        return;
+    }
+
+    let [top_area, hero_area, mut grid_area, _footer_area] = home_layout(frame.area());
+    render_top_bar(frame, top_area, state);
 
     if active_cat == Category::Music {
         state.live_playback.now_playing_hitboxes.clear();

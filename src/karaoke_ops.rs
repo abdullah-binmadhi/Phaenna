@@ -241,6 +241,7 @@ async fn persist_current_track_pref(state: &mut AppState, pool: &SqlitePool) {
         lyric_offset_ms: state.music.karaoke.lyric_offset_ms,
         vocal_mode: state.music.karaoke.vocal_mode.as_u8(),
         speed_pct: state.music.karaoke.speed_pct,
+        sweep_speed_pct: state.music.karaoke.sweep_speed_pct,
         loop_start_ms: state.music.karaoke.loop_start_ms,
         loop_end_ms: state.music.karaoke.loop_end_ms,
     };
@@ -284,6 +285,11 @@ pub async fn play_karaoke_entry_at(
     state.music.karaoke.lyric_offset_ms = pref.lyric_offset_ms;
     state.music.karaoke.vocal_mode = KaraokeVocalMode::from_u8(pref.vocal_mode);
     state.music.karaoke.speed_pct = pref.speed_pct;
+    state.music.karaoke.sweep_speed_pct = if pref.sweep_speed_pct == 0 {
+        100
+    } else {
+        pref.sweep_speed_pct.clamp(50, 200)
+    };
     state.music.karaoke.loop_start_ms = pref.loop_start_ms;
     state.music.karaoke.loop_end_ms = pref.loop_end_ms;
 
@@ -414,6 +420,13 @@ pub async fn handle_karaoke_hit(
         }
         KaraokeHit::ToggleFocus => {
             state.music.karaoke.stage_focus = !state.music.karaoke.stage_focus;
+            state.kitty_flush_needed = true;
+        }
+        KaraokeHit::ToggleFullscreen => {
+            state.music.karaoke.fullscreen = !state.music.karaoke.fullscreen;
+            if !state.music.karaoke.fullscreen {
+                state.music.karaoke.show_compact_setlist = false;
+            }
             state.kitty_flush_needed = true;
         }
         KaraokeHit::ToggleCompactSetlist => {
@@ -635,6 +648,17 @@ pub async fn handle_karaoke_hit(
             apply_karaoke_dsp_chain(state);
             persist_current_track_pref(state, pool).await;
             state.show_toast(format!("Practice Tempo: {:.2}x", next as f64 / 100.0));
+        }
+        KaraokeHit::SweepSpeedDelta(delta) => {
+            let next = (state.music.karaoke.sweep_speed_pct as i32 + delta as i32).clamp(50, 200) as u16;
+            state.music.karaoke.sweep_speed_pct = next;
+            persist_current_track_pref(state, pool).await;
+            state.show_toast(format!("Word Sweep Speed: {:.1}x", next as f64 / 100.0));
+        }
+        KaraokeHit::ResetSweepSpeed => {
+            state.music.karaoke.sweep_speed_pct = 100;
+            persist_current_track_pref(state, pool).await;
+            state.show_toast("Word Sweep Speed: 1.0x (Reset)");
         }
         KaraokeHit::OffsetDelta(delta) => {
             state.music.karaoke.lyric_offset_ms =
@@ -924,23 +948,31 @@ pub async fn handle_karaoke_key(
             state.kitty_flush_needed = true;
         }
         KeyCode::Tab => {
-            if state.music.karaoke.stage_focus || state.music.karaoke.setlist_rect.width == 0 {
+            if state.music.karaoke.fullscreen
+                || state.music.karaoke.stage_focus
+                || state.music.karaoke.setlist_rect.width == 0
+            {
                 handle_karaoke_hit(KaraokeHit::ToggleCompactSetlist, state, pool, tx, client).await;
             } else {
                 state.active_category = (state.active_category + 1) % state.categories.len();
             }
         }
         KeyCode::BackTab => {
+            state.music.karaoke.fullscreen = false;
             state.active_category =
                 (state.active_category + state.categories.len() - 1) % state.categories.len();
         }
         KeyCode::Char(d @ '1'..='7') => {
+            state.music.karaoke.fullscreen = false;
             let idx = (d as usize) - ('1' as usize);
             state.active_category = idx.min(state.categories.len() - 1);
         }
         KeyCode::Char('m') => handle_karaoke_hit(KaraokeHit::ToggleMode, state, pool, tx, client).await,
         KeyCode::Char('f') => handle_karaoke_hit(KaraokeHit::ToggleFocus, state, pool, tx, client).await,
+        KeyCode::Char('F') => handle_karaoke_hit(KaraokeHit::ToggleFullscreen, state, pool, tx, client).await,
         KeyCode::Char('v') => handle_karaoke_hit(KaraokeHit::CycleVocalMode, state, pool, tx, client).await,
+        KeyCode::Char('w') => handle_karaoke_hit(KaraokeHit::SweepSpeedDelta(-10), state, pool, tx, client).await,
+        KeyCode::Char('W') => handle_karaoke_hit(KaraokeHit::SweepSpeedDelta(10), state, pool, tx, client).await,
         KeyCode::Char('+') | KeyCode::Char('=') => {
             handle_karaoke_hit(KaraokeHit::PitchDelta(1), state, pool, tx, client).await;
         }
@@ -949,12 +981,20 @@ pub async fn handle_karaoke_key(
         }
         KeyCode::Char('9') => handle_karaoke_hit(KaraokeHit::SpeedDelta(-5), state, pool, tx, client).await,
         KeyCode::Char('0') => handle_karaoke_hit(KaraokeHit::SpeedDelta(5), state, pool, tx, client).await,
-        KeyCode::Char('[') => {
-            let step = if modifiers.contains(KeyModifiers::SHIFT) { -500 } else { -100 };
+        KeyCode::Char('[') | KeyCode::Char('{') => {
+            let step = if code == KeyCode::Char('{') || modifiers.contains(KeyModifiers::SHIFT) {
+                -500
+            } else {
+                -100
+            };
             handle_karaoke_hit(KaraokeHit::OffsetDelta(step), state, pool, tx, client).await;
         }
-        KeyCode::Char(']') => {
-            let step = if modifiers.contains(KeyModifiers::SHIFT) { 500 } else { 100 };
+        KeyCode::Char(']') | KeyCode::Char('}') => {
+            let step = if code == KeyCode::Char('}') || modifiers.contains(KeyModifiers::SHIFT) {
+                500
+            } else {
+                100
+            };
             handle_karaoke_hit(KaraokeHit::OffsetDelta(step), state, pool, tx, client).await;
         }
         KeyCode::Char('a') => handle_karaoke_hit(KaraokeHit::SetLoopA, state, pool, tx, client).await,
@@ -1008,6 +1048,11 @@ pub async fn handle_karaoke_key(
                 handle_karaoke_hit(KaraokeHit::CancelTapSync, state, pool, tx, client).await;
             } else if state.music.karaoke.inline_search_open {
                 state.music.karaoke.inline_search_open = false;
+            } else if state.music.karaoke.fullscreen && state.music.karaoke.show_compact_setlist {
+                state.music.karaoke.show_compact_setlist = false;
+            } else if state.music.karaoke.fullscreen {
+                state.music.karaoke.fullscreen = false;
+                state.kitty_flush_needed = true;
             } else {
                 state.music.section = YtmSection::Home;
             }

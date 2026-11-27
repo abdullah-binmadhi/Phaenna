@@ -168,12 +168,20 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             lyric_offset_ms INTEGER NOT NULL DEFAULT 0,
             vocal_mode INTEGER NOT NULL DEFAULT 0,
             speed_pct INTEGER NOT NULL DEFAULT 100,
+            sweep_speed_pct INTEGER NOT NULL DEFAULT 100,
             loop_start_ms INTEGER,
             loop_end_ms INTEGER,
             updated_at INTEGER NOT NULL
         )",
     )
     .execute(pool)
+    .await?;
+    ensure_column_exists(
+        pool,
+        "karaoke_track_prefs",
+        "sweep_speed_pct",
+        "INTEGER NOT NULL DEFAULT 100",
+    )
     .await?;
     Ok(())
 }

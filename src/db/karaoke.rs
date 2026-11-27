@@ -113,6 +113,7 @@ pub struct KaraokeTrackPref {
     pub lyric_offset_ms: i64,
     pub vocal_mode: u8,
     pub speed_pct: u16,
+    pub sweep_speed_pct: u16,
     pub loop_start_ms: Option<u64>,
     pub loop_end_ms: Option<u64>,
 }
@@ -125,6 +126,7 @@ impl Default for KaraokeTrackPref {
             lyric_offset_ms: 0,
             vocal_mode: 0,
             speed_pct: 100,
+            sweep_speed_pct: 100,
             loop_start_ms: None,
             loop_end_ms: None,
         }
@@ -543,7 +545,7 @@ pub async fn get_karaoke_track_pref(
     let row = sqlx::query(
         r#"
         SELECT video_id, pitch_semitones, lyric_offset_ms, vocal_mode,
-               speed_pct, loop_start_ms, loop_end_ms
+               speed_pct, sweep_speed_pct, loop_start_ms, loop_end_ms
         FROM karaoke_track_prefs WHERE video_id = ?1
         "#,
     )
@@ -555,6 +557,7 @@ pub async fn get_karaoke_track_pref(
         let pitch: i64 = r.get("pitch_semitones");
         let vocal: i64 = r.get("vocal_mode");
         let spd: i64 = r.get("speed_pct");
+        let swp: i64 = r.get("sweep_speed_pct");
         let la: Option<i64> = r.get("loop_start_ms");
         let lb: Option<i64> = r.get("loop_end_ms");
         KaraokeTrackPref {
@@ -563,6 +566,7 @@ pub async fn get_karaoke_track_pref(
             lyric_offset_ms: r.get("lyric_offset_ms"),
             vocal_mode: vocal.clamp(0, 2) as u8,
             speed_pct: spd.clamp(50, 150) as u16,
+            sweep_speed_pct: swp.clamp(50, 200) as u16,
             loop_start_ms: la.filter(|&v| v >= 0).map(|v| v as u64),
             loop_end_ms: lb.filter(|&v| v >= 0).map(|v| v as u64),
         }
@@ -578,13 +582,14 @@ pub async fn upsert_karaoke_track_pref(
         r#"
         INSERT INTO karaoke_track_prefs (
             video_id, pitch_semitones, lyric_offset_ms, vocal_mode,
-            speed_pct, loop_start_ms, loop_end_ms, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            speed_pct, sweep_speed_pct, loop_start_ms, loop_end_ms, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ON CONFLICT(video_id) DO UPDATE SET
             pitch_semitones = excluded.pitch_semitones,
             lyric_offset_ms = excluded.lyric_offset_ms,
             vocal_mode      = excluded.vocal_mode,
             speed_pct       = excluded.speed_pct,
+            sweep_speed_pct = excluded.sweep_speed_pct,
             loop_start_ms   = excluded.loop_start_ms,
             loop_end_ms     = excluded.loop_end_ms,
             updated_at      = excluded.updated_at
@@ -595,6 +600,7 @@ pub async fn upsert_karaoke_track_pref(
     .bind(pref.lyric_offset_ms)
     .bind(pref.vocal_mode as i64)
     .bind(pref.speed_pct as i64)
+    .bind(pref.sweep_speed_pct.clamp(50, 200) as i64)
     .bind(pref.loop_start_ms.map(|v| v as i64))
     .bind(pref.loop_end_ms.map(|v| v as i64))
     .bind(now)
@@ -697,6 +703,7 @@ mod tests {
                 lyric_offset_ms: 250,
                 vocal_mode: 1,
                 speed_pct: 95,
+                sweep_speed_pct: 140,
                 loop_start_ms: Some(1000),
                 loop_end_ms: Some(4000),
             },
@@ -718,6 +725,9 @@ mod tests {
         assert_eq!(items[1].lyric_offset_ms, 250);
         assert_eq!(items[1].sung_count, 1);
         assert_eq!(items[1].lyrics_status, KaraokeLyricsReadiness::SyncedWord);
+
+        let got_pref = get_karaoke_track_pref(&pool, "vid_1").await.unwrap().unwrap();
+        assert_eq!(got_pref.sweep_speed_pct, 140);
 
         let cached = get_karaoke_lyrics_cache(&pool, "vid_1")
             .await

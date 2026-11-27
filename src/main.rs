@@ -4376,6 +4376,7 @@ async fn play_music_track_at_inner(
     };
     if !from_karaoke {
         state.music.karaoke.session_active = false;
+        state.music.karaoke.fullscreen = false;
         state.music.karaoke.active_item_id = None;
         state.music.karaoke.tap_sync_active = false;
         state.music.karaoke.intermission_next_idx = None;
@@ -5365,6 +5366,9 @@ async fn handle_music_mouse_event(
                     MusicHit::SelectSection(sec) => {
                         state.music.search_editing = sec == YtmSection::Search
                             && state.music.search_query.trim().is_empty();
+                        if sec != YtmSection::Karaoke {
+                            state.music.karaoke.fullscreen = false;
+                        }
                         state.music.section = sec;
                         state.music.browse_stack.clear();
                         state.music.cursor = 0;

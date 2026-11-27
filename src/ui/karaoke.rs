@@ -6,7 +6,8 @@
 use crate::api::ytmusic::YtmLyricLine;
 use crate::db::cache::format_duration_secs;
 use crate::state::{
-    AppState, KaraokeHit, KaraokeLyricsReadiness, KaraokeMode, KaraokePlaylistEntry, ThumbPriority,
+    AppState, KaraokeHit, KaraokeLyricsReadiness, KaraokeMode, KaraokePlaylistEntry, MusicHit,
+    ThumbPriority,
 };
 use crate::ui::components::cover::render_thumbnail_cover;
 use crate::ui::music::{
@@ -32,12 +33,24 @@ pub struct KaraokeLayoutDims {
 }
 
 /// Compute balanced Karaoke body widths so neither the Lyric Stage nor the Setlist Companion
-/// feels cramped (<32 cols) or overly stretched across an ultrawide canvas.
+/// feels cramped (<30 cols) or overly stretched across an ultrawide canvas.
 pub fn karaoke_layout_dims(
     body_w: u16,
     stage_focus: bool,
+    fullscreen: bool,
     show_compact_setlist: bool,
 ) -> KaraokeLayoutDims {
+    if fullscreen {
+        return KaraokeLayoutDims {
+            compact_only_one_pane: true,
+            show_stage: true,
+            show_setlist: false,
+            stage_w: body_w,
+            setlist_w: 0,
+            corridor_w: body_w.saturating_sub(4).min(114).max(body_w.min(28)),
+        };
+    }
+
     if stage_focus {
         return KaraokeLayoutDims {
             compact_only_one_pane: true,
@@ -45,7 +58,7 @@ pub fn karaoke_layout_dims(
             show_setlist: false,
             stage_w: body_w,
             setlist_w: 0,
-            corridor_w: body_w.saturating_sub(4).min(82).max(body_w.min(24)),
+            corridor_w: body_w.saturating_sub(4).min(96).max(body_w.min(24)),
         };
     }
 
@@ -57,13 +70,13 @@ pub fn karaoke_layout_dims(
             show_setlist: show_set,
             stage_w: if show_set { 0 } else { body_w },
             setlist_w: if show_set { body_w } else { 0 },
-            corridor_w: body_w.saturating_sub(2).min(82),
+            corridor_w: body_w.saturating_sub(2).min(88),
         };
     }
 
-    let setlist_w = ((body_w as u32 * 34) / 100).clamp(32, 42) as u16;
+    let setlist_w = ((body_w as u32 * 30) / 100).clamp(30, 38) as u16;
     let stage_w = body_w.saturating_sub(setlist_w);
-    let corridor_w = stage_w.saturating_sub(4).min(82).max(stage_w.min(28));
+    let corridor_w = stage_w.saturating_sub(4).min(92).max(stage_w.min(28));
     KaraokeLayoutDims {
         compact_only_one_pane: false,
         show_stage: true,
@@ -74,47 +87,74 @@ pub fn karaoke_layout_dims(
     }
 }
 
-/// Compute exact global character cursor across a lyric line using true word spans (`words`)
-/// when available, falling back to smooth line timing otherwise.
-pub fn compute_lyric_sung_chars(
+/// Compute strictly linear word-sweep progress (`sung_chars`, normalized `0.0..=1.0`) scaled manually
+/// by `sweep_speed_pct` (`50..=200`, default `100`).
+pub fn compute_lyric_sung_chars_and_frac(
     line: &YtmLyricLine,
     pos_ms: u64,
     next_start_ms: Option<u64>,
-) -> usize {
+    sweep_speed_pct: u16,
+) -> (usize, f64) {
     let total_chars = line.text.chars().count();
     if total_chars == 0 {
-        return 0;
+        return (0, 0.0);
     }
+    let scale = (sweep_speed_pct.clamp(50, 200) as f64) / 100.0;
 
     if let Some(ref words) = line.words {
         if !words.is_empty() {
             let mut count = 0usize;
             for w in words {
                 let wlen = w.text.chars().count();
-                if pos_ms >= w.end_ms {
-                    count += wlen;
-                } else if pos_ms > w.start_ms {
-                    let dur = w.end_ms.saturating_sub(w.start_ms).max(80) as f64;
-                    let frac = ((pos_ms.saturating_sub(w.start_ms)) as f64 / dur).clamp(0.0, 1.0);
-                    count += ((frac * wlen as f64).round() as usize).min(wlen);
+                let raw_dur = w.end_ms.saturating_sub(w.start_ms).max(80) as f64;
+                let eff_dur = (raw_dur / scale).max(40.0);
+                if pos_ms <= w.start_ms {
                     break;
+                }
+                let elapsed = (pos_ms.saturating_sub(w.start_ms)) as f64;
+                if elapsed >= eff_dur {
+                    count += wlen;
                 } else {
+                    let frac = (elapsed / eff_dur).clamp(0.0, 1.0);
+                    count += ((frac * wlen as f64).round() as usize).min(wlen);
                     break;
                 }
             }
-            return count.min(total_chars);
+            let clamped = count.min(total_chars);
+            return (clamped, (clamped as f64 / total_chars as f64).clamp(0.0, 1.0));
         }
     }
 
     if let Some(t0) = line.start_ms {
-        let p = karaoke_progress(pos_ms, t0, line.end_ms, next_start_ms);
-        ((p * total_chars as f64).round() as usize).min(total_chars)
+        let base_p = if (scale - 1.0).abs() < f64::EPSILON {
+            karaoke_progress(pos_ms, t0, line.end_ms, next_start_ms)
+        } else {
+            let t1 = line
+                .end_ms
+                .filter(|&e| e > t0)
+                .or_else(|| next_start_ms.filter(|&ns| ns > t0))
+                .unwrap_or(t0.saturating_add(4000));
+            let raw_dur = t1.saturating_sub(t0).max(250) as f64;
+            let eff_dur = (raw_dur / scale).max(150.0);
+            ((pos_ms.saturating_sub(t0)) as f64 / eff_dur).clamp(0.0, 1.0)
+        };
+        let chars = ((base_p * total_chars as f64).round() as usize).min(total_chars);
+        (chars, base_p)
     } else {
-        total_chars
+        (total_chars, 1.0)
     }
 }
 
-/// Render the full dedicated Karaoke workspace inside the area beside Sidebar and above Player Bar.
+pub fn compute_lyric_sung_chars(
+    line: &YtmLyricLine,
+    pos_ms: u64,
+    next_start_ms: Option<u64>,
+    sweep_speed_pct: u16,
+) -> usize {
+    compute_lyric_sung_chars_and_frac(line, pos_ms, next_start_ms, sweep_speed_pct).0
+}
+
+/// Render the full dedicated Karaoke workspace cleanly inside `area`.
 pub fn render_karaoke_workspace(
     frame: &mut Frame,
     area: Rect,
@@ -129,9 +169,11 @@ pub fn render_karaoke_workspace(
         return;
     }
 
+    let is_full = state.music.karaoke.fullscreen;
     let dims = karaoke_layout_dims(
         area.width,
         state.music.karaoke.stage_focus,
+        is_full,
         state.music.karaoke.show_compact_setlist,
     );
 
@@ -144,6 +186,13 @@ pub fn render_karaoke_workspace(
         render_karaoke_setlist(frame, cols[1], state, modal_rect);
     } else if dims.show_stage {
         render_karaoke_stage(frame, area, state, modal_rect, dims);
+        if is_full && state.music.karaoke.show_compact_setlist && modal_rect.is_none() && area.width >= 56 && area.height >= 14 {
+            let qw = ((area.width as u32 * 32) / 100).clamp(32, 42) as u16;
+            let qh = area.height.saturating_sub(5);
+            let q_rect = Rect::new(area.x + area.width.saturating_sub(qw + 1), area.y + 1, qw, qh);
+            frame.render_widget(Clear, q_rect);
+            render_karaoke_setlist(frame, q_rect, state, modal_rect);
+        }
     } else if dims.show_setlist {
         render_karaoke_setlist(frame, area, state, modal_rect);
     }
@@ -225,8 +274,15 @@ fn render_karaoke_stage(
     let corr_x = inner.x + inner.width.saturating_sub(corr_w) / 2;
     let corr = Rect::new(corr_x, inner.y, corr_w, inner.height);
 
-    let show_hero = corr.height >= 15;
-    let footer_h: u16 = if corr.height >= 12 { 2 } else { 1 };
+    let is_full = state.music.karaoke.fullscreen;
+    let show_hero = !is_full && corr.height >= 16;
+    let footer_h: u16 = if is_full {
+        if corr.height >= 14 { 3 } else { 2 }
+    } else if corr.height >= 12 {
+        2
+    } else {
+        1
+    };
     let hero_h: u16 = if show_hero { 3 } else { 0 };
     let tap_h: u16 = if state.music.karaoke.tap_sync_active { 1 } else { 0 };
 
@@ -239,13 +295,13 @@ fn render_karaoke_stage(
             Constraint::Length(tap_h),    // Tap-to-Sync strip when active
             Constraint::Min(4),           // Lyric theatre
             Constraint::Length(1),        // Separator
-            Constraint::Length(footer_h), // Controls & hotkeys
+            Constraint::Length(footer_h), // Controls & always-visible keybind bar
         ])
         .split(corr);
 
     // 1. Top Stage Header Bar
     let top = parts[0];
-    let compact_hdr = top.width < 58;
+    let compact_hdr = top.width < 68;
     let mode_lbl = match (compact_hdr, state.music.karaoke.mode) {
         (true, KaraokeMode::Practice) => " [Practice] ",
         (true, KaraokeMode::Party) => " [Party] ",
@@ -253,21 +309,33 @@ fn render_karaoke_stage(
         (false, KaraokeMode::Party) => " [Mode: Party] ",
     };
     let focus_lbl = if state.music.karaoke.stage_focus {
-        if compact_hdr { " [Full] " } else { " [Stage: Full] " }
+        " [Split] "
     } else if compact_hdr {
         " [Focus] "
     } else {
         " [Focus (f)] "
     };
-    let setlist_lbl = " [Setlist] ";
+    let full_lbl = if is_full {
+        " [Exit Full (F)] "
+    } else if compact_hdr {
+        " [Full] "
+    } else {
+        " [Full (F)] "
+    };
+    let setlist_lbl = if is_full { " [Queue] " } else { " [Setlist] " };
     let mode_w = mode_lbl.chars().count() as u16;
-    let focus_w = focus_lbl.chars().count() as u16;
+    let full_w = full_lbl.chars().count() as u16;
+    let focus_w = if is_full {
+        0
+    } else {
+        focus_lbl.chars().count() as u16 + 1
+    };
     let set_w = if dims.compact_only_one_pane {
         setlist_lbl.chars().count() as u16 + 1
     } else {
         0
     };
-    let right_total = mode_w + 1 + focus_w + set_w;
+    let right_total = mode_w + 1 + full_w + focus_w + set_w;
     let left_w = top.width.saturating_sub(right_total + 1) as usize;
     let pl_name = state
         .music
@@ -278,7 +346,35 @@ fn render_karaoke_stage(
         .map(|p| p.name.as_str())
         .unwrap_or("Stage Queue");
 
-    let title_str = truncate_str(&format!("◈ KARAOKE · {pl_name}"), left_w.max(8));
+    let left_header_text = if is_full {
+        let entry = active_or_selected_entry(state);
+        let track_tag = state
+            .music
+            .current_track()
+            .map(|t| {
+                if t.artist.is_empty() {
+                    t.title.clone()
+                } else {
+                    format!("{} — {}", t.title, t.artist)
+                }
+            })
+            .or_else(|| entry.map(|e| format!("{} — {}", e.title, e.artist)))
+            .unwrap_or_else(|| pl_name.to_string());
+        let mic_tag = entry
+            .and_then(|e| e.singer_name.as_deref())
+            .map(|s| format!(" · Mic:{s}"))
+            .unwrap_or_default();
+        let swp_tag = if state.music.karaoke.sweep_speed_pct != 100 {
+            format!(" · Swp:{:.1}x", state.music.karaoke.sweep_speed_pct as f64 / 100.0)
+        } else {
+            String::new()
+        };
+        format!("◈ FULL KARAOKE · {track_tag}{mic_tag}{swp_tag}")
+    } else {
+        format!("◈ KARAOKE · {pl_name}")
+    };
+
+    let title_str = truncate_str(&left_header_text, left_w.max(8));
     let mut top_spans = vec![Span::styled(
         format!("{title_str:<w$}", w = left_w.max(8)),
         Style::default()
@@ -301,14 +397,29 @@ fn render_karaoke_stage(
         KaraokeHit::ToggleMode,
         (Color::Black, mode_col),
     );
+    if !is_full {
+        push_stage_pill(
+            &mut state.music.karaoke.hitboxes,
+            &mut top_spans,
+            &mut rx,
+            (top.y, top.x + top.width),
+            focus_lbl,
+            KaraokeHit::ToggleFocus,
+            (Color::White, Color::Rgb(46, 52, 68)),
+        );
+    }
     push_stage_pill(
         &mut state.music.karaoke.hitboxes,
         &mut top_spans,
         &mut rx,
         (top.y, top.x + top.width),
-        focus_lbl,
-        KaraokeHit::ToggleFocus,
-        (Color::White, Color::Rgb(46, 52, 68)),
+        full_lbl,
+        KaraokeHit::ToggleFullscreen,
+        if is_full {
+            (Color::Black, Color::Rgb(245, 190, 75))
+        } else {
+            (Color::Black, theme.accent)
+        },
     );
     if dims.compact_only_one_pane {
         push_stage_pill(
@@ -705,7 +816,8 @@ fn render_karaoke_theatre(
     let effective_pos = state.effective_playback_pos_secs();
     let pos_ms = state.music.effective_lyric_pos_ms(effective_pos);
     let active_idx = state.music.active_lyric_index(effective_pos);
-    let wide_breathing = view_h >= 14 && !state.music.karaoke.tap_sync_active;
+    let sweep_speed_pct = state.music.karaoke.sweep_speed_pct;
+    let wide_breathing = view_h >= 12 && !state.music.karaoke.tap_sync_active;
 
     struct StageVisualRow {
         spans: Vec<Span<'static>>,
@@ -713,7 +825,10 @@ fn render_karaoke_theatre(
         is_focus: bool,
     }
 
-    let text_w = (body.width.saturating_sub(6) as usize).clamp(12, 74);
+    let text_w = (body.width.saturating_sub(4) as usize).clamp(
+        12,
+        if state.music.karaoke.fullscreen { 108 } else { 80 },
+    );
     let tap_cursor = state.music.karaoke.tap_sync_stamps.len();
     let mut rows: Vec<StageVisualRow> = Vec::new();
 
@@ -789,13 +904,22 @@ fn render_karaoke_theatre(
 
         let chunks = wrap_lyric_line_with_offsets(&line.text, text_w);
         let total_chars = line.text.chars().count();
-        let sung_chars = if state.music.karaoke.tap_sync_active {
-            if is_past { total_chars } else { 0 }
+        let (sung_chars, sweep_frac) = if state.music.karaoke.tap_sync_active {
+            if is_past { (total_chars, 1.0) } else { (0, 0.0) }
         } else if is_active {
-            compute_lyric_sung_chars(line, pos_ms, next_start)
+            compute_lyric_sung_chars_and_frac(line, pos_ms, next_start, sweep_speed_pct)
         } else {
-            0
+            (0, 0.0)
         };
+
+        let spotlight_cushion = view_h >= 14 && is_active && !in_post_interlude && !state.music.karaoke.tap_sync_active;
+        if spotlight_cushion {
+            rows.push(StageVisualRow {
+                spans: Vec::new(),
+                seek_ms: None,
+                is_focus: false,
+            });
+        }
 
         for (ci, (cs, _ce, chunk)) in chunks.into_iter().enumerate() {
             let mut spans = Vec::new();
@@ -859,7 +983,7 @@ fn render_karaoke_theatre(
             } else {
                 spans.push(Span::styled(
                     chunk,
-                    Style::default().fg(Color::Rgb(135, 145, 160)),
+                    Style::default().fg(Color::Rgb(115, 125, 140)),
                 ));
             }
 
@@ -876,6 +1000,27 @@ fn render_karaoke_theatre(
                 spans,
                 seek_ms: line.start_ms,
                 is_focus: focus_line && ci == 0,
+            });
+        }
+
+        if spotlight_cushion && lyrics.is_timed && body.width >= 20 {
+            let beam_w = total_chars.clamp(18, text_w.min(54));
+            let filled = ((beam_w.saturating_sub(1)) as f64 * sweep_frac.clamp(0.0, 1.0))
+                .round() as usize;
+            let rem = beam_w.saturating_sub(filled + 1);
+            rows.push(StageVisualRow {
+                spans: vec![
+                    Span::styled("━".repeat(filled), Style::default().fg(spotify_green)),
+                    Span::styled("●", Style::default().fg(Color::White)),
+                    Span::styled("─".repeat(rem), Style::default().fg(Color::Rgb(65, 72, 88))),
+                ],
+                seek_ms: line.start_ms,
+                is_focus: false,
+            });
+            rows.push(StageVisualRow {
+                spans: Vec::new(),
+                seek_ms: None,
+                is_focus: false,
             });
         }
 
@@ -969,11 +1114,98 @@ fn render_karaoke_stage_footer(
         return;
     }
 
-    let r0 = Rect::new(area.x, area.y, area.width, 1);
+    let is_full = state.music.karaoke.fullscreen;
+    let mut row_idx = 0u16;
+
+    // In Fullscreen mode, reserve top footer row for compact transport + clickable Seek Bar
+    if is_full && area.height >= 3 {
+        let tr_row = Rect::new(area.x, area.y, area.width, 1);
+        let cur_playing = state.music.current_track().is_some();
+        let play_lbl = if cur_playing && !state.live_playback.paused && state.has_live_ipc() {
+            " || "
+        } else {
+            " ▶ "
+        };
+        let mut bx = tr_row.x;
+        let max_x = tr_row.x + tr_row.width;
+        let dark_pill = Color::Rgb(42, 48, 62);
+        let mut t_spans = Vec::new();
+        for (lbl, mhit, fg, bg) in [
+            (" |< ", MusicHit::PrevTrack, Color::White, dark_pill),
+            (play_lbl, MusicHit::TogglePlayPause, Color::Black, Color::White),
+            (" >| ", MusicHit::NextTrack, Color::White, dark_pill),
+        ] {
+            let w = lbl.chars().count() as u16;
+            if bx + w <= max_x {
+                state
+                    .music
+                    .hitboxes
+                    .push((Rect::new(bx, tr_row.y, w, 1), mhit));
+                t_spans.push(Span::styled(
+                    lbl,
+                    Style::default()
+                        .fg(fg)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                t_spans.push(Span::raw(" "));
+                bx += w + 1;
+            }
+        }
+        let dur_secs = if state.active_playback_dur > 0.0 {
+            state.active_playback_dur
+        } else {
+            state
+                .music
+                .current_track()
+                .and_then(|t| t.duration_secs)
+                .map(|d| d as f64)
+                .unwrap_or(0.0)
+        };
+        let pos_secs = if cur_playing {
+            state.effective_playback_pos_secs().clamp(0.0, dur_secs.max(state.active_playback_pos))
+        } else {
+            0.0
+        };
+        let t_left = format_duration_secs(pos_secs as u64);
+        let t_right = format_duration_secs(dur_secs as u64);
+        let rem_w = max_x.saturating_sub(bx) as usize;
+        let bar_space = rem_w.saturating_sub(t_left.len() + t_right.len() + 3);
+        if bar_space >= 8 {
+            let ratio = if dur_secs > 0.0 {
+                (pos_secs / dur_secs).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let filled = ((bar_space - 1) as f64 * ratio).round() as usize;
+            let rem = bar_space.saturating_sub(filled + 1);
+            let seek_rect = Rect::new(bx + t_left.len() as u16 + 1, tr_row.y, bar_space as u16, 1);
+            state.music.progress_bar_rect = seek_rect;
+            state.music.hitboxes.push((seek_rect, MusicHit::SeekBar));
+            t_spans.push(Span::styled(format!("{t_left} "), Style::default().fg(theme.text_dim)));
+            t_spans.push(Span::styled("━".repeat(filled), Style::default().fg(spotify_green)));
+            t_spans.push(Span::styled("●", Style::default().fg(Color::White)));
+            t_spans.push(Span::styled("─".repeat(rem), Style::default().fg(Color::Rgb(70, 76, 92))));
+            t_spans.push(Span::styled(format!(" {t_right}"), Style::default().fg(theme.text_dim)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(t_spans)), tr_row);
+        row_idx += 1;
+    }
+
+    let r0 = Rect::new(area.x, area.y + row_idx, area.width, 1);
     let mut spans = Vec::new();
     let mut bx = r0.x;
     let max_x = r0.x + r0.width;
     let dark_pill = Color::Rgb(42, 48, 62);
+    let swp_col = if state.music.karaoke.sweep_speed_pct != 100 {
+        spotify_green
+    } else {
+        theme.accent
+    };
+    let swp_lbl = format!(
+        "{:.1}x",
+        state.music.karaoke.sweep_speed_pct as f64 / 100.0
+    );
 
     match state.music.karaoke.mode {
         KaraokeMode::Practice => {
@@ -996,6 +1228,34 @@ fn render_karaoke_stage_footer(
                 &v_lbl,
                 KaraokeHit::CycleVocalMode,
                 (v_fg, v_bg),
+            );
+
+            push_stage_pill(
+                &mut state.music.karaoke.hitboxes,
+                &mut spans,
+                &mut bx,
+                (r0.y, max_x),
+                " Swp- ",
+                KaraokeHit::SweepSpeedDelta(-10),
+                (Color::White, dark_pill),
+            );
+            push_stage_pill(
+                &mut state.music.karaoke.hitboxes,
+                &mut spans,
+                &mut bx,
+                (r0.y, max_x),
+                &swp_lbl,
+                KaraokeHit::ResetSweepSpeed,
+                (swp_col, Color::Reset),
+            );
+            push_stage_pill(
+                &mut state.music.karaoke.hitboxes,
+                &mut spans,
+                &mut bx,
+                (r0.y, max_x),
+                "+ ",
+                KaraokeHit::SweepSpeedDelta(10),
+                (Color::White, dark_pill),
             );
 
             push_stage_pill(
@@ -1147,6 +1407,33 @@ fn render_karaoke_stage_footer(
                 KaraokeHit::CycleVocalMode,
                 (Color::Black, spotify_green),
             );
+            push_stage_pill(
+                &mut state.music.karaoke.hitboxes,
+                &mut spans,
+                &mut bx,
+                (r0.y, max_x),
+                " Swp- ",
+                KaraokeHit::SweepSpeedDelta(-10),
+                (Color::White, dark_pill),
+            );
+            push_stage_pill(
+                &mut state.music.karaoke.hitboxes,
+                &mut spans,
+                &mut bx,
+                (r0.y, max_x),
+                &swp_lbl,
+                KaraokeHit::ResetSweepSpeed,
+                (swp_col, Color::Reset),
+            );
+            push_stage_pill(
+                &mut state.music.karaoke.hitboxes,
+                &mut spans,
+                &mut bx,
+                (r0.y, max_x),
+                "+ ",
+                KaraokeHit::SweepSpeedDelta(10),
+                (Color::White, dark_pill),
+            );
             let k_lbl = format!(" Key {:+}st ", state.music.karaoke.pitch_semitones);
             push_stage_pill(
                 &mut state.music.karaoke.hitboxes,
@@ -1179,39 +1466,75 @@ fn render_karaoke_stage_footer(
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), r0);
+    row_idx += 1;
 
-    if area.height >= 2 {
-        let r1 = Rect::new(area.x, area.y + 1, area.width, 1);
-        let hint = match state.music.karaoke.mode {
-            KaraokeMode::Practice => fit_joined_parts(
+    // Always-visible Keybind Reminder Bar at the bottom!
+    if row_idx < area.height {
+        let r_hint = Rect::new(area.x, area.y + row_idx, area.width, 1);
+        let hint = match (is_full, state.music.karaoke.mode) {
+            (true, KaraokeMode::Practice) => fit_joined_parts(
                 &[
+                    "[F/Esc] Exit Fullscreen",
+                    "[w/W] Word Sweep Speed",
+                    "[+/-] Key",
+                    "[[ / ]] Sync Offset",
                     "[v] Vocal Cut",
+                    "[9/0] Tempo",
+                    "[a/b/x] Loop",
+                    "[t] Tap-Sync",
+                    "[Tab] Queue",
+                    "[Space] Play/Pause",
+                ],
+                " · ",
+                r_hint.width as usize,
+            ),
+            (true, KaraokeMode::Party) => fit_joined_parts(
+                &[
+                    "[F/Esc] Exit Fullscreen",
+                    "[w/W] Word Sweep Speed",
+                    "[+/-] Key",
+                    "[v] Vocal Cut",
+                    "[Tab] Queue",
+                    "[>] Next (5s Handoff)",
+                    "[m] Practice Mode",
+                    "[Space] Play/Pause",
+                ],
+                " · ",
+                r_hint.width as usize,
+            ),
+            (false, KaraokeMode::Practice) => fit_joined_parts(
+                &[
+                    "[F] Fullscreen",
+                    "[w/W] Sweep",
                     "[+/-] Key",
                     "[9/0] Speed",
                     "[[ / ]] Sync",
-                    "[a/b/x] Chorus Loop",
+                    "[v] Vocal",
+                    "[a/b/x] Loop",
                     "[t] Tap-Sync",
-                    "[f] Full Stage",
-                    "[m] Party Mode",
+                    "[f] Focus",
+                    "[m] Party",
                 ],
                 " · ",
-                r1.width as usize,
+                r_hint.width as usize,
             ),
-            KaraokeMode::Party => fit_joined_parts(
+            (false, KaraokeMode::Party) => fit_joined_parts(
                 &[
+                    "[F] Fullscreen",
+                    "[w/W] Sweep",
                     "[Space] Play/Pause",
                     "[>] Next (5s Handoff)",
                     "[/] Add Song",
-                    "[m] Practice Tools",
-                    "[f] Full Stage",
+                    "[m] Practice",
+                    "[f] Focus",
                 ],
                 " · ",
-                r1.width as usize,
+                r_hint.width as usize,
             ),
         };
         frame.render_widget(
             Paragraph::new(hint).style(Style::default().fg(theme.text_dim)),
-            r1,
+            r_hint,
         );
     }
 }
@@ -2019,19 +2342,24 @@ mod tests {
 
     #[test]
     fn test_karaoke_layout_dims_avoid_claustrophobia_and_barren_ultrawide() {
-        let narrow = karaoke_layout_dims(80, false, false);
+        let narrow = karaoke_layout_dims(80, false, false, false);
         assert!(narrow.show_stage && !narrow.show_setlist);
 
-        let desk = karaoke_layout_dims(118, false, false);
+        let desk = karaoke_layout_dims(118, false, false, false);
         assert!(desk.show_stage && desk.show_setlist);
-        assert!(desk.stage_w >= 76 && desk.setlist_w >= 36);
+        assert!(desk.stage_w >= 80 && desk.setlist_w >= 34);
 
-        let ultra = karaoke_layout_dims(200, false, false);
-        assert!(ultra.corridor_w <= 82);
+        let ultra = karaoke_layout_dims(200, false, false, false);
+        assert!(ultra.corridor_w <= 92);
+
+        let full = karaoke_layout_dims(140, false, true, false);
+        assert!(full.show_stage && !full.show_setlist);
+        assert_eq!(full.stage_w, 140);
+        assert!(full.corridor_w >= 110);
     }
 
     #[test]
-    fn test_word_level_sung_chars_uses_word_spans() {
+    fn test_word_level_sung_chars_uses_word_spans_and_sweep_speed() {
         let line = YtmLyricLine {
             text: "Far away".to_string(),
             start_ms: Some(10_000),
@@ -2049,8 +2377,73 @@ mod tests {
                 },
             ]),
         };
-        assert_eq!(compute_lyric_sung_chars(&line, 11_000, None), 4);
-        assert_eq!(compute_lyric_sung_chars(&line, 12_500, None), 6);
+        assert_eq!(compute_lyric_sung_chars(&line, 11_000, None, 100), 4);
+        assert_eq!(compute_lyric_sung_chars(&line, 12_500, None, 100), 6);
+
+        // Faster manual sweep (150%) finishes ahead of 100%, slower (50%) trails smoothly
+        let plain_line = YtmLyricLine {
+            text: "Fast vocals ahead of sweep".to_string(),
+            start_ms: Some(10_000),
+            end_ms: Some(16_000),
+            words: None,
+        };
+        let c_slow = compute_lyric_sung_chars(&plain_line, 13_000, None, 50);
+        let c_norm = compute_lyric_sung_chars(&plain_line, 13_000, None, 100);
+        let c_fast = compute_lyric_sung_chars(&plain_line, 13_000, None, 150);
+        assert!(c_slow < c_norm && c_norm < c_fast);
+        assert_eq!(compute_lyric_sung_chars(&plain_line, 14_000, None, 150), 26);
+    }
+
+    #[test]
+    fn test_karaoke_fullscreen_renders_big_lyrics_sweep_beam_and_bottom_keybinds() {
+        let mut st = make_karaoke_state();
+        st.music.karaoke.fullscreen = true;
+        st.music.karaoke.sweep_speed_pct = 130;
+        let backend = TestBackend::new(140, 42);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::home::render_home_screen(f, &mut st, None))
+            .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("FULL KARAOKE"));
+        assert!(text.contains("Swp:1.3x"));
+        assert!(text.contains("[F/Esc] Exit Fullscreen"));
+        assert!(text.contains("[w/W] Word Sweep Speed"));
+        assert!(text.contains("Far away"));
+        // Active sweep progress beam rendered beneath active line
+        assert!(text.contains("●"));
+        assert_eq!(term.backend().buffer()[(70, 20)].bg, Color::Reset);
+        assert!(st
+            .music
+            .karaoke
+            .hitboxes
+            .iter()
+            .any(|(_, h)| *h == KaraokeHit::SweepSpeedDelta(10)));
+        assert!(st
+            .music
+            .karaoke
+            .hitboxes
+            .iter()
+            .any(|(_, h)| *h == KaraokeHit::ToggleFullscreen));
+
+        // Floating Setlist Queue drawer in Fullscreen
+        st.music.karaoke.show_compact_setlist = true;
+        term.draw(|f| crate::ui::home::render_home_screen(f, &mut st, None))
+            .unwrap();
+        let q_text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(q_text.contains("Friday Night"));
+        assert!(q_text.contains("Jane Remover"));
     }
 
     #[test]

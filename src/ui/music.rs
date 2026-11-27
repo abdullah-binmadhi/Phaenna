@@ -225,6 +225,11 @@ pub fn render_music_workspace(
         return;
     }
 
+    if state.music.section == YtmSection::Karaoke && state.music.karaoke.fullscreen {
+        crate::ui::karaoke::render_karaoke_workspace(frame, area, state, modal_rect);
+        return;
+    }
+
     let bar_h: u16 = if area.height >= 26 { 6 } else { 5 };
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2679,7 +2684,12 @@ fn render_lyrics_view(
         let chunks = wrap_lyric_line_with_offsets(&line.text, text_w);
         let total_chars = line.text.chars().count();
         let sung_chars = if is_active {
-            crate::ui::karaoke::compute_lyric_sung_chars(line, pos_ms, next_start)
+            let swp = if state.music.karaoke.session_active {
+                state.music.karaoke.sweep_speed_pct
+            } else {
+                100
+            };
+            crate::ui::karaoke::compute_lyric_sung_chars(line, pos_ms, next_start, swp)
         } else {
             0
         };
