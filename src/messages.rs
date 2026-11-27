@@ -171,6 +171,22 @@ pub enum AppMessage {
         pos: f64,
         duration: f64,
     },
+    OverlayCommentsRequested {
+        session_id: u64,
+        video_id: String,
+        sort_newest: bool,
+    },
+    OverlayPostComment {
+        session_id: u64,
+        video_id: String,
+        parent_id: Option<String>,
+        text: String,
+    },
+    OverlayTranslateComment {
+        session_id: u64,
+        comment_id: String,
+        text: String,
+    },
     SponsorSkipped {
         video_id: String,
         category: String,

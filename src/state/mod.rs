@@ -846,6 +846,10 @@ pub struct AppState {
     pub sponsor_skips_session: u32,
     pub live_playback: LivePlaybackControlState,
     pub stream_ladder_cache: HashMap<String, ResolvedStreamLadder>,
+    pub overlay_comments: Vec<crate::api::innertube::VideoComment>,
+    pub overlay_comment_params: Option<String>,
+    pub overlay_comments_video_id: Option<String>,
+    pub overlay_comments_uploader: Option<String>,
 
     // Intelligence & Services
     pub analytics: UserAnalytics,
@@ -1050,6 +1054,10 @@ impl AppState {
             sponsor_skips_session: 0,
             live_playback: init_live_playback,
             stream_ladder_cache: HashMap::new(),
+            overlay_comments: Vec::new(),
+            overlay_comment_params: None,
+            overlay_comments_video_id: None,
+            overlay_comments_uploader: None,
 
             analytics: UserAnalytics::default(),
             analytics_loaded: false,
@@ -3274,7 +3282,7 @@ fn push_reply_subtree(
     }
 }
 
-fn comment_age_rank(published: &str) -> (u8, u64) {
+pub fn comment_age_rank(published: &str) -> (u8, u64) {
     let low = published.trim().to_lowercase();
     if low.is_empty() || low.contains("just now") {
         return (0, 0);

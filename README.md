@@ -66,6 +66,7 @@ Web browsers compress, wash out, and muddy the videos you love. Phaenna restores
 - `k` / `Space` Play & Pause · `j` / `l` Jump `-10s` / `+10s` · `Left` / `Right` Step `-5s` / `+5s`
 - `Up` / `Down` Volume · `m` Mute · `f` Toggle Fullscreen · `Esc` Exit Fullscreen
 - `p` Toggle PiP · `P` Cycle PiP Corner & Size · `i` / `I` Bento HUD (`6s` / `Pin 1Hz`) · `F1` Raw Stats
+- `C` Transparent Live Comment Chat (`Alt+c` Style · `Alt+r` VOD Sync · `;` / `\` Comment · `'` Replies · `Alt+t` Translate)
 - `c` Captions · `d` Switch Audio/Dub Track · `<` / `>` Playback Speed · `,` / `.` Frame Step
 - `0`–`9` Jump to `0%`–`90%` · `[` / `]` Previous & Next Chapter
 

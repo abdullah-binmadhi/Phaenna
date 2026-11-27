@@ -250,6 +250,19 @@ P script-binding phaenna-cycle-pip-corner
 i script-binding phaenna-toggle-hud
 I script-binding phaenna-pin-hud
 g script-binding phaenna-cycle-governor
+C script-binding phaenna-toggle-chat
+Alt+c script-binding phaenna-cycle-chat-style
+Alt+r script-binding phaenna-toggle-chat-replay
+Alt+l script-binding phaenna-toggle-chat-side
+Alt+s script-binding phaenna-toggle-chat-sort
+Alt+t script-binding phaenna-translate-chat-comment
+PGUP script-binding phaenna-chat-scroll-up
+PGDWN script-binding phaenna-chat-scroll-down
+Alt+UP script-binding phaenna-chat-scroll-up
+Alt+DOWN script-binding phaenna-chat-scroll-down
+; script-binding phaenna-chat-compose
+\ script-binding phaenna-chat-compose
+' script-binding phaenna-chat-toggle-replies
 F1 script-binding stats/display-stats-toggle
 L script-binding phaenna-snap-live-edge
 "#;
@@ -1142,6 +1155,513 @@ end
 
 mp.add_forced_key_binding("i", "phaenna-toggle-hud", toggle_info_hud)
 mp.add_forced_key_binding("I", "phaenna-pin-hud", pin_info_hud)
+
+-- =============================================================================
+-- 5. Fullscreen Transparent Live Comment Chat ([C] toggle, [;] write/reply)
+-- =============================================================================
+local utils = require("mp.utils")
+local chat_ov = mp.create_osd_overlay("ass-events")
+chat_ov.res_x = 1280
+chat_ov.res_y = 720
+
+local chat_visible = false
+local chat_style = "ink" -- "ink" (100% transparent), "glass" (subtle soft edge tint), "compact"
+local chat_side = "right" -- "right" | "left"
+local chat_replay = false
+local chat_sort_label = "Top"
+local chat_sort_newest = false
+local chat_can_post = false
+local chat_signed_in = false
+local chat_items = {}
+local chat_loading = false
+local chat_scroll = 1
+local chat_cursor = 1
+local chat_expanded = {}
+local chat_translations = {}
+local chat_status_msg = nil
+local chat_status_until = 0
+local chat_compose = false
+local chat_compose_buf = ""
+local chat_compose_reply_mode = false
+local chat_timer = nil
+
+local author_palette = {
+    "&HFFE87C&", -- Sky cyan
+    "&H78FFA8&", -- Mint green
+    "&HE39CFF&", -- Soft rose
+    "&HDB9DB3&", -- Lavender
+    "&HC4CB80&", -- Teal
+    "&H91ABFF&", -- Coral peach
+    "&H9DF5FF&", -- Pale lemon
+    "&HFFBA82&", -- Azure
+}
+
+local function hash_author_color(name)
+    local h = 0
+    for i = 1, #name do
+        h = (h * 31 + string.byte(name, i)) % 997
+    end
+    return author_palette[(h % #author_palette) + 1]
+end
+
+local function utf8_pop(s)
+    local len = #s
+    if len == 0 then return "" end
+    local i = len
+    while i > 1 and string.byte(s, i) >= 0x80 and string.byte(s, i) < 0xC0 do
+        i = i - 1
+    end
+    return string.sub(s, 1, i - 1)
+end
+
+local function wrap_lines(str, max_col)
+    local out = {}
+    local clean = esc_ass(str or "")
+    if clean == "" then return out end
+    local rem = clean
+    while #rem > max_col do
+        local cut = max_col
+        for i = max_col, math.max(10, max_col - 16), -1 do
+            if string.sub(rem, i, i) == " " then
+                cut = i
+                break
+            end
+        end
+        local head = string.sub(rem, 1, cut):gsub("%s+$", "")
+        if head == "" then
+            head = string.sub(rem, 1, max_col)
+            rem = string.sub(rem, max_col + 1)
+        else
+            rem = string.sub(rem, cut + 1):gsub("^%s+", "")
+        end
+        table.insert(out, head)
+        if #out >= 4 then
+            if #rem > 0 then out[#out] = out[#out] .. "…" end
+            rem = ""
+            break
+        end
+    end
+    if #rem > 0 then
+        table.insert(out, rem)
+    end
+    return out
+end
+
+local function active_chat_list()
+    if not chat_replay then
+        return chat_items
+    end
+    local pos = mp.get_property_number("time-pos", 0) or 0
+    local timed = {}
+    for _, c in ipairs(chat_items) do
+        if type(c.ts) == "number" and c.ts >= math.max(0, pos - 90) and c.ts <= pos + 8 then
+            table.insert(timed, c)
+        end
+    end
+    table.sort(timed, function(a, b) return (a.ts or 0) < (b.ts or 0) end)
+    if #timed > 0 then
+        return timed
+    end
+    return chat_items
+end
+
+local function render_chat_overlay()
+    if not chat_visible then
+        chat_ov:remove()
+        return
+    end
+
+    local is_right = (chat_side == "right")
+    local panel_w = (chat_style == "compact") and 390 or 432
+    local x0 = is_right and (1280 - panel_w - 18) or 18
+    local x1 = x0 + panel_w
+    local tx = x0 + 12
+    local max_cols = (chat_style == "compact") and 44 or 48
+    local max_msg_lines = (chat_style == "compact") and 14 or 22
+
+    local parts = {}
+
+    if chat_style == "glass" then
+        -- Smooth semi-transparent edge scrim (~20% dark tint), zero harsh box border
+        table.insert(parts, string.format(
+            "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&HC8&\\p1}m %d 16 l %d 16 l %d 704 l %d 704{\\p0}",
+            x0, x1, x1, x0
+        ))
+        table.insert(parts, string.format(
+            "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HF8BD38&\\1a&H60&\\p1}m %d 42 l %d 42 l %d 44 l %d 44{\\p0}",
+            tx, x1 - 12, x1 - 12, tx
+        ))
+    end
+
+    local style_lbl = (chat_style == "ink" and "TRANSPARENT") or (chat_style == "glass" and "GLASS") or "COMPACT"
+    local mode_lbl = chat_replay and "VOD SYNC" or chat_sort_label
+    local count_n = #chat_items
+    local hdr_text = string.format(
+        "{\\an7\\pos(%d,18)\\bord1.6\\shad1.4\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs16\\b1\\1c&HF8BD38&}◈ COMMENTS{\\1c&H24BFFB&} · %s (%d) {\\1c&H99D334&}[%s]{\\1c&HC8B8A4&\\b0\\fs13}  [C] Hide  [;] Write",
+        tx, mode_lbl, count_n, style_lbl
+    )
+    table.insert(parts, hdr_text)
+
+    local list = active_chat_list()
+    if #list == 0 then
+        local msg = chat_loading and "Loading live comments…" or (chat_replay and "Waiting for timestamped comments…" or "No comments loaded yet ([Alt+s] refresh)")
+        table.insert(parts, string.format(
+            "{\\an7\\pos(%d,56)\\bord1.5\\shad1.2\\3c&H000000&\\fs15\\1c&HDAD4CE&}%s",
+            tx, msg
+        ))
+    else
+        if chat_cursor < 1 then chat_cursor = 1 end
+        if chat_cursor > #list then chat_cursor = #list end
+        if chat_cursor < chat_scroll then chat_scroll = chat_cursor end
+
+        -- Reserve bottom strip for compose input / status hint
+        local bottom_limit_y = chat_compose and 608 or 672
+        local cur_y = 50
+        local drawn = 0
+        local line_budget = max_msg_lines
+
+        -- Build visible message blocks starting at chat_scroll
+        if chat_replay and not chat_compose then
+            chat_scroll = math.max(1, #list - 8)
+        end
+
+        for idx = chat_scroll, #list do
+            if cur_y >= bottom_limit_y or line_budget <= 0 then break end
+            local c = list[idx]
+            local is_sel = (idx == chat_cursor)
+            local author = esc_ass(c.author or "@user")
+            local acol = c.creator and "&H4FD5FF&" or (c.self_msg and "&H8CEB78&" or hash_author_color(author))
+
+            local badge = ""
+            if c.creator then badge = badge .. "{\\1c&H4FD5FF&\\b1} [CREATOR]{\\b0}" end
+            if c.pinned then badge = badge .. "{\\1c&H24BFFB&\\b1} [PIN]{\\b0}" end
+            if c.self_msg then badge = badge .. "{\\1c&H8CEB78&\\b1} [YOU]{\\b0}" end
+            if type(c.ts) == "number" then
+                badge = badge .. string.format("{\\1c&HF8BD38&} [%s]", fmt_clock(c.ts))
+            end
+
+            local meta_tail = ""
+            if c.likes and c.likes ~= "" and c.likes ~= "0" then
+                meta_tail = meta_tail .. " ♥" .. esc_ass(c.likes)
+            end
+            if c.replies_count and c.replies_count > 0 then
+                meta_tail = meta_tail .. string.format(" · ↳%d", c.replies_count)
+            end
+
+            local sel_mark = is_sel and "{\\1c&HF8BD38&}▸ " or ""
+            table.insert(parts, string.format(
+                "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H28&\\4c&H000000&\\4a&H38&\\fs14}%s{\\b1\\1c%s}%s{\\b0}%s{\\1c&HAAA49E&\\fs12}%s",
+                tx, cur_y, sel_mark, acol, author, badge, meta_tail
+            ))
+            cur_y = cur_y + 19
+
+            local body_lines = wrap_lines(c.text or "", max_cols)
+            for _, ln in ipairs(body_lines) do
+                if cur_y >= bottom_limit_y then break end
+                table.insert(parts, string.format(
+                    "{\\an7\\pos(%d,%d)\\bord1.8\\shad1.5\\3c&H000000&\\3a&H20&\\4c&H000000&\\4a&H38&\\fs15\\1c&HFAF7F2&}%s",
+                    tx + (is_sel and 10 or 4), cur_y, ln
+                ))
+                cur_y = cur_y + 19
+                line_budget = line_budget - 1
+            end
+
+            if chat_translations[c.id] then
+                for _, tl in ipairs(wrap_lines("TR: " .. chat_translations[c.id], max_cols - 2)) do
+                    if cur_y >= bottom_limit_y then break end
+                    table.insert(parts, string.format(
+                        "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.3\\3c&H000000&\\fs14\\i1\\1c&HFFE87C&}%s",
+                        tx + 8, cur_y, tl
+                    ))
+                    cur_y = cur_y + 18
+                end
+            end
+
+            if chat_expanded[c.id] and type(c.replies) == "table" and #c.replies > 0 then
+                for _, rep in ipairs(c.replies) do
+                    if cur_y >= bottom_limit_y then break end
+                    local rauth = esc_ass(rep.author or "")
+                    local rlines = wrap_lines(rauth .. ": " .. (rep.text or ""), max_cols - 4)
+                    for _, rl in ipairs(rlines) do
+                        if cur_y >= bottom_limit_y then break end
+                        table.insert(parts, string.format(
+                            "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.3\\3c&H000000&\\fs13\\1c&HC8D6E5&}  ↳ %s",
+                            tx + 8, cur_y, rl
+                        ))
+                        cur_y = cur_y + 17
+                    end
+                end
+            end
+
+            cur_y = cur_y + 7
+            drawn = drawn + 1
+        end
+    end
+
+    if chat_status_msg and mp.get_time() < chat_status_until then
+        table.insert(parts, string.format(
+            "{\\an7\\pos(%d,%d)\\bord1.6\\shad1.4\\3c&H000000&\\fs14\\b1\\1c&H99D334&}%s",
+            tx, chat_compose and 592 or 674, esc_ass(chat_status_msg)
+        ))
+    end
+
+    if chat_compose then
+        local box_y = 616
+        table.insert(parts, string.format(
+            "{\\an7\\pos(0,0)\\bord1.5\\3c&HF8BD38&\\1c&H14100D&\\1a&H42&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}",
+            x0 + 6, box_y, x1 - 6, box_y, x1 - 6, box_y + 76, x0 + 6, box_y + 76
+        ))
+        local list_cur = list[chat_cursor]
+        local target_lbl = (chat_compose_reply_mode and list_cur)
+            and ("Reply to " .. esc_ass(list_cur.author or "user") .. "  [Tab: New]")
+            or "New Comment  [Tab: Reply]"
+        table.insert(parts, string.format(
+            "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs13\\b1\\1c&HF8BD38&}✎ %s   {\\1c&HC8B8A4&\\b0}[Enter] Post · [Esc] Cancel",
+            tx, box_y + 8, target_lbl
+        ))
+        local shown_txt = esc_ass(chat_compose_buf)
+        if #shown_txt > 44 then
+            shown_txt = "…" .. string.sub(shown_txt, #shown_txt - 43)
+        end
+        table.insert(parts, string.format(
+            "{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs16\\1c&HFFFFFF&}%s|",
+            tx, box_y + 34, shown_txt
+        ))
+    else
+        table.insert(parts, string.format(
+            "{\\an7\\pos(%d,692)\\bord1.5\\shad1.2\\3c&H000000&\\fs12\\1c&HB8B0A6&}[PgUp/Dn] Scroll · [Alt+r] VOD Sync · [Alt+s] Sort · [Alt+l] Side · [Alt+t] Translate",
+            tx
+        ))
+    end
+
+    chat_ov.data = table.concat(parts, "\n")
+    chat_ov:update()
+end
+
+local function set_chat_status(msg, secs)
+    chat_status_msg = msg
+    chat_status_until = mp.get_time() + (secs or 3.5)
+    render_chat_overlay()
+end
+
+local function ensure_chat_timer()
+    if not chat_timer then
+        chat_timer = mp.add_periodic_timer(0.8, function()
+            if chat_visible then render_chat_overlay() end
+        end)
+    end
+end
+
+local function close_chat_compose()
+    if not chat_compose then return end
+    chat_compose = false
+    for _, name in ipairs({"chat-cap-uni", "chat-cap-enter", "chat-cap-kpe", "chat-cap-esc", "chat-cap-bs", "chat-cap-tab", "chat-cap-space"}) do
+        mp.remove_key_binding(name)
+    end
+    render_chat_overlay()
+end
+
+local function submit_chat_compose()
+    local text = chat_compose_buf:gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then
+        close_chat_compose()
+        return
+    end
+    if not chat_signed_in then
+        set_chat_status("Sign in ([L] in Phaenna TUI) to post comments", 4.0)
+        close_chat_compose()
+        return
+    end
+    local list = active_chat_list()
+    local parent_id = ""
+    if chat_compose_reply_mode and list[chat_cursor] and list[chat_cursor].id then
+        parent_id = tostring(list[chat_cursor].id)
+    end
+    mp.commandv("script-message", "phaenna-ipc-post-comment", parent_id, text)
+    chat_compose_buf = ""
+    close_chat_compose()
+    set_chat_status("Posting comment to YouTube…", 4.0)
+end
+
+local function open_chat_compose()
+    if not chat_visible then
+        chat_visible = true
+        if #chat_items == 0 then
+            chat_loading = true
+            mp.commandv("script-message", "phaenna-ipc-request-comments", chat_sort_newest and "newest" or "top")
+        end
+    end
+    if chat_compose then return end
+    chat_compose = true
+    chat_compose_buf = ""
+    ensure_chat_timer()
+
+    mp.add_forced_key_binding("ANY_UNICODE", "chat-cap-uni", function(ev)
+        if ev.event == "up" then return end
+        if ev.key_text and #ev.key_text > 0 then
+            local b = string.byte(ev.key_text, 1)
+            if b >= 32 and b ~= 127 then
+                chat_compose_buf = chat_compose_buf .. ev.key_text
+                render_chat_overlay()
+            end
+        end
+    end, { repeatable = true, complex = true })
+
+    mp.add_forced_key_binding("SPACE", "chat-cap-space", function()
+        chat_compose_buf = chat_compose_buf .. " "
+        render_chat_overlay()
+    end, { repeatable = true })
+
+    mp.add_forced_key_binding("BS", "chat-cap-bs", function()
+        chat_compose_buf = utf8_pop(chat_compose_buf)
+        render_chat_overlay()
+    end, { repeatable = true })
+
+    mp.add_forced_key_binding("TAB", "chat-cap-tab", function()
+        chat_compose_reply_mode = not chat_compose_reply_mode
+        render_chat_overlay()
+    end)
+
+    mp.add_forced_key_binding("ENTER", "chat-cap-enter", submit_chat_compose)
+    mp.add_forced_key_binding("KP_ENTER", "chat-cap-kpe", submit_chat_compose)
+    mp.add_forced_key_binding("ESC", "chat-cap-esc", close_chat_compose)
+    render_chat_overlay()
+end
+
+local function toggle_chat_overlay()
+    chat_visible = not chat_visible
+    if chat_visible then
+        ensure_chat_timer()
+        if #chat_items == 0 and not chat_loading then
+            chat_loading = true
+            mp.commandv("script-message", "phaenna-ipc-request-comments", chat_sort_newest and "newest" or "top")
+        end
+        render_chat_overlay()
+    else
+        close_chat_compose()
+        chat_ov:remove()
+    end
+end
+
+local function cycle_chat_style()
+    if chat_style == "ink" then
+        chat_style = "glass"
+    elseif chat_style == "glass" then
+        chat_style = "compact"
+    else
+        chat_style = "ink"
+    end
+    if not chat_visible then chat_visible = true end
+    ensure_chat_timer()
+    set_chat_status("Style: " .. chat_style:upper(), 2.0)
+end
+
+local function toggle_chat_replay()
+    chat_replay = not chat_replay
+    chat_scroll = 1
+    chat_cursor = 1
+    if not chat_visible then chat_visible = true end
+    ensure_chat_timer()
+    set_chat_status(chat_replay and "VOD Timed Replay: ON" or "VOD Timed Replay: OFF", 2.5)
+end
+
+local function toggle_chat_side()
+    chat_side = (chat_side == "right") and "left" or "right"
+    if not chat_visible then chat_visible = true end
+    render_chat_overlay()
+end
+
+local function toggle_chat_sort()
+    chat_sort_newest = not chat_sort_newest
+    chat_loading = true
+    if not chat_visible then chat_visible = true end
+    mp.commandv("script-message", "phaenna-ipc-request-comments", chat_sort_newest and "newest" or "top")
+    set_chat_status("Fetching " .. (chat_sort_newest and "Newest" or "Top") .. " comments…", 2.5)
+end
+
+local function chat_scroll_delta(d)
+    if not chat_visible then return end
+    local list = active_chat_list()
+    if #list == 0 then return end
+    chat_replay = false
+    chat_cursor = math.max(1, math.min(#list, chat_cursor + d))
+    if chat_cursor < chat_scroll then
+        chat_scroll = chat_cursor
+    elseif d > 0 and chat_cursor - chat_scroll >= 5 then
+        chat_scroll = chat_cursor - 4
+    end
+    render_chat_overlay()
+end
+
+local function chat_toggle_replies()
+    if not chat_visible then return end
+    local list = active_chat_list()
+    local cur = list[chat_cursor]
+    if cur and cur.id then
+        chat_expanded[cur.id] = not chat_expanded[cur.id]
+        render_chat_overlay()
+    end
+end
+
+local function chat_translate_selected()
+    if not chat_visible then return end
+    local list = active_chat_list()
+    local cur = list[chat_cursor]
+    if cur and cur.id and cur.text and cur.text ~= "" then
+        mp.commandv("script-message", "phaenna-ipc-translate-comment", tostring(cur.id), tostring(cur.text))
+        set_chat_status("Translating comment…", 2.5)
+    end
+end
+
+mp.register_script_message("phaenna-overlay-comments-data", function(payload_str)
+    local parsed = utils.parse_json(payload_str or "")
+    chat_loading = false
+    if type(parsed) == "table" then
+        chat_sort_label = parsed.sort or "Top"
+        chat_can_post = parsed.can_post == true
+        chat_signed_in = parsed.signed_in == true
+        chat_items = type(parsed.items) == "table" and parsed.items or {}
+        chat_cursor = 1
+        chat_scroll = 1
+        if chat_visible then render_chat_overlay() end
+    end
+end)
+
+mp.register_script_message("phaenna-overlay-comment-result", function(payload_str)
+    local res = utils.parse_json(payload_str or "")
+    if type(res) ~= "table" then return end
+    if res.ok and type(res.new_comment_json) == "string" and res.new_comment_json ~= "" then
+        local c = utils.parse_json(res.new_comment_json)
+        if type(c) == "table" then
+            table.insert(chat_items, 1, c)
+            chat_cursor = 1
+            chat_scroll = 1
+        end
+    end
+    set_chat_status(res.status or (res.ok and "Comment posted!" or "Post failed"), 4.0)
+end)
+
+mp.register_script_message("phaenna-overlay-comment-translation", function(payload_str)
+    local tr = utils.parse_json(payload_str or "")
+    if type(tr) == "table" and tr.comment_id and tr.translated_text then
+        chat_translations[tr.comment_id] = tr.translated_text
+        if chat_visible then render_chat_overlay() end
+    end
+end)
+
+mp.add_forced_key_binding("C", "phaenna-toggle-chat", toggle_chat_overlay)
+mp.add_forced_key_binding("Alt+c", "phaenna-cycle-chat-style", cycle_chat_style)
+mp.add_forced_key_binding("Alt+r", "phaenna-toggle-chat-replay", toggle_chat_replay)
+mp.add_forced_key_binding("Alt+l", "phaenna-toggle-chat-side", toggle_chat_side)
+mp.add_forced_key_binding("Alt+s", "phaenna-toggle-chat-sort", toggle_chat_sort)
+mp.add_forced_key_binding("Alt+t", "phaenna-translate-chat-comment", chat_translate_selected)
+mp.add_forced_key_binding("PGUP", "phaenna-chat-scroll-up", function() chat_scroll_delta(-1) end, { repeatable = true })
+mp.add_forced_key_binding("PGDWN", "phaenna-chat-scroll-down", function() chat_scroll_delta(1) end, { repeatable = true })
+mp.add_forced_key_binding("Alt+UP", "phaenna-chat-scroll-up-alt", function() chat_scroll_delta(-1) end, { repeatable = true })
+mp.add_forced_key_binding("Alt+DOWN", "phaenna-chat-scroll-down-alt", function() chat_scroll_delta(1) end, { repeatable = true })
+mp.add_forced_key_binding(";", "phaenna-chat-compose", open_chat_compose)
+mp.add_forced_key_binding("\\", "phaenna-chat-compose-bsl", open_chat_compose)
+mp.add_forced_key_binding("'", "phaenna-chat-toggle-replies", chat_toggle_replies)
 
 start_anim()
 "##;

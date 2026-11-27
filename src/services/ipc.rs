@@ -269,6 +269,18 @@ pub enum PlayerCommand {
         title: String,
         video_id: String,
     },
+    PushOverlayComments {
+        payload_json: String,
+    },
+    PushOverlayCommentResult {
+        ok: bool,
+        status: String,
+        new_comment_json: String,
+    },
+    PushOverlayCommentTranslation {
+        comment_id: String,
+        translated_text: String,
+    },
     HotSwitchStream {
         primary_url: String,
         audio_url: Option<String>,
@@ -661,6 +673,33 @@ impl PlayerCommand {
                     json!({"command": ["set_property", "force-media-title", title]}).to_string(),
                     json!({"command": ["loadfile", url, "replace"]}).to_string(),
                 ]
+            }
+            Self::PushOverlayComments { payload_json } => {
+                vec![json!({"command": ["script-message", "phaenna-overlay-comments-data", payload_json]}).to_string()]
+            }
+            Self::PushOverlayCommentResult {
+                ok,
+                status,
+                new_comment_json,
+            } => {
+                let res_json = json!({
+                    "ok": ok,
+                    "status": status,
+                    "new_comment_json": new_comment_json,
+                })
+                .to_string();
+                vec![json!({"command": ["script-message", "phaenna-overlay-comment-result", res_json]}).to_string()]
+            }
+            Self::PushOverlayCommentTranslation {
+                comment_id,
+                translated_text,
+            } => {
+                let tr_json = json!({
+                    "comment_id": comment_id,
+                    "translated_text": translated_text,
+                })
+                .to_string();
+                vec![json!({"command": ["script-message", "phaenna-overlay-comment-translation", tr_json]}).to_string()]
             }
             Self::UpdateSkipSegments(_) | Self::UndoLastSkip | Self::SetSponsorOsdToast(_) => {
                 Vec::new()
@@ -1308,6 +1347,55 @@ pub fn spawn_mpv_ipc_monitor(config: IpcMonitorConfig) {
                                     .await;
                                 continue;
                             }
+                            "phaenna-ipc-request-comments" => {
+                                let sort_newest = args
+                                    .first()
+                                    .is_some_and(|s| s.eq_ignore_ascii_case("newest"));
+                                let _ = config
+                                    .tx
+                                    .send(AppMessage::OverlayCommentsRequested {
+                                        session_id: config.session_id,
+                                        video_id: config.video_id.clone(),
+                                        sort_newest,
+                                    })
+                                    .await;
+                                continue;
+                            }
+                            "phaenna-ipc-post-comment" => {
+                                let parent_id = args
+                                    .first()
+                                    .map(|s| s.trim())
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToOwned::to_owned);
+                                let text = args.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
+                                if !text.is_empty() {
+                                    let _ = config
+                                        .tx
+                                        .send(AppMessage::OverlayPostComment {
+                                            session_id: config.session_id,
+                                            video_id: config.video_id.clone(),
+                                            parent_id,
+                                            text,
+                                        })
+                                        .await;
+                                }
+                                continue;
+                            }
+                            "phaenna-ipc-translate-comment" => {
+                                let comment_id = args.first().cloned().unwrap_or_default();
+                                let text = args.get(1).cloned().unwrap_or_default();
+                                if !comment_id.is_empty() && !text.trim().is_empty() {
+                                    let _ = config
+                                        .tx
+                                        .send(AppMessage::OverlayTranslateComment {
+                                            session_id: config.session_id,
+                                            comment_id,
+                                            text,
+                                        })
+                                        .await;
+                                }
+                                continue;
+                            }
                             _ => {}
                         }
                     }
@@ -1759,5 +1847,133 @@ mod tests {
         assert_eq!(fs_name, "phaenna-ipc-toggle-fullscreen");
         assert_eq!(fs_args, vec!["1"]);
         assert!(clean.contains("WebM Opus"));
+
+        assert_eq!(parse_comment_timestamp_secs("Look at 4:12 lol"), Some(252.0));
+        assert_eq!(parse_comment_timestamp_secs("(1:02:05) clutch!"), Some(3725.0));
+        assert_eq!(parse_comment_timestamp_secs("no timestamp here"), None);
+
+        let sample_c = vec![crate::api::innertube::VideoComment {
+            id: "c1".into(),
+            author: "@Tester".into(),
+            published_text: "2h ago".into(),
+            text: "Wait 01:30 that jump!".into(),
+            like_count_text: "42".into(),
+            reply_count: 1,
+            is_pinned: true,
+            is_self: false,
+            ..Default::default()
+        }];
+        let payload = build_overlay_chat_payload(&sample_c, Some("Tester"), "Top", true, true);
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["items"][0]["creator"], true);
+        assert_eq!(parsed["items"][0]["ts"], 90.0);
+        assert_eq!(parsed["items"][0]["pinned"], true);
     }
+}
+
+/// Extract the first `M:SS` or `H:MM:SS` timestamp in a comment string (used for VOD live replay).
+pub fn parse_comment_timestamp_secs(text: &str) -> Option<f64> {
+    for raw in text.split_whitespace() {
+        let tok = raw.trim_matches(|c: char| !c.is_ascii_digit() && c != ':');
+        if !tok.contains(':') {
+            continue;
+        }
+        let parts: Vec<&str> = tok.split(':').collect();
+        match parts.as_slice() {
+            [m, s] if !m.is_empty() && s.len() == 2 => {
+                if let (Ok(mm), Ok(ss)) = (m.parse::<u64>(), s.parse::<u64>()) {
+                    if ss < 60 && mm <= 600 {
+                        return Some((mm * 60 + ss) as f64);
+                    }
+                }
+            }
+            [h, m, s] if !h.is_empty() && m.len() == 2 && s.len() == 2 => {
+                if let (Ok(hh), Ok(mm), Ok(ss)) =
+                    (h.parse::<u64>(), m.parse::<u64>(), s.parse::<u64>())
+                {
+                    if mm < 60 && ss < 60 && hh <= 48 {
+                        return Some((hh * 3600 + mm * 60 + ss) as f64);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn trim_comment_text(s: &str, max_chars: usize) -> String {
+    let clean: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = clean.chars().count();
+    if count <= max_chars {
+        clean
+    } else {
+        let head: String = clean.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+/// Serialize one comment entry into compact overlay chat JSON (also used on optimistic post).
+pub fn overlay_comment_json_value(
+    c: &crate::api::innertube::VideoComment,
+    uploader_hint: Option<&str>,
+) -> Value {
+    let clean_upl = uploader_hint
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    let clean_auth = c.author.trim().trim_start_matches('@').to_ascii_lowercase();
+    let is_creator = !clean_upl.is_empty() && !clean_auth.is_empty() && clean_auth == clean_upl;
+    let replies: Vec<Value> = c
+        .replies
+        .iter()
+        .take(3)
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "author": r.author,
+                "published": r.published_text,
+                "text": trim_comment_text(&r.text, 200),
+                "likes": r.like_count_text,
+                "self_msg": r.is_self,
+            })
+        })
+        .collect();
+
+    json!({
+        "id": c.id,
+        "author": c.author,
+        "published": c.published_text,
+        "text": trim_comment_text(&c.text, 280),
+        "likes": c.like_count_text,
+        "replies_count": c.reply_count,
+        "pinned": c.is_pinned,
+        "creator": is_creator,
+        "self_msg": c.is_self,
+        "ts": parse_comment_timestamp_secs(&c.text),
+        "replies": replies,
+    })
+}
+
+/// Build the full compact JSON payload pushed to the `mpv` fullscreen comment overlay.
+pub fn build_overlay_chat_payload(
+    comments: &[crate::api::innertube::VideoComment],
+    uploader_hint: Option<&str>,
+    sort_label: &str,
+    can_post: bool,
+    is_signed_in: bool,
+) -> String {
+    let items: Vec<Value> = comments
+        .iter()
+        .take(75)
+        .map(|c| overlay_comment_json_value(c, uploader_hint))
+        .collect();
+    json!({
+        "sort": sort_label,
+        "can_post": can_post,
+        "signed_in": is_signed_in,
+        "items": items,
+    })
+    .to_string()
 }

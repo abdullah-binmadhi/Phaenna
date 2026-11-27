@@ -70,7 +70,8 @@ use crate::services::calendar::{bucket_videos_by_week, compute_week_bounds};
 use crate::services::cast::{discover_devices, resolve_tv_stream_url, start_casting};
 use crate::services::downloader::{spawn_download_task, DownloadTask};
 use crate::services::ipc::{
-    spawn_mpv_ipc_monitor, IpcMonitorConfig, LiveIpcEvent, PlayerCommand,
+    build_overlay_chat_payload, overlay_comment_json_value, spawn_mpv_ipc_monitor,
+    IpcMonitorConfig, LiveIpcEvent, PlayerCommand,
 };
 use crate::services::remote::start_remote_server;
 use crate::services::shaders::{
@@ -1811,6 +1812,33 @@ async fn handle_app_message(
             comments,
             create_params,
         } => {
+            let incoming_comments = comments.clone();
+            let is_playing_vid = state
+                .active_playback_video_id
+                .as_deref()
+                .is_some_and(|v| v.trim_start_matches("RD") == video_id.trim_start_matches("RD"))
+                && state.music.active_audio_session_id != Some(state.active_session_id);
+
+            if is_playing_vid {
+                state.overlay_comments_video_id = Some(video_id.clone());
+                if create_params.is_some() {
+                    state.overlay_comment_params = create_params.clone();
+                }
+                let mut merged_ov: Vec<VideoComment> = state
+                    .overlay_comments
+                    .iter()
+                    .filter(|c| c.is_self && c.parent_id.is_none())
+                    .cloned()
+                    .collect();
+                for c in &incoming_comments {
+                    if c.parent_id.is_none() && !merged_ov.iter().any(|m| m.id == c.id) {
+                        merged_ov.push(c.clone());
+                    }
+                }
+                state.overlay_comments = merged_ov;
+                push_overlay_comments_to_mpv(state, false);
+            }
+
             if state
                 .detail_video
                 .as_ref()
@@ -1993,6 +2021,14 @@ async fn handle_app_message(
             }
             state.active_playback_video_id = Some(video_id.clone());
             state.active_playback_title = Some(title.clone());
+            state.overlay_comments.clear();
+            state.overlay_comment_params = None;
+            state.overlay_comments_video_id = Some(video_id.clone());
+            state.overlay_comments_uploader = state
+                .all_known_videos()
+                .into_iter()
+                .find(|v| v.id == video_id)
+                .map(|v| v.display_uploader().to_string());
             state.live_playback.is_live_stream = state
                 .all_known_videos()
                 .into_iter()
@@ -2027,6 +2063,24 @@ async fn handle_app_message(
         AppMessage::PlaybackCommandReady { session_id, cmd_tx } => {
             if session_id == state.active_session_id {
                 state.live_playback.cmd_tx = Some(cmd_tx);
+                if state.music.active_audio_session_id != Some(session_id) {
+                    if let Some(vid) = state.active_playback_video_id.clone() {
+                        let matching_detail = state
+                            .detail_video
+                            .as_ref()
+                            .is_some_and(|v| v.id == vid)
+                            && !state.detail_comments.is_empty();
+                        if matching_detail {
+                            state.overlay_comments = state.detail_comments.clone();
+                            state.overlay_comment_params =
+                                state.detail_create_comment_params.clone();
+                            state.overlay_comments_video_id = Some(vid);
+                            push_overlay_comments_to_mpv(state, false);
+                        } else {
+                            spawn_overlay_comments_fetch(vid, state, pool, tx, client);
+                        }
+                    }
+                }
             }
         }
         AppMessage::PlaybackTelemetryUpdated { session_id, event } => {
@@ -2090,6 +2144,58 @@ async fn handle_app_message(
                 let _ = handle
                     .state_tx
                     .send(serde_json::to_string(&*rst).unwrap_or_default());
+            }
+        }
+        AppMessage::OverlayCommentsRequested {
+            session_id,
+            video_id,
+            sort_newest,
+        } => {
+            if session_id == state.active_session_id {
+                if !state.overlay_comments.is_empty()
+                    && state
+                        .overlay_comments_video_id
+                        .as_deref()
+                        .is_some_and(|v| {
+                            v.trim_start_matches("RD") == video_id.trim_start_matches("RD")
+                        })
+                {
+                    push_overlay_comments_to_mpv(state, sort_newest);
+                } else {
+                    spawn_overlay_comments_fetch(video_id, state, pool, tx, client);
+                }
+            }
+        }
+        AppMessage::OverlayPostComment {
+            session_id,
+            video_id,
+            parent_id,
+            text,
+        } => {
+            if session_id == state.active_session_id {
+                handle_overlay_post_comment(&video_id, parent_id, text, state, pool, client).await;
+            }
+        }
+        AppMessage::OverlayTranslateComment {
+            session_id,
+            comment_id,
+            text,
+        } => {
+            if session_id == state.active_session_id {
+                if let Some(cmd_tx) = state.live_playback.cmd_tx.clone() {
+                    let c = client.clone();
+                    let lang = state.detail_translate_lang.clone();
+                    tokio::spawn(async move {
+                        let translated = match translate_text(&c, &text, &lang).await {
+                            Ok((tr, _)) => tr,
+                            Err(e) => format!("Translation error: {e}"),
+                        };
+                        let _ = cmd_tx.send(PlayerCommand::PushOverlayCommentTranslation {
+                            comment_id,
+                            translated_text: translated,
+                        });
+                    });
+                }
             }
         }
         AppMessage::SponsorSkipped {
@@ -2829,6 +2935,39 @@ fn open_detail_for_video(
         }
     });
 
+    spawn_overlay_comments_fetch(vid_id, state, pool, tx, client);
+}
+
+fn push_overlay_comments_to_mpv(state: &AppState, sort_newest: bool) {
+    let mut ordered = state.overlay_comments.clone();
+    if sort_newest {
+        ordered.sort_by_key(|c| {
+            (
+                usize::from(!c.is_self),
+                crate::state::comment_age_rank(&c.published_text),
+            )
+        });
+    }
+    let sort_label = if sort_newest { "Newest" } else { "Top" };
+    let signed_in = state.auth_vault.active_account().is_some();
+    let can_post = signed_in && state.overlay_comment_params.is_some();
+    let payload_json = build_overlay_chat_payload(
+        &ordered,
+        state.overlay_comments_uploader.as_deref(),
+        sort_label,
+        can_post,
+        signed_in,
+    );
+    state.send_player_cmd(PlayerCommand::PushOverlayComments { payload_json });
+}
+
+fn spawn_overlay_comments_fetch(
+    vid_id: String,
+    state: &AppState,
+    pool: &SqlitePool,
+    tx: &mpsc::Sender<AppMessage>,
+    client: &reqwest::Client,
+) {
     let c_cm = client.clone();
     let p_cm = pool.clone();
     let tx_cm = tx.clone();
@@ -2853,6 +2992,121 @@ fn open_detail_for_video(
                 create_params,
             })
             .await;
+    });
+}
+
+async fn handle_overlay_post_comment(
+    vid_id: &str,
+    parent_id: Option<String>,
+    body: String,
+    state: &mut AppState,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+) {
+    let clean_vid = vid_id.trim_start_matches("RD").to_string();
+    let Some(sess) = state.auth_vault.active_account().cloned() else {
+        state.send_player_cmd(PlayerCommand::PushOverlayCommentResult {
+            ok: false,
+            status: "Sign in ([L] in Phaenna TUI) to post comments".to_string(),
+            new_comment_json: String::new(),
+        });
+        return;
+    };
+
+    let author = if sess.display_name.trim().is_empty() {
+        sess.channel_handle
+            .clone()
+            .unwrap_or_else(|| sess.email.clone())
+    } else {
+        sess.display_name.clone()
+    };
+    let now = now_unix();
+    let _ = save_user_video_comment(
+        pool,
+        &clean_vid,
+        &author,
+        &body,
+        now,
+        parent_id.as_deref(),
+    )
+    .await;
+
+    let local_cmt = VideoComment {
+        id: format!("local_{now}"),
+        author,
+        published_text: "Just now".to_string(),
+        text: body.clone(),
+        like_count_text: "0".to_string(),
+        reply_count: 0,
+        is_pinned: false,
+        is_self: true,
+        parent_id: parent_id.clone(),
+        ..Default::default()
+    };
+
+    let new_comment_json = if let Some(ref pid) = parent_id {
+        if let Some(root) = state
+            .overlay_comments
+            .iter_mut()
+            .find(|c| &c.id == pid || c.replies.iter().any(|r| &r.id == pid))
+        {
+            root.reply_count = root.reply_count.saturating_add(1);
+            root.replies.push(local_cmt.clone());
+        }
+        if state
+            .detail_video
+            .as_ref()
+            .is_some_and(|v| v.id.trim_start_matches("RD") == clean_vid)
+        {
+            state.insert_comment_reply(pid, pid, local_cmt.clone());
+        }
+        String::new()
+    } else {
+        state.overlay_comments.insert(0, local_cmt.clone());
+        if state
+            .detail_video
+            .as_ref()
+            .is_some_and(|v| v.id.trim_start_matches("RD") == clean_vid)
+        {
+            state.detail_comments.insert(0, local_cmt.clone());
+        }
+        overlay_comment_json_value(&local_cmt, state.overlay_comments_uploader.as_deref())
+            .to_string()
+    };
+
+    let Some(cmd_tx) = state.live_playback.cmd_tx.clone() else {
+        return;
+    };
+
+    let c_post = client.clone();
+    let params = state
+        .overlay_comment_params
+        .clone()
+        .or_else(|| state.detail_create_comment_params.clone());
+    let reply_params = parent_id.as_ref().and_then(|pid| {
+        state
+            .overlay_comments
+            .iter()
+            .chain(state.detail_comments.iter())
+            .find(|c| &c.id == pid)
+            .and_then(|c| c.create_reply_params.clone())
+    });
+
+    tokio::spawn(async move {
+        let res = if parent_id.is_some() {
+            post_comment_reply(&c_post, &sess, &clean_vid, reply_params.as_deref(), &body).await
+        } else {
+            post_video_comment(&c_post, &sess, &clean_vid, params.as_deref(), &body).await
+        };
+        let (ok, status) = match res {
+            Ok(()) => (true, "✓ Posted live to YouTube!".to_string()),
+            Err(e) => (false, format!("Saved locally (YouTube sync failed: {e})")),
+        };
+        let _ = cmd_tx.send(PlayerCommand::PushOverlayCommentResult {
+            ok,
+            status,
+            new_comment_json,
+        });
     });
 }
 
